@@ -1,12 +1,14 @@
-"""Minimal AnimRL-compatible PPO without task registry or logging backends."""
+"""Minimal AnimRL-compatible PPO with local TensorBoard logging."""
 
 import json
+import math
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 
 from simtoolreal_animrl.runners.modules.normalizer import EmpiricalNormalization
 from simtoolreal_animrl.runners.modules.policy import Policy
@@ -24,7 +26,14 @@ class PPO:
         self.alg_name = train_cfg.algorithm_name
         self.device = torch.device(device)
         self.env = env
-        self.log_dir = log_dir
+        self.log_dir = Path(log_dir) if log_dir is not None else None
+        self.writer = None
+        if self.log_dir is not None and bool(self.cfg.tensorboard):
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(
+                log_dir=str(self.log_dir),
+                flush_secs=int(self.cfg.tensorboard_flush_secs),
+            )
 
         num_actor_obs = self.env.num_obs
         num_critic_obs = (
@@ -74,6 +83,8 @@ class PPO:
         self.learning_rate = float(self.alg_cfg.learning_rate)
         self.total_timesteps = 0
         self.total_time_s = 0.0
+        self.best_evaluation_score = -math.inf
+        self.best_evaluation_iteration = -1
         self.env.reset()
 
     def collect_rollout(self):
@@ -95,6 +106,13 @@ class PPO:
         early_termination_count = 0
         episode_count = 0
         episode_sums = {}
+        position_reward_sum = 0.0
+        velocity_reward_sum = 0.0
+        rms_position_error_sum = 0.0
+        rms_velocity_error_sum = 0.0
+        max_abs_position_error = 0.0
+        clipped_action_count = 0
+        action_value_count = 0
 
         with torch.inference_mode():
             for _ in range(int(self.cfg.num_steps_per_env)):
@@ -107,6 +125,8 @@ class PPO:
                 actions, log_prob = self.policy.act_and_log_prob(
                     actor_observations
                 )
+                clipped_action_count += int((actions.abs() > 1.0).sum())
+                action_value_count += actions.numel()
                 (
                     next_observations,
                     next_privileged_observations,
@@ -134,6 +154,18 @@ class PPO:
                     )
 
                 reward_sum += float(rewards.mean())
+                position_reward_sum += float(infos["position_reward"].mean())
+                velocity_reward_sum += float(infos["velocity_reward"].mean())
+                rms_position_error_sum += float(
+                    infos["rms_position_error"].mean()
+                )
+                rms_velocity_error_sum += float(
+                    infos["rms_velocity_error"].mean()
+                )
+                max_abs_position_error = max(
+                    max_abs_position_error,
+                    float(infos["max_abs_arm_position_error"].max()),
+                )
                 done_count += int(dones.sum())
                 timeout_count += int(infos["time_outs"].sum())
                 early_termination_count += int(
@@ -158,11 +190,26 @@ class PPO:
                 last_values, self.alg_cfg.gamma, self.alg_cfg.lam
             )
 
+        rollout_steps = float(self.cfg.num_steps_per_env)
+        transition_count = int(self.cfg.num_steps_per_env * self.env.num_envs)
         result = {
-            "mean_reward": reward_sum / float(self.cfg.num_steps_per_env),
+            "mean_reward": reward_sum / rollout_steps,
+            "mean_position_reward": position_reward_sum / rollout_steps,
+            "mean_velocity_reward": velocity_reward_sum / rollout_steps,
+            "mean_rms_position_error": rms_position_error_sum / rollout_steps,
+            "mean_rms_velocity_error": rms_velocity_error_sum / rollout_steps,
+            "max_abs_position_error": max_abs_position_error,
+            "action_clipped_fraction": (
+                clipped_action_count / float(max(action_value_count, 1))
+            ),
             "done_count": done_count,
             "timeout_count": timeout_count,
             "early_termination_count": early_termination_count,
+            "done_fraction": done_count / float(transition_count),
+            "timeout_fraction": timeout_count / float(transition_count),
+            "early_termination_fraction": (
+                early_termination_count / float(transition_count)
+            ),
             "episode_count": episode_count,
         }
         if episode_count > 0:
@@ -316,6 +363,7 @@ class PPO:
         save_interval=None,
         log_interval=1,
         metrics_path=None,
+        evaluation_callback=None,
     ):
         """Run a finite training segment and write AnimRL-compatible models.
 
@@ -382,11 +430,33 @@ class PPO:
                     "fps": iteration_timesteps / max(iteration_time, 1.0e-12),
                 }
             )
+            if evaluation_callback is not None:
+                evaluation_start = time.perf_counter()
+                evaluation_stats = evaluation_callback(iteration, self)
+                evaluation_time = time.perf_counter() - evaluation_start
+                if evaluation_stats is not None:
+                    stats.update(evaluation_stats)
+                    stats["evaluation_time_s"] = evaluation_time
+                    score = float(stats["evaluation_score"])
+                    is_best = score > self.best_evaluation_score
+                    if is_best:
+                        self.best_evaluation_score = score
+                        self.best_evaluation_iteration = iteration
+                    stats["evaluation_best_score"] = float(
+                        self.best_evaluation_score
+                    )
+                    stats["evaluation_is_best"] = float(is_best)
+                    if is_best and checkpoint_dir is not None:
+                        self.save(
+                            checkpoint_dir / "best_model.pt",
+                            infos=self._checkpoint_infos(stats),
+                        )
             history.append(stats)
 
             if metrics_path is not None:
                 with metrics_path.open("a", encoding="utf-8") as metrics_file:
                     metrics_file.write(json.dumps(stats, sort_keys=True) + "\n")
+            self._write_tensorboard(stats)
             if iteration % log_interval == 0:
                 self._print_iteration(stats, end_iteration)
             if checkpoint_dir is not None and iteration % save_interval == 0:
@@ -403,12 +473,55 @@ class PPO:
             )
         return history
 
+    def _write_tensorboard(self, stats):
+        if self.writer is None:
+            return
+        iteration = int(stats["iteration"])
+        tags = {
+            "Train/mean_step_reward": "mean_reward",
+            "Reward/position": "mean_position_reward",
+            "Reward/velocity": "mean_velocity_reward",
+            "Tracking/rms_arm_position_error": "mean_rms_position_error",
+            "Tracking/rms_arm_velocity_error": "mean_rms_velocity_error",
+            "Tracking/max_abs_arm_position_error": "max_abs_position_error",
+            "Policy/mean_action_std": "mean_action_std",
+            "Policy/action_clipped_fraction": "action_clipped_fraction",
+            "Loss/value": "value_loss",
+            "Loss/surrogate": "surrogate_loss",
+            "Termination/done_fraction": "done_fraction",
+            "Termination/early_fraction": "early_termination_fraction",
+            "Termination/timeout_fraction": "timeout_fraction",
+            "Perf/fps": "fps",
+            "Perf/collection_time_s": "collection_time_s",
+            "Perf/learning_time_s": "learning_time_s",
+            "Perf/iteration_time_s": "iteration_time_s",
+            "Perf/total_timesteps": "total_timesteps",
+            "Learn/learning_rate": "learning_rate",
+        }
+        for tag, key in tags.items():
+            self.writer.add_scalar(tag, stats[key], iteration)
+        for key, value in stats.items():
+            if key.startswith("episode_"):
+                self.writer.add_scalar(
+                    "Episode/{}".format(key[len("episode_"):]),
+                    value,
+                    iteration,
+                )
+            elif key.startswith("evaluation_"):
+                self.writer.add_scalar(
+                    "Evaluation/{}".format(key[len("evaluation_"):]),
+                    value,
+                    iteration,
+                )
+
     def _checkpoint_infos(self, stats):
         infos = {
             "iteration": int(stats["iteration"]),
             "next_iteration": int(stats["next_iteration"]),
             "total_timesteps": int(self.total_timesteps),
             "total_time_s": float(self.total_time_s),
+            "best_evaluation_score": float(self.best_evaluation_score),
+            "best_evaluation_iteration": int(self.best_evaluation_iteration),
         }
         if self.normalize_observation:
             infos["actor_normalizer_count"] = int(
@@ -431,7 +544,8 @@ class PPO:
         print(
             "Iteration {}/{} | reward={:.4f} | {} | "
             "value_loss={:.4f} | surrogate_loss={:.4f} | "
-            "std={:.3f} | fps={:.0f} | dones={} (early={}, timeout={})".format(
+            "std={:.3f} | clipped={:.3f} | fps={:.0f} | "
+            "dones={} (early={}, timeout={})".format(
                 stats["iteration"],
                 end_iteration - 1,
                 stats["mean_reward"],
@@ -439,12 +553,25 @@ class PPO:
                 stats["value_loss"],
                 stats["surrogate_loss"],
                 stats["mean_action_std"],
+                stats["action_clipped_fraction"],
                 stats["fps"],
                 stats["done_count"],
                 stats["early_termination_count"],
                 stats["timeout_count"],
             )
         )
+        if "evaluation_score" in stats:
+            print(
+                "  Evaluation | score={:.4f} | fixed_pos={:.4f} | "
+                "uniform_pos={:.4f} | early(fixed/uniform)={:.3f}/{:.3f}{}".format(
+                    stats["evaluation_score"],
+                    stats["evaluation_fixed_mean_position_reward"],
+                    stats["evaluation_uniform_mean_position_reward"],
+                    stats["evaluation_fixed_early_termination_fraction"],
+                    stats["evaluation_uniform_early_termination_fraction"],
+                    " | new best" if stats["evaluation_is_best"] else "",
+                )
+            )
 
     def save(self, path, infos=None):
         path = Path(path)
@@ -487,6 +614,12 @@ class PPO:
         if isinstance(infos, dict):
             self.total_timesteps = int(infos.get("total_timesteps", 0))
             self.total_time_s = float(infos.get("total_time_s", 0.0))
+            self.best_evaluation_score = float(
+                infos.get("best_evaluation_score", -math.inf)
+            )
+            self.best_evaluation_iteration = int(
+                infos.get("best_evaluation_iteration", -1)
+            )
             if load_normalizers and self.normalize_observation:
                 self.actor_obs_normalizer.count = int(
                     infos.get("actor_normalizer_count", 0)
@@ -522,3 +655,9 @@ class PPO:
         if self.normalize_observation:
             self.actor_obs_normalizer.eval()
             self.critic_obs_normalizer.eval()
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
+            self.writer = None

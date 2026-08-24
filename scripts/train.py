@@ -18,7 +18,10 @@ from simtoolreal_animrl.cfg import (
     config_to_dict,
 )
 from simtoolreal_animrl.envs.motion_imitation import MotionImitationEnv
-from simtoolreal_animrl.runners import PPO
+from simtoolreal_animrl.runners import (
+    PPO,
+    SubprocessDeterministicEvaluator,
+)
 
 
 def parse_args():
@@ -63,6 +66,14 @@ def parse_args():
         help="Required only for legacy checkpoints without iteration metadata.",
     )
     parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--eval-interval", type=int, default=None)
+    parser.add_argument("--eval-num-envs", type=int, default=None)
+    parser.add_argument("--eval-seed", type=int, default=None)
+    parser.add_argument(
+        "--no-periodic-eval",
+        action="store_true",
+        help="Disable the deterministic fixed/uniform RSI evaluation.",
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument(
         "--viewer",
@@ -128,6 +139,18 @@ def main():
         env_cfg.env.num_envs = int(args.num_envs)
     if args.run_name is not None:
         train_cfg.runner.run_name = args.run_name
+    if args.no_periodic_eval:
+        train_cfg.runner.evaluation_enabled = False
+    if args.eval_interval is not None:
+        if args.eval_interval <= 0:
+            raise ValueError("--eval-interval must be positive")
+        train_cfg.runner.evaluation_interval = int(args.eval_interval)
+    if args.eval_num_envs is not None:
+        if args.eval_num_envs <= 0:
+            raise ValueError("--eval-num-envs must be positive")
+        train_cfg.runner.evaluation_num_envs = int(args.eval_num_envs)
+    if args.eval_seed is not None:
+        train_cfg.runner.evaluation_seed = int(args.eval_seed)
 
     num_iterations = (
         int(args.iterations)
@@ -153,6 +176,7 @@ def main():
         headless=not args.viewer,
         num_envs_override=None,
     )
+    runner = None
     try:
         runner = PPO(env, train_cfg, log_dir=run_dir, device=env.device)
         checkpoint_infos = None
@@ -170,6 +194,24 @@ def main():
                 env.num_envs, num_iterations, start_iteration
             )
         )
+        evaluator = None
+        if bool(train_cfg.runner.evaluation_enabled):
+            evaluator = SubprocessDeterministicEvaluator(
+                interval=train_cfg.runner.evaluation_interval,
+                num_envs=train_cfg.runner.evaluation_num_envs,
+                seed=train_cfg.runner.evaluation_seed,
+                fixed_phases=train_cfg.runner.evaluation_fixed_phases,
+                sim_device=args.sim_device,
+                config_path=run_dir / "config.json",
+                run_dir=run_dir,
+            )
+            print(
+                "Periodic deterministic evaluation: {} envs every {} "
+                "iterations".format(
+                    train_cfg.runner.evaluation_num_envs,
+                    train_cfg.runner.evaluation_interval,
+                )
+            )
         runner.learn(
             num_iterations=num_iterations,
             start_iteration=start_iteration,
@@ -177,8 +219,11 @@ def main():
             save_interval=save_interval,
             log_interval=args.log_interval,
             metrics_path=run_dir / "metrics.jsonl",
+            evaluation_callback=evaluator,
         )
     finally:
+        if runner is not None:
+            runner.close()
         env.close()
 
 

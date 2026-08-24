@@ -109,5 +109,13 @@ class BaseTrainCfg(ABCConfig):
         record_iters = 10
         experiment_name = "simtoolreal"
         run_name = "llcfix_animrl"
-        wandb = True
+        tensorboard = True
+        tensorboard_flush_secs = 10
+        evaluation_enabled = True
+        evaluation_interval = 100
+        evaluation_num_envs = 64
+        evaluation_seed = 123
+        evaluation_fixed_phases = [0.0, 0.25, 0.5, 0.75]
+        # W&B remains a future optional backend; this milestone logs locally.
+        wandb = False
         wandb_group = "default"

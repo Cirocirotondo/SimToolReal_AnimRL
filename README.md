@@ -97,9 +97,36 @@ number of PPO updates with:
   --resume logs/simtoolreal/<run>/model_2.pt
 ```
 
-Each run stores `config.json`, `metrics.jsonl`, and AnimRL-compatible models.
-TensorBoard/WandB, periodic evaluation, and video capture remain deliberately
-deferred.
+Each run stores `config.json`, `metrics.jsonl`, TensorBoard event files, and
+AnimRL-compatible models. Follow a running experiment locally with:
+
+```bash
+/home/simone/.venv/bin/tensorboard --logdir logs/simtoolreal
+```
+
+TensorBoard records reward components, actor/critic losses, policy standard
+deviation, action clipping, arm tracking errors, termination fractions, and
+throughput, plus periodic deterministic evaluation. W&B and video capture
+remain deliberately deferred. The data is visible here:
+`http://localhost:6006`
+
+Periodic evaluation runs in a separate headless environment every 100 PPO
+updates by default. It evaluates the deterministic policy mean on both fixed
+RSI phases (`0`, `0.25`, `0.5`, `0.75`) and a uniformly sampled RSI cohort
+that is reconstructed from the same dedicated seed at every evaluation.
+`best_model.pt` is selected using the mean fixed/uniform position score, with early-terminated
+episodes penalized by subtracting their fraction from the mean position reward.
+This preserves a useful ranking while all early policies still fail, and makes
+any fully successful cohort outrank a fully failed one. Periodic
+`model_<iteration>.pt` checkpoints are retained independently.
+
+Override the evaluation cadence and size without editing configs:
+
+```bash
+python scripts/train.py --eval-interval 50 --eval-num-envs 128
+```
+
+Use `--no-periodic-eval` for short profiling/debug runs.
 
 ## Deterministic checkpoint evaluation
 

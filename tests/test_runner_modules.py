@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import torch
 
 from simtoolreal_animrl.cfg import (
@@ -12,6 +13,10 @@ from simtoolreal_animrl.runners.modules import (
     EmpiricalNormalization,
     Policy,
     Value,
+)
+from simtoolreal_animrl.runners.evaluation import (
+    DeterministicEvaluator,
+    preserve_random_state,
 )
 from simtoolreal_animrl.runners.storage import RolloutStorage
 
@@ -84,6 +89,14 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertEqual(train.algorithm.num_mini_batches, 4)
         self.assertEqual(train.algorithm.learning_rate, 1.0e-4)
         self.assertEqual(train.algorithm.schedule, "fixed")
+        self.assertTrue(train.runner.tensorboard)
+        self.assertFalse(train.runner.wandb)
+        self.assertTrue(train.runner.evaluation_enabled)
+        self.assertEqual(train.runner.evaluation_interval, 100)
+        self.assertEqual(train.runner.evaluation_num_envs, 64)
+        self.assertEqual(
+            train.runner.evaluation_fixed_phases, [0.0, 0.25, 0.5, 0.75]
+        )
         self.assertEqual(train.policy.actor_hidden_dims, [512, 256])
         self.assertEqual(train.policy.critic_hidden_dims, [512, 256])
 
@@ -97,6 +110,38 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertEqual(restored.algorithm.learning_rate, 1.0e-4)
         with self.assertRaises(KeyError):
             update_config_from_dict(restored, {"unknown": 1})
+
+    def test_evaluation_cohorts_are_repeatable(self):
+        class Reference:
+            last_index = 1107
+
+        class Env:
+            num_envs = 7
+            device = torch.device("cpu")
+            reference = Reference()
+
+        first = DeterministicEvaluator(Env(), 100, 123, [0.0, 0.5, 1.0])
+        second = DeterministicEvaluator(Env(), 100, 123, [0.0, 0.5, 1.0])
+        self.assertEqual(
+            first.fixed_indices.tolist(), [0, 553, 1106, 0, 553, 1106, 0]
+        )
+        self.assertTrue(
+            torch.equal(first.uniform_indices, second.uniform_indices)
+        )
+
+    def test_evaluation_preserves_torch_and_numpy_rng(self):
+        torch.manual_seed(17)
+        np.random.seed(17)
+        expected_torch = torch.rand(4)
+        expected_numpy = np.random.rand(4)
+
+        torch.manual_seed(17)
+        np.random.seed(17)
+        with preserve_random_state():
+            torch.rand(20)
+            np.random.rand(20)
+        self.assertTrue(torch.equal(torch.rand(4), expected_torch))
+        self.assertTrue(np.array_equal(np.random.rand(4), expected_numpy))
 
 
 if __name__ == "__main__":

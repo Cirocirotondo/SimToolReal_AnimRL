@@ -71,6 +71,22 @@ def main():
         configured_lr = float(train_cfg.algorithm.learning_rate)
 
         rollout = ppo.collect_rollout()
+        required_rollout_metrics = {
+            "mean_reward",
+            "mean_position_reward",
+            "mean_velocity_reward",
+            "mean_rms_position_error",
+            "mean_rms_velocity_error",
+            "max_abs_position_error",
+            "action_clipped_fraction",
+            "done_fraction",
+            "early_termination_fraction",
+            "timeout_fraction",
+        }
+        if not required_rollout_metrics.issubset(rollout):
+            raise AssertionError("PPO rollout diagnostics are incomplete")
+        if not 0.0 <= rollout["action_clipped_fraction"] <= 1.0:
+            raise AssertionError("Action clipping fraction is outside [0, 1]")
         if ppo.storage.step != train_cfg.runner.num_steps_per_env:
             raise AssertionError("Rollout storage is not full")
         for name in (
