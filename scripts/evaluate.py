@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Evaluate an AnimRL checkpoint with deterministic mean actions."""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def _configure_isaac_gym_graphics_environment():
+    """Prevent ROS/Gazebo libraries from shadowing NVIDIA graphics libs."""
+    if os.environ.get("ISAACGYM_PRESERVE_ROS_GRAPHICS_PATH") != "1":
+        library_path = os.environ.get("LD_LIBRARY_PATH", "")
+        kept_paths = [
+            entry
+            for entry in library_path.split(":")
+            if "/opt/ros/" not in entry and "/gazebo" not in entry.lower()
+        ]
+        if kept_paths:
+            os.environ["LD_LIBRARY_PATH"] = ":".join(kept_paths)
+        else:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+    nvidia_icd = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+    if os.path.isfile(nvidia_icd):
+        os.environ.setdefault("VK_ICD_FILENAMES", nvidia_icd)
+    os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+
+
+_configure_isaac_gym_graphics_environment()
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+# Preserve Isaac Gym's required import-before-torch ordering.
+from simtoolreal_animrl.cfg import (
+    SimToolRealCfg,
+    SimToolRealTrainCfg,
+    update_config_from_dict,
+)
+from simtoolreal_animrl.envs.motion_imitation import MotionImitationEnv
+from simtoolreal_animrl.runners import PPO
+
+import torch
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Defaults to config.json next to the checkpoint.",
+    )
+    parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--sim-device", default="cuda:0")
+    parser.add_argument("--seed", type=int, default=1)
+    rsi = parser.add_mutually_exclusive_group()
+    rsi.add_argument(
+        "--rsi-index",
+        type=int,
+        default=0,
+        help="Fixed initial reference sample (default: 0).",
+    )
+    rsi.add_argument(
+        "--uniform-rsi",
+        action="store_true",
+        help="Use the same seeded uniform RSI distribution as training.",
+    )
+    parser.add_argument(
+        "--viewer", action="store_true", help="Open the Isaac Gym viewer."
+    )
+    parser.add_argument(
+        "--print-every",
+        type=int,
+        default=30,
+        help="Print rollout diagnostics every N steps; 0 disables them.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="JSON output path (default: next to the checkpoint).",
+    )
+    return parser.parse_args()
+
+
+def load_saved_configuration(config_path):
+    env_cfg = SimToolRealCfg()
+    train_cfg = SimToolRealTrainCfg()
+    if config_path is None:
+        return env_cfg, train_cfg
+    with config_path.open("r", encoding="utf-8") as config_file:
+        saved = json.load(config_file)
+    if "env_cfg" not in saved or "train_cfg" not in saved:
+        raise ValueError(
+            "Configuration must contain env_cfg and train_cfg sections"
+        )
+    update_config_from_dict(env_cfg, saved["env_cfg"])
+    update_config_from_dict(train_cfg, saved["train_cfg"])
+    return env_cfg, train_cfg
+
+
+def scalar(value):
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().cpu())
+    return float(value)
+
+
+def main():
+    args = parse_args()
+    checkpoint = args.checkpoint.expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError("Checkpoint not found: {}".format(checkpoint))
+    config_path = (
+        args.config.expanduser().resolve()
+        if args.config is not None
+        else checkpoint.parent / "config.json"
+    )
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            "Training configuration not found: {}. Pass --config explicitly."
+            .format(config_path)
+        )
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be positive")
+    if args.episodes <= 0:
+        raise ValueError("--episodes must be positive")
+    if args.print_every < 0:
+        raise ValueError("--print-every cannot be negative")
+
+    env_cfg, train_cfg = load_saved_configuration(config_path)
+    env_cfg.seed = int(args.seed)
+    env_cfg.env.num_envs = int(args.num_envs)
+    env_cfg.env.play = True
+    env_cfg.viewer.enable_viewer = bool(args.viewer)
+    if int(env_cfg.env.num_observations) != 19:
+        raise ValueError("This evaluator requires the 19D arm observation contract")
+    if int(env_cfg.env.num_actions) != 6:
+        raise ValueError("This evaluator requires 6 absolute arm actions")
+
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output is not None
+        else checkpoint.parent / "eval_{}.json".format(checkpoint.stem)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    env = MotionImitationEnv(
+        env_cfg,
+        sim_device=args.sim_device,
+        headless=not args.viewer,
+        num_envs_override=None,
+    )
+    try:
+        runner = PPO(env, train_cfg, log_dir=None, device=env.device)
+        checkpoint_infos = runner.load(
+            checkpoint, load_optimizer=False, load_normalizers=True
+        )
+        policy = runner.get_inference_policy(device=env.device)
+
+        fixed_rsi = None if args.uniform_rsi else int(args.rsi_index)
+        if fixed_rsi is not None:
+            env.reset(reference_index=fixed_rsi)
+        else:
+            env.reset()
+
+        observations = env.get_observations()
+        completed_episodes = 0
+        total_steps = 0
+        total_reward = 0.0
+        done_count = 0
+        early_count = 0
+        timeout_count = 0
+        episode_weight = 0
+        episode_totals = {}
+        trajectory = {
+            "observations": [],
+            "actions": [],
+            "rewards": [],
+            "dones": [],
+            "reference_indices": [],
+            "max_abs_position_errors": [],
+        }
+
+        print("Checkpoint: {}".format(checkpoint))
+        print("Configuration: {}".format(config_path))
+        print(
+            "Evaluating deterministic mean actions: {} env(s), RSI={}".format(
+                env.num_envs,
+                "uniform" if fixed_rsi is None else fixed_rsi,
+            )
+        )
+        with torch.inference_mode():
+            while completed_episodes < args.episodes:
+                actions = policy(observations)
+                (
+                    observations,
+                    _,
+                    rewards,
+                    dones,
+                    infos,
+                ) = env.step(actions)
+                total_steps += 1
+                total_reward += scalar(rewards.mean())
+                step_done_count = int(dones.sum())
+                done_count += step_done_count
+                early_count += int(infos["early_termination"].sum())
+                timeout_count += int(infos["time_outs"].sum())
+
+                trajectory["observations"].append(
+                    observations[0].detach().cpu().tolist()
+                )
+                trajectory["actions"].append(
+                    actions[0].detach().cpu().tolist()
+                )
+                trajectory["rewards"].append(float(rewards[0]))
+                trajectory["dones"].append(bool(dones[0]))
+                trajectory["reference_indices"].append(
+                    int(infos["reference_index"][0])
+                )
+                trajectory["max_abs_position_errors"].append(
+                    float(infos["max_abs_position_error"][0])
+                )
+
+                if "episode" in infos:
+                    episode = infos["episode"]
+                    completed = int(episode["completed_episodes"])
+                    completed_episodes += completed
+                    episode_weight += completed
+                    for name, value in episode.items():
+                        if name == "completed_episodes":
+                            continue
+                        episode_totals[name] = episode_totals.get(name, 0.0) + (
+                            scalar(value) * completed
+                        )
+                    if fixed_rsi is not None and completed_episodes < args.episodes:
+                        env.reset(reference_index=fixed_rsi)
+                        observations = env.get_observations()
+
+                if args.print_every > 0 and total_steps % args.print_every == 0:
+                    print(
+                        "step {:5d} | reward {:.6f} | max q error {:.6f} rad "
+                        "| completed {}".format(
+                            total_steps,
+                            scalar(rewards.mean()),
+                            scalar(infos["max_abs_position_error"].max()),
+                            completed_episodes,
+                        )
+                    )
+                if args.viewer and env.viewer_closed():
+                    print("Viewer closed before the requested episodes completed")
+                    break
+
+        episode_metrics = {
+            name: total / episode_weight
+            for name, total in episode_totals.items()
+        } if episode_weight else {}
+        result = {
+            "checkpoint": str(checkpoint),
+            "config": str(config_path),
+            "checkpoint_infos": checkpoint_infos,
+            "deterministic": True,
+            "seed": int(args.seed),
+            "num_envs": env.num_envs,
+            "rsi": "uniform" if fixed_rsi is None else fixed_rsi,
+            "requested_episodes": int(args.episodes),
+            "completed_episodes": completed_episodes,
+            "environment_steps": total_steps,
+            "mean_step_reward": total_reward / max(total_steps, 1),
+            "done_count": done_count,
+            "early_termination_count": early_count,
+            "timeout_count": timeout_count,
+            "episode_metrics": episode_metrics,
+            "trajectory_env_0": trajectory,
+        }
+        with output_path.open("w", encoding="utf-8") as output_file:
+            json.dump(result, output_file, indent=2, sort_keys=True)
+
+        print("Evaluation complete")
+        print("  completed episodes : {}".format(completed_episodes))
+        print("  environment steps  : {}".format(total_steps))
+        print("  mean step reward   : {:.6f}".format(result["mean_step_reward"]))
+        print("  early / timeout    : {} / {}".format(
+            early_count, timeout_count
+        ))
+        if episode_metrics:
+            print("  mean return        : {:.6f}".format(
+                episode_metrics["return"]
+            ))
+            print("  mean episode length: {:.2f}".format(
+                episode_metrics["length"]
+            ))
+        print("  output             : {}".format(output_path))
+    finally:
+        env.close()
+
+
+if __name__ == "__main__":
+    main()
