@@ -60,10 +60,10 @@ def main():
         if ppo.storage.observations.shape != (
             train_cfg.runner.num_steps_per_env,
             env.num_envs,
-            19,
+            79,
         ):
             raise AssertionError("Unexpected rollout observation shape")
-        if ppo.storage.actions.shape[-1] != 6:
+        if ppo.storage.actions.shape[-1] != 26:
             raise AssertionError("Unexpected rollout action shape")
 
         policy_before = clone_parameters(ppo.policy)
@@ -79,6 +79,10 @@ def main():
             "mean_rms_position_error",
             "mean_rms_velocity_error",
             "mean_rms_action_rate",
+            "mean_hand_position_reward",
+            "mean_hand_velocity_reward",
+            "mean_hand_action_rate_reward",
+            "mean_rms_hand_position_error",
             "max_abs_position_error",
             "action_target_clipped_fraction",
             "mean_abs_action",
@@ -180,7 +184,13 @@ def main():
                 tuple(ppo.storage.observations.shape)
             )
         )
-        print("  actor/value dimensions    : 19 -> [512, 256] -> 6 / 1")
+        print(
+            "  actor/value dimensions    : {} -> {} -> {} / 1".format(
+                env.num_obs,
+                list(train_cfg.policy.actor_hidden_dims),
+                env.num_actions,
+            )
+        )
         print("  learning epochs/minibatch : 5 / 4")
         print("  fixed learning rate       : {:.1e}".format(configured_lr))
         print("  rollout mean reward       : {:.6f}".format(rollout["mean_reward"]))

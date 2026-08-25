@@ -12,13 +12,14 @@ class ConfigAndDemoTest(unittest.TestCase):
         env_cfg = SimToolRealCfg()
         train_cfg = SimToolRealTrainCfg()
         self.assertEqual(env_cfg.env.num_envs, 4096)
-        self.assertEqual(env_cfg.env.episode_length, 500)
-        self.assertEqual(env_cfg.env.num_observations, 19)
-        self.assertEqual(env_cfg.env.num_actions, 6)
+        self.assertEqual(env_cfg.env.episode_length, 100)
+        self.assertEqual(env_cfg.env.num_observations, 79)
+        self.assertEqual(env_cfg.env.num_actions, 26)
         self.assertEqual(
             env_cfg.control.action_parameterization, "animrl_residual"
         )
         self.assertEqual(env_cfg.control.scale_joint_target, 0.25)
+        self.assertEqual(env_cfg.control.scale_hand_joint_target, 0.15)
         self.assertEqual(env_cfg.control.clip_joint_target, 100.0)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)

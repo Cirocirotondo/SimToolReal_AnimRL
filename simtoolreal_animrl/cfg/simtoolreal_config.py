@@ -7,11 +7,10 @@ class SimToolRealCfg(BaseEnvCfg):
     class env(BaseEnvCfg.env):
         num_envs = 4096
         episode_length = 100
-        num_actions = 6
-        # 6 normalized arm q + 6 previous physical arm targets + 6 arm dq
-        # + 1 normalized reference phase. The hand follows the demonstration
-        # directly and is neither observed nor controlled by the policy.
-        num_observations = 19
+        num_actions = 26
+        # 26 normalized q + 26 previous physical targets + 26 dq + 1 normalized
+        # reference phase, over the 6 arm and 20 hand joints alike.
+        num_observations = 79
         num_privileged_obs = None
         reference_state_initialization = True
         reference_init_distribution = "uniform"
@@ -42,6 +41,15 @@ class SimToolRealCfg(BaseEnvCfg):
             1.5709867791,
             -2.6179869035,
         ]
+        # Sample zero of the demonstration for the 20 DG5F joints, in the
+        # rj_dg_<finger>_<joint> order of controller.HAND_JOINT_NAMES.
+        default_hand_joint_angles = [
+            0.3823220950, -0.1954499712, 0.0374738305, 0.0331612558,
+            -0.1989675347, 0.0575958653, 0.0000000000, 0.2456188158,
+            0.1364082419, 0.3909537524, 0.0191986218, 0.0575942737,
+            0.2129301687, 0.3926990817, 0.0418879020, 0.0314159265,
+            0.2112131611, 0.3211405824, 0.3385938749, 0.0261799388,
+        ]
 
     class motion:
         file = "demonstrations/demo_20260727_152551_335339_60hz.npz"
@@ -52,19 +60,30 @@ class SimToolRealCfg(BaseEnvCfg):
         decimation = 1
         action_parameterization = "animrl_residual"
         scale_joint_target = 0.25
+        # Finer residual for the hand. Its joints travel a median of 0.414 rad
+        # from the default pose against the arm's 0.458, and the smaller scale
+        # buys resolution for the contact work that follows.
+        scale_hand_joint_target = 0.15
         clip_joint_target = 100.0
 
     class rewards:
-        position_weight = 0.8
-        velocity_weight = 0.2
-        position_std_rad = 0.223607
-        velocity_std_rad_per_s = 0.3
-        # Action-rate regularization on a_t - a_{t-1}. The processed
-        # demonstration never exceeds an RMS action delta of 0.012, so a
-        # 0.05 std leaves perfect tracking essentially unpenalized while
-        # suppressing the high-frequency chatter of an unregularized policy.
-        action_rate_weight = 0.2
-        action_rate_std = 5
+        # Arm and hand keep separate Gaussian terms so neither dilutes the
+        # other's gradient. The arm values are unchanged and the hand mirrors
+        # them, which doubles the maximum per-step reward to 2.4.
+        position_arm_weight = 0.8
+        velocity_arm_weight = 0.2
+        action_rate_arm_weight = 0.2
+        position_arm_std_rad = 0.223607
+        velocity_arm_std_rad_per_s = 1.0
+        # Action-rate regularization on a_t - a_{t-1}, per block.
+        action_rate_arm_std = 5
+
+        position_hand_weight = 0.8
+        velocity_hand_weight = 0.2
+        action_rate_hand_weight = 0.2
+        position_hand_std_rad = 0.223607
+        velocity_hand_std_rad_per_s = 1.0
+        action_rate_hand_std = 5
 
     class termination:
         enabled = True
