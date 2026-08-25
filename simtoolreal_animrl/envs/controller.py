@@ -21,6 +21,14 @@ HAND_JOINT_NAMES = tuple(
 )
 JOINT_NAMES = ARM_JOINT_NAMES + HAND_JOINT_NAMES
 
+# Finite UR5e position-drive gains tuned at 60 Hz / two PhysX substeps against
+# both the recorded motion and the synthetic all-arm-joints trajectory.  The
+# official UR Gazebo effort-controller profile was used only as the starting
+# shape; these lower gains preserve tracking without the float32-max fallback
+# previously inherited from the asset.
+ARM_PD_STIFFNESS = (1000.0, 1000.0, 1000.0, 200.0, 200.0, 100.0)
+ARM_PD_DAMPING = (100.0, 100.0, 100.0, 10.0, 10.0, 10.0) #(25.0, 25.0, 5.0, 0.25, 0.25, 0.025)
+
 # Source of truth copied from the corrected hand_dofs == 20 branch of
 # simtoolreal/isaacgymenvs/tasks/simtoolreal/utils.py and from the verified
 # Isaac Gym demonstration viewer.
@@ -59,7 +67,10 @@ def validate_joint_order(gym, asset) -> np.ndarray:
 def configure_pd_properties(gym, asset, demo_to_asset: np.ndarray):
     properties = gym.get_asset_dof_properties(asset)
     properties["driveMode"].fill(int(gymapi.DOF_MODE_POS))
+    arm_indices = demo_to_asset[:len(ARM_JOINT_NAMES)]
     hand_indices = demo_to_asset[len(ARM_JOINT_NAMES):]
+    properties["stiffness"][arm_indices] = ARM_PD_STIFFNESS
+    properties["damping"][arm_indices] = ARM_PD_DAMPING
     properties["stiffness"][hand_indices] = HAND_PD_STIFFNESS
     properties["damping"][hand_indices] = HAND_PD_DAMPING
     return properties

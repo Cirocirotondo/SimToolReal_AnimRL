@@ -100,22 +100,37 @@ class DeterministicEvaluator:
         reward_sum = torch.zeros_like(episode_steps)
         position_reward_sum = torch.zeros_like(episode_steps)
         velocity_reward_sum = torch.zeros_like(episode_steps)
+        action_rate_reward_sum = torch.zeros_like(episode_steps)
         rms_position_error_sum = torch.zeros_like(episode_steps)
+        rms_action_rate_sum = torch.zeros_like(episode_steps)
         rms_velocity_error_sum = torch.zeros_like(episode_steps)
         max_position_error = torch.zeros_like(episode_steps)
         early = torch.zeros_like(active)
         timeout = torch.zeros_like(active)
-        clipped_components = 0
+        clipped_target_components = 0
         action_components = 0
+        abs_action_sum = 0.0
+        max_abs_action = 0.0
 
         with torch.inference_mode():
             for _ in range(self.env.max_episode_length):
                 normalized = runner.actor_obs_normalizer(observations)
                 actions = runner.policy.act_inference(normalized)
-                clipped_components += int(
-                    ((actions.abs() > 1.0) & active[:, None]).sum()
+                clipped_target_components += int(
+                    (
+                        (
+                            actions.abs() * self.env.action_scale
+                            > self.env.action_target_clip
+                        )
+                        & active[:, None]
+                    ).sum()
                 )
                 action_components += int(active.sum()) * self.env.num_actions
+                abs_action_sum += float((actions.abs() * active[:, None]).sum())
+                if bool(active.any()):
+                    max_abs_action = max(
+                        max_abs_action, float(actions[active].abs().max())
+                    )
                 observations, _, rewards, dones, infos = self.env.step(actions)
 
                 active_float = active.float()
@@ -123,6 +138,10 @@ class DeterministicEvaluator:
                 reward_sum += rewards * active_float
                 position_reward_sum += infos["position_reward"] * active_float
                 velocity_reward_sum += infos["velocity_reward"] * active_float
+                action_rate_reward_sum += (
+                    infos["action_rate_reward"] * active_float
+                )
+                rms_action_rate_sum += infos["rms_action_rate"] * active_float
                 rms_position_error_sum += (
                     infos["rms_position_error"] * active_float
                 )
@@ -152,6 +171,12 @@ class DeterministicEvaluator:
             "mean_velocity_reward": float(
                 (velocity_reward_sum / lengths).mean()
             ),
+            "mean_action_rate_reward": float(
+                (action_rate_reward_sum / lengths).mean()
+            ),
+            "mean_rms_action_rate": float(
+                (rms_action_rate_sum / lengths).mean()
+            ),
             "mean_rms_position_error": float(
                 (rms_position_error_sum / lengths).mean()
             ),
@@ -162,8 +187,10 @@ class DeterministicEvaluator:
             "mean_episode_length": float(episode_steps.mean()),
             "early_termination_fraction": float(early.float().mean()),
             "timeout_fraction": float(timeout.float().mean()),
-            "action_clipped_fraction": clipped_components
+            "action_target_clipped_fraction": clipped_target_components
             / float(max(action_components, 1)),
+            "mean_abs_action": abs_action_sum / float(max(action_components, 1)),
+            "max_abs_action": max_abs_action,
             # Position remains the ranking signal. Subtracting the failure
             # fraction prevents short failed rollouts from looking artificially
             # good while retaining resolution when every early policy fails.

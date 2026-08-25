@@ -68,7 +68,7 @@ class BaseEnvCfg(ABCConfig):
 
     class viewer:
         enable_viewer = False
-        camera_position = [1.8, 2.0, 1.5]
+        camera_position = [-1.8,-2.0, 1.5] # [1.8, 2.0, 1.5]
         camera_lookat = [0.0, 0.6, 0.75]
 
 
@@ -112,7 +112,7 @@ class BaseTrainCfg(ABCConfig):
         tensorboard = True
         tensorboard_flush_secs = 10
         evaluation_enabled = True
-        evaluation_interval = 100
+        evaluation_interval = 500
         evaluation_num_envs = 64
         evaluation_seed = 123
         evaluation_fixed_phases = [0.0, 0.25, 0.5, 0.75]

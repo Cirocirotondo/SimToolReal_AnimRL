@@ -52,6 +52,12 @@ class MotionImitationEnv:
         self.dt = float(self.cfg.sim.dt) * int(self.cfg.control.decimation)
         if self.num_actions != len(ARM_JOINT_NAMES):
             raise ValueError("The arm-only policy requires exactly 6 actions")
+        if self.cfg.control.action_parameterization != "animrl_residual":
+            raise ValueError("Only the AnimRL residual action contract is supported")
+        self.action_scale = float(self.cfg.control.scale_joint_target)
+        self.action_target_clip = float(self.cfg.control.clip_joint_target)
+        if self.action_scale <= 0.0 or self.action_target_clip <= 0.0:
+            raise ValueError("AnimRL action scale and target clip must be positive")
         if not math.isclose(
             self.dt,
             1.0 / float(self.cfg.motion.frequency_hz),
@@ -195,6 +201,17 @@ class MotionImitationEnv:
         )
         self.arm_lower_limits = self.joint_lower_limits[: len(ARM_JOINT_NAMES)]
         self.arm_upper_limits = self.joint_upper_limits[: len(ARM_JOINT_NAMES)]
+        self.default_arm_positions = torch.as_tensor(
+            self.cfg.init_state.default_arm_joint_angles,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self.default_arm_positions.shape != (len(ARM_JOINT_NAMES),):
+            raise ValueError("Default arm pose must contain exactly 6 angles")
+        if torch.any(self.default_arm_positions < self.arm_lower_limits) or torch.any(
+            self.default_arm_positions > self.arm_upper_limits
+        ):
+            raise ValueError("Default arm pose exceeds the URDF position limits")
         self.demo_to_asset_tensor = torch.as_tensor(
             self.demo_to_asset, dtype=torch.long, device=self.device
         )
@@ -317,6 +334,8 @@ class MotionImitationEnv:
         self.actions = torch.zeros(
             (self.num_envs, self.num_actions), dtype=torch.float32, device=self.device
         )
+        # a_{t-1} for the action-rate regularization term.
+        self.previous_actions = torch.zeros_like(self.actions)
         self.episode_sums = {
             name: torch.zeros(
                 self.num_envs, dtype=torch.float32, device=self.device
@@ -325,8 +344,10 @@ class MotionImitationEnv:
                 "reward",
                 "position_reward",
                 "velocity_reward",
+                "action_rate_reward",
                 "rms_position_error",
                 "rms_velocity_error",
+                "rms_action_rate",
             )
         }
         self.extras = {}
@@ -374,19 +395,24 @@ class MotionImitationEnv:
         destination[:, self.demo_to_asset_tensor] = values
 
     def scale_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        return (
-            0.5 * (actions.clamp(-1.0, 1.0) + 1.0)
-            * (self.arm_upper_limits - self.arm_lower_limits)
-            + self.arm_lower_limits
+        """Apply AnimRL's unbounded residual-action target mapping."""
+        residual = (actions * self.action_scale).clamp(
+            -self.action_target_clip, self.action_target_clip
         )
+        return self.default_arm_positions + residual
 
-    def unscale_arm_positions(self, positions: torch.Tensor) -> torch.Tensor:
+    def normalize_arm_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        """Normalize physical arm positions only for the observation vector."""
         return (
             2.0
             * (positions - self.arm_lower_limits)
             / (self.arm_upper_limits - self.arm_lower_limits)
             - 1.0
         ).clamp(-1.0, 1.0)
+
+    def arm_positions_to_actions(self, positions: torch.Tensor) -> torch.Tensor:
+        """Invert the AnimRL residual mapping for ideal reference playback."""
+        return (positions - self.default_arm_positions) / self.action_scale
 
     def next_reference_action(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the ideal six-arm action and complete next reference pose."""
@@ -395,7 +421,7 @@ class MotionImitationEnv:
         )
         target = self.reference.sample(next_indices).q
         arm_target = target[:, : len(ARM_JOINT_NAMES)]
-        return self.unscale_arm_positions(arm_target), target
+        return self.arm_positions_to_actions(arm_target), target
 
     def reset_idx(
         self,
@@ -442,6 +468,15 @@ class MotionImitationEnv:
         if hasattr(self, "episode_sums"):
             for values in self.episode_sums.values():
                 values[env_ids] = 0.0
+        if hasattr(self, "previous_actions"):
+            # Seed a_{t-1} with the action that reproduces the RSI pose instead
+            # of zero, so the first step of an episode is not charged an
+            # action-rate penalty for the reset discontinuity.
+            reset_action = self.arm_positions_to_actions(
+                sample.q[:, : len(ARM_JOINT_NAMES)]
+            )
+            self.actions[env_ids] = reset_action
+            self.previous_actions[env_ids] = reset_action
 
         state_subset = self.dof_state[env_ids]
         state_subset[:, self.demo_to_asset_tensor, 0] = sample.q
@@ -481,7 +516,7 @@ class MotionImitationEnv:
         phase = (
             self.reference_index.float() / float(self.reference.last_index)
         ).unsqueeze(1)
-        normalized_arm_q = self.unscale_arm_positions(self.arm_q)
+        normalized_arm_q = self.normalize_arm_positions(self.arm_q)
         self.obs_buf.copy_(
             torch.cat(
                 (
@@ -508,6 +543,8 @@ class MotionImitationEnv:
         hand_dq_error = self.hand_dq - reference_hand_dq
         position_mse = arm_q_error.square().mean(dim=1)
         velocity_mse = arm_dq_error.square().mean(dim=1)
+        action_rate = self.actions - self.previous_actions
+        action_rate_mse = action_rate.square().mean(dim=1)
         position_reward = torch.exp(
             -position_mse / (2.0 * float(self.cfg.rewards.position_std_rad) ** 2)
         )
@@ -515,9 +552,13 @@ class MotionImitationEnv:
             -velocity_mse
             / (2.0 * float(self.cfg.rewards.velocity_std_rad_per_s) ** 2)
         )
+        action_rate_reward = torch.exp(
+            -action_rate_mse / (2.0 * float(self.cfg.rewards.action_rate_std) ** 2)
+        )
         self.rew_buf.copy_(
             float(self.cfg.rewards.position_weight) * position_reward
             + float(self.cfg.rewards.velocity_weight) * velocity_reward
+            + float(self.cfg.rewards.action_rate_weight) * action_rate_reward
         )
         return {
             "q_error": arm_q_error,
@@ -526,8 +567,10 @@ class MotionImitationEnv:
             "hand_dq_error": hand_dq_error,
             "position_mse": position_mse,
             "velocity_mse": velocity_mse,
+            "action_rate_mse": action_rate_mse,
             "position_reward": position_reward,
             "velocity_reward": velocity_reward,
+            "action_rate_reward": action_rate_reward,
         }
 
     def threshold_violation(self, q_error: torch.Tensor) -> torch.Tensor:
@@ -568,11 +611,15 @@ class MotionImitationEnv:
         self.episode_sums["reward"] += self.rew_buf
         self.episode_sums["position_reward"] += metrics["position_reward"]
         self.episode_sums["velocity_reward"] += metrics["velocity_reward"]
+        self.episode_sums["action_rate_reward"] += metrics["action_rate_reward"]
         self.episode_sums["rms_position_error"] += metrics[
             "position_mse"
         ].sqrt()
         self.episode_sums["rms_velocity_error"] += metrics[
             "velocity_mse"
+        ].sqrt()
+        self.episode_sums["rms_action_rate"] += metrics[
+            "action_rate_mse"
         ].sqrt()
 
     def _build_episode_summary(
@@ -604,9 +651,13 @@ class MotionImitationEnv:
                 )
             )
         # Pre-Physics Step: clamp and scale the actions, then write them to the robot DOF position targets.
-        self.actions = actions.to(device=self.device, dtype=torch.float32).clamp(
-            -1.0, 1.0
-        )
+        # Capture a_{t-1} before a_t overwrites it, so the action-rate
+        # regularization computed post-physics sees the correct pair.
+        self.previous_actions.copy_(self.actions)
+        # Copy into the owned buffer rather than rebinding: PPO collects inside
+        # torch.inference_mode(), and an inference tensor cannot be updated
+        # in place later by reset_idx().
+        self.actions.copy_(actions.to(device=self.device, dtype=torch.float32))
         arm_target_q = self.scale_actions(self.actions)
         next_indices = (self.reference_index + 1).clamp(
             max=self.reference.last_index
@@ -655,8 +706,10 @@ class MotionImitationEnv:
             "worst_joint_index": metrics["q_error"].abs().argmax(dim=1),
             "rms_position_error": metrics["position_mse"].sqrt(),
             "rms_velocity_error": metrics["velocity_mse"].sqrt(),
+            "rms_action_rate": metrics["action_rate_mse"].sqrt(),
             "position_reward": metrics["position_reward"],
             "velocity_reward": metrics["velocity_reward"],
+            "action_rate_reward": metrics["action_rate_reward"],
         }
         rewards = self.rew_buf.clone()
         dones = done.clone()
@@ -681,6 +734,8 @@ class MotionImitationEnv:
         stiffness = np.asarray(self.pd_properties["stiffness"], dtype=np.float64)
         damping = np.asarray(self.pd_properties["damping"], dtype=np.float64)
         return {
+            "arm_stiffness": stiffness[self.demo_to_asset[:len(ARM_JOINT_NAMES)]],
+            "arm_damping": damping[self.demo_to_asset[:len(ARM_JOINT_NAMES)]],
             "hand_stiffness": stiffness[self.demo_to_asset[len(ARM_JOINT_NAMES):]],
             "hand_damping": damping[self.demo_to_asset[len(ARM_JOINT_NAMES):]],
         }

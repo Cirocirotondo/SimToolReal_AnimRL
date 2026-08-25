@@ -40,6 +40,7 @@ from simtoolreal_animrl.cfg import (
 )
 from simtoolreal_animrl.envs.motion_imitation import MotionImitationEnv
 from simtoolreal_animrl.runners import PPO
+from simtoolreal_animrl.runners.eval_plotter import EvaluationPlotter
 
 import torch
 
@@ -62,7 +63,10 @@ def parse_args():
         "--rsi-index",
         type=int,
         default=0,
-        help="Fixed initial reference sample (default: 0).",
+        help=(
+            "Reference sample the episode starts from (default: 0). "
+            "Playback always continues to the final sample."
+        ),
     )
     rsi.add_argument(
         "--uniform-rsi",
@@ -83,6 +87,21 @@ def parse_args():
         type=Path,
         default=None,
         help="JSON output path (default: next to the checkpoint).",
+    )
+    parser.add_argument(
+        "--no-plots",
+        dest="plots",
+        action="store_false",
+        help="Skip the per-episode diagnostic figures.",
+    )
+    parser.add_argument(
+        "--plot-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for the diagnostic figures "
+            "(default: eval_plots/ next to the checkpoint)."
+        ),
     )
     return parser.parse_args()
 
@@ -107,6 +126,17 @@ def scalar(value):
     if isinstance(value, torch.Tensor):
         return float(value.detach().cpu())
     return float(value)
+
+
+def termination_reason(infos, env_idx=0):
+    """Name why env `env_idx` stopped, for the diagnostic figure titles."""
+    if bool(infos["early_termination"][env_idx]):
+        return "early_termination"
+    if bool(infos["reference_end"][env_idx]):
+        return "reference_end"
+    if bool(infos["horizon_time_outs"][env_idx]):
+        return "horizon"
+    return "done"
 
 
 def main():
@@ -136,10 +166,16 @@ def main():
     env_cfg.env.num_envs = int(args.num_envs)
     env_cfg.env.play = True
     env_cfg.viewer.enable_viewer = bool(args.viewer)
+    env_cfg.viewer.camera_position = [-1.0, -1.0, 1.5]
+    env_cfg.viewer.camera_lookat = [0.0, 0.6, 0.75]
+    # Playback always runs from the chosen RSI index to the final reference
+    # sample, so the tracking threshold must not cut the episode short. The
+    # threshold is still reported: see max_abs_position_error below.
+    env_cfg.termination.enabled = False
     if int(env_cfg.env.num_observations) != 19:
         raise ValueError("This evaluator requires the 19D arm observation contract")
     if int(env_cfg.env.num_actions) != 6:
-        raise ValueError("This evaluator requires 6 absolute arm actions")
+        raise ValueError("This evaluator requires 6 AnimRL residual arm actions")
 
     output_path = (
         args.output.expanduser().resolve()
@@ -147,6 +183,11 @@ def main():
         else checkpoint.parent / "eval_{}.json".format(checkpoint.stem)
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_dir = (
+        args.plot_dir.expanduser().resolve()
+        if args.plot_dir is not None
+        else checkpoint.parent / "eval_plots"
+    )
 
     env = MotionImitationEnv(
         env_cfg,
@@ -155,6 +196,20 @@ def main():
         num_envs_override=None,
     )
     try:
+        max_start = int(env.reference.last_index - 1)
+        if not args.uniform_rsi and not 0 <= int(args.rsi_index) <= max_start:
+            raise ValueError(
+                "--rsi-index must lie in [0, {}], got {}".format(
+                    max_start, args.rsi_index
+                )
+            )
+        # Starting at reference index k needs last_index - k transitions to
+        # reach the final sample; last_index covers the earliest possible
+        # start, and reference-end termination closes each episode on its own
+        # last transition. This replaces the saved training horizon.
+        env.max_episode_length = int(env.reference.last_index)
+        env.cfg.env.episode_length = env.max_episode_length
+
         runner = PPO(env, train_cfg, log_dir=None, device=env.device)
         checkpoint_infos = runner.load(
             checkpoint, load_optimizer=False, load_normalizers=True
@@ -174,6 +229,7 @@ def main():
         done_count = 0
         early_count = 0
         timeout_count = 0
+        peak_position_error = 0.0
         episode_weight = 0
         episode_totals = {}
         trajectory = {
@@ -184,6 +240,10 @@ def main():
             "reference_indices": [],
             "max_abs_position_errors": [],
         }
+        plotter = EvaluationPlotter(plot_dir) if args.plots else None
+        plot_paths = {}
+        if plotter is not None:
+            plotter.start_episode("episode_{:02d}".format(completed_episodes), env)
 
         print("Checkpoint: {}".format(checkpoint))
         print("Configuration: {}".format(config_path))
@@ -193,6 +253,22 @@ def main():
                 "uniform" if fixed_rsi is None else fixed_rsi,
             )
         )
+        if fixed_rsi is None:
+            print(
+                "Playing to reference sample {} from every uniform start; "
+                "early termination disabled.".format(env.reference.last_index)
+            )
+        else:
+            transitions = int(env.reference.last_index) - fixed_rsi
+            print(
+                "Playing samples {} to {}: {} transitions ({:.2f} s), early "
+                "termination disabled.".format(
+                    fixed_rsi,
+                    env.reference.last_index,
+                    transitions,
+                    transitions * env.dt,
+                )
+            )
         with torch.inference_mode():
             while completed_episodes < args.episodes:
                 actions = policy(observations)
@@ -209,6 +285,12 @@ def main():
                 done_count += step_done_count
                 early_count += int(infos["early_termination"].sum())
                 timeout_count += int(infos["time_outs"].sum())
+                # Early termination no longer stops playback, so the tracking
+                # threshold is reported instead of enforced.
+                peak_position_error = max(
+                    peak_position_error,
+                    scalar(infos["max_abs_position_error"].max()),
+                )
 
                 trajectory["observations"].append(
                     observations[0].detach().cpu().tolist()
@@ -224,6 +306,10 @@ def main():
                 trajectory["max_abs_position_errors"].append(
                     float(infos["max_abs_position_error"][0])
                 )
+                if plotter is not None:
+                    plotter.record(
+                        env, total_steps, actions, rewards, dones, infos
+                    )
 
                 if "episode" in infos:
                     episode = infos["episode"]
@@ -236,6 +322,12 @@ def main():
                         episode_totals[name] = episode_totals.get(name, 0.0) + (
                             scalar(value) * completed
                         )
+                    if plotter is not None:
+                        plot_paths = plotter.finalize(termination_reason(infos))
+                        if completed_episodes < args.episodes:
+                            plotter.start_episode(
+                                "episode_{:02d}".format(completed_episodes), env
+                            )
                     if fixed_rsi is not None and completed_episodes < args.episodes:
                         env.reset(reference_index=fixed_rsi)
                         observations = env.get_observations()
@@ -254,6 +346,11 @@ def main():
                     print("Viewer closed before the requested episodes completed")
                     break
 
+        if plotter is not None and completed_episodes < args.episodes:
+            # The loop broke out early (viewer closed); keep whatever the
+            # partial episode recorded rather than discarding it.
+            plot_paths = plotter.finalize("stopped") or plot_paths
+
         episode_metrics = {
             name: total / episode_weight
             for name, total in episode_totals.items()
@@ -266,6 +363,7 @@ def main():
             "seed": int(args.seed),
             "num_envs": env.num_envs,
             "rsi": "uniform" if fixed_rsi is None else fixed_rsi,
+            "final_reference_index": int(env.reference.last_index),
             "requested_episodes": int(args.episodes),
             "completed_episodes": completed_episodes,
             "environment_steps": total_steps,
@@ -273,8 +371,17 @@ def main():
             "done_count": done_count,
             "early_termination_count": early_count,
             "timeout_count": timeout_count,
+            "peak_position_error": peak_position_error,
+            "termination_threshold": float(
+                env_cfg.termination.arm_position_threshold_rad
+            ),
+            "exceeded_termination_threshold": bool(
+                peak_position_error
+                > float(env_cfg.termination.arm_position_threshold_rad)
+            ),
             "episode_metrics": episode_metrics,
             "trajectory_env_0": trajectory,
+            "plot_paths": plot_paths,
         }
         with output_path.open("w", encoding="utf-8") as output_file:
             json.dump(result, output_file, indent=2, sort_keys=True)
@@ -283,8 +390,10 @@ def main():
         print("  completed episodes : {}".format(completed_episodes))
         print("  environment steps  : {}".format(total_steps))
         print("  mean step reward   : {:.6f}".format(result["mean_step_reward"]))
-        print("  early / timeout    : {} / {}".format(
-            early_count, timeout_count
+        print("  peak |q error|     : {:.6f} rad (threshold {:.2f}{})".format(
+            peak_position_error,
+            result["termination_threshold"],
+            ", EXCEEDED" if result["exceeded_termination_threshold"] else "",
         ))
         if episode_metrics:
             print("  mean return        : {:.6f}".format(
@@ -294,6 +403,8 @@ def main():
                 episode_metrics["length"]
             ))
         print("  output             : {}".format(output_path))
+        if plot_paths.get("episode_dir"):
+            print("  plots              : {}".format(plot_paths["episode_dir"]))
     finally:
         env.close()
 

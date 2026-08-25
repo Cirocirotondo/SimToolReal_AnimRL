@@ -24,14 +24,16 @@ and Cartwheel configurations:
 
 The test loads the local robot asset and 60 Hz demonstration, applies the
 corrected DG5F gains, resets uniformly over the complete motion, executes ideal
-normalized arm reference actions while driving the hand directly from the demo,
+AnimRL residual arm actions while driving the hand directly from the demo,
 and validates tracking, arm-only reward, arm-only early termination, and the
 Cartwheel-style reference-end timeout.
 
 The arm-only policy observation has 19 values: 6 normalized arm positions, 6
 previously applied physical arm targets, 6 arm velocities, and the normalized
-reference phase. Its 6 normalized actions are absolute UR5e joint targets. The
-20 hand targets are read directly from the next demonstration sample inside the
+reference phase. Its 6 actions use AnimRL's original unbounded residual
+parameterization: `q_target = q_default + clip(0.25 * action, -100, 100)`.
+The fixed `q_default` is the first arm pose of the demonstration. The 20 hand
+targets are read directly from the next demonstration sample inside the
 environment, so the policy neither observes nor controls the hand.
 
 The Gaussian position/velocity imitation reward and early termination use only
@@ -41,6 +43,11 @@ not affect reward or termination.
 This replaces the former 79D/26D full-robot policy contract. Checkpoints made
 with that earlier architecture cannot be loaded by the 19D/6D networks and must
 not be resumed for this training family.
+
+Checkpoints trained with the earlier normalized absolute-action version of the
+19D/6D environment are also behaviorally incompatible and must not be resumed:
+the network shape is unchanged, but the meaning and scale of every action have
+changed.
 
 The environment follows AnimRL's five-value vectorized step contract:
 
@@ -154,7 +161,7 @@ or `--rsi-index <sample>` for a fixed reproducible initial state.
 ## Isaac Gym demonstration viewer
 
 To open the exact same environment configuration used by training and replace
-the six policy outputs with the normalized arm action from the next
+the six policy outputs with the ideal AnimRL residual action for the next
 demonstration sample (the hand remains reference-driven), run:
 
 ```bash
