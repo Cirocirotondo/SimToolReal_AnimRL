@@ -77,6 +77,15 @@ def parse_args():
         "--viewer", action="store_true", help="Open the Isaac Gym viewer."
     )
     parser.add_argument(
+        "--no-ghost",
+        dest="ghost",
+        action="store_false",
+        help=(
+            "Hide the green reference robot shown beside the policy robot. "
+            "The ghost needs --viewer and is never built headless."
+        ),
+    )
+    parser.add_argument(
         "--print-every",
         type=int,
         default=30,
@@ -168,6 +177,7 @@ def main():
     env_cfg.viewer.enable_viewer = bool(args.viewer)
     env_cfg.viewer.camera_position = [-1.0, -1.0, 1.5]
     env_cfg.viewer.camera_lookat = [0.0, 0.6, 0.75]
+    env_cfg.viewer.reference_ghost = bool(args.viewer and args.ghost)
     # Playback always runs from the chosen RSI index to the final reference
     # sample, so the tracking threshold must not cut the episode short. The
     # threshold is still reported: see max_abs_position_error below.
