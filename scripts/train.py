@@ -76,6 +76,19 @@ def parse_args():
     )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="PATH=VALUE",
+        help=(
+            "Override one configuration field, e.g. "
+            "--set rewards.velocity_std_rad_per_s=0.3. Repeatable. Prefix the "
+            "path with 'train.' to address the training config instead of the "
+            "environment config. Unknown fields are rejected."
+        ),
+    )
+    parser.add_argument(
         "--viewer",
         action="store_true",
         help="Show the environment (training is headless by default).",
@@ -109,6 +122,47 @@ def resolve_start_iteration(args, checkpoint_infos):
         "The resume checkpoint has no iteration metadata; pass "
         "--start-iteration explicitly."
     )
+
+
+def apply_overrides(env_cfg, train_cfg, overrides):
+    """Apply --set PATH=VALUE onto the configs, rejecting unknown fields.
+
+    A typo in a sweep must fail loudly rather than silently training the
+    default value, so every path component is checked against the config.
+    """
+    applied = {}
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError("--set expects PATH=VALUE, got {!r}".format(item))
+        path, raw = item.split("=", 1)
+        path = path.strip()
+        if path.startswith("train."):
+            node, remainder = train_cfg, path[len("train."):]
+        else:
+            node, remainder = env_cfg, path
+        parts = [part for part in remainder.split(".") if part]
+        if not parts:
+            raise ValueError("--set has an empty path in {!r}".format(item))
+        for part in parts[:-1]:
+            if not hasattr(node, part):
+                raise KeyError(
+                    "Unknown configuration section {!r} in --set {}".format(
+                        part, item
+                    )
+                )
+            node = getattr(node, part)
+        leaf = parts[-1]
+        if not hasattr(node, leaf):
+            raise KeyError(
+                "Unknown configuration field {!r} in --set {}".format(leaf, item)
+            )
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        setattr(node, leaf, value)
+        applied[path] = value
+    return applied
 
 
 def save_configuration(run_dir, env_cfg, train_cfg, args):
@@ -151,6 +205,10 @@ def main():
         train_cfg.runner.evaluation_num_envs = int(args.eval_num_envs)
     if args.eval_seed is not None:
         train_cfg.runner.evaluation_seed = int(args.eval_seed)
+    # Applied last so an explicit --set always wins over the flags above.
+    applied_overrides = apply_overrides(env_cfg, train_cfg, args.overrides)
+    for path, value in applied_overrides.items():
+        print("Override: {} = {!r}".format(path, value))
 
     num_iterations = (
         int(args.iterations)
