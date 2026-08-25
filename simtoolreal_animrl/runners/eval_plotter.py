@@ -20,9 +20,12 @@ import torch
 # (info key, cfg.rewards weight attribute). Order fixes the legend order and
 # must stay aligned with MotionImitationEnv._compute_reward_and_errors.
 REWARD_TERMS: Tuple[Tuple[str, str], ...] = (
-    ("position_reward", "position_weight"),
-    ("velocity_reward", "velocity_weight"),
-    ("action_rate_reward", "action_rate_weight"),
+    ("position_reward", "position_arm_weight"),
+    ("velocity_reward", "velocity_arm_weight"),
+    ("action_rate_reward", "action_rate_arm_weight"),
+    ("hand_position_reward", "position_hand_weight"),
+    ("hand_velocity_reward", "velocity_hand_weight"),
+    ("hand_action_rate_reward", "action_rate_hand_weight"),
 )
 
 # Scalar per-step diagnostics copied straight out of the step extras.
@@ -30,6 +33,9 @@ SCALAR_INFO_KEYS: Tuple[str, ...] = (
     "rms_position_error",
     "rms_velocity_error",
     "rms_action_rate",
+    "rms_hand_position_error",
+    "rms_hand_velocity_error",
+    "rms_hand_action_rate",
     "max_abs_position_error",
     "max_abs_hand_position_error",
 )
@@ -118,20 +124,26 @@ class EvaluationPlotter:
         self._weights: Dict[str, float] = {}
         self._position_threshold: Optional[float] = None
         self._action_scale = 1.0
+        self._hand_action_scale = 1.0
         self._num_arm_dofs = 0
+        self._num_hand_dofs = 0
         self._arm_names: Tuple[str, ...] = ()
+        self._hand_names: Tuple[str, ...] = ()
         self._records: Dict[str, List[Any]] = {}
 
     def start_episode(self, slug: str, env) -> None:
         self._slug = str(slug)
         self._dt = float(env.dt)
         self._action_scale = float(env.action_scale)
-        # The arm-only policy acts on exactly the leading arm DOFs.
-        self._num_arm_dofs = int(env.num_actions)
-        self._arm_names = tuple(
-            _short_joint_name(name)
-            for name in env.JOINT_NAMES[: self._num_arm_dofs]
-        )
+        self._hand_action_scale = float(env.hand_action_scale)
+        # The policy now drives all 26 joints, so the split comes from the
+        # environment's own arm/hand views rather than from the action width:
+        # one 26-panel figure would be unreadable.
+        self._num_arm_dofs = int(env.arm_q.shape[1])
+        self._num_hand_dofs = int(env.hand_q.shape[1])
+        names = tuple(_short_joint_name(name) for name in env.JOINT_NAMES)
+        self._arm_names = names[: self._num_arm_dofs]
+        self._hand_names = names[self._num_arm_dofs:]
         self._weights = {
             info_key: float(getattr(env.cfg.rewards, weight_attribute))
             for info_key, weight_attribute in REWARD_TERMS
@@ -168,29 +180,39 @@ class EvaluationPlotter:
             self._append(key, _scalar(infos.get(key), env_idx))
         self._append("worst_joint_index", _scalar(infos.get("worst_joint_index"), env_idx))
 
+        arm = self._num_arm_dofs
         action = _vector(actions, env_idx)
-        self._append("action", action)
+        self._append("action", action[:arm])
+        self._append("hand_action", action[arm:])
         # Recomputed from the action rather than read back from the environment:
         # reset_idx() overwrites the stored targets of a terminated env.
-        self._append("arm_target_q", _vector(env.scale_actions(
+        target = _vector(env.scale_actions(
             torch.as_tensor(action, dtype=torch.float32, device=env.device).unsqueeze(0)
-        ), 0))
+        ), 0)
+        self._append("arm_target_q", target[:arm])
+        self._append("hand_target_q", target[arm:])
 
         indices = torch.as_tensor(
             [reference_index], dtype=torch.long, device=env.device
         )
         reference = env.reference.sample(indices)
-        arm = self._num_arm_dofs
         self._append("reference_arm_q", _vector(reference.q[:, :arm], 0))
         self._append("reference_arm_dq", _vector(reference.dq[:, :arm], 0))
+        self._append("reference_hand_q", _vector(reference.q[:, arm:], 0))
+        self._append("reference_hand_dq", _vector(reference.dq[:, arm:], 0))
 
         if done:
             nan_arm = np.full(arm, np.nan)
+            nan_hand = np.full(self._num_hand_dofs, np.nan)
             self._append("actual_arm_q", nan_arm)
             self._append("actual_arm_dq", nan_arm)
+            self._append("actual_hand_q", nan_hand)
+            self._append("actual_hand_dq", nan_hand)
         else:
             self._append("actual_arm_q", _vector(env.arm_q, env_idx))
             self._append("actual_arm_dq", _vector(env.arm_dq, env_idx))
+            self._append("actual_hand_q", _vector(env.hand_q, env_idx))
+            self._append("actual_hand_dq", _vector(env.hand_dq, env_idx))
 
     def _arrays(self) -> Dict[str, np.ndarray]:
         arrays = {
@@ -201,6 +223,16 @@ class EvaluationPlotter:
             return arrays
         arrays["steps"] = arrays["steps"].astype(np.int64)
         arrays["reference_index"] = arrays["reference_index"].astype(np.int64)
+        arrays["hand_position_error"] = (
+            arrays["actual_hand_q"] - arrays["reference_hand_q"]
+        )
+        arrays["hand_velocity_error"] = (
+            arrays["actual_hand_dq"] - arrays["reference_hand_dq"]
+        )
+        hand_delta = np.diff(arrays["hand_action"], axis=0)
+        arrays["hand_action_delta"] = np.vstack(
+            (np.full((1, arrays["hand_action"].shape[1]), np.nan), hand_delta)
+        )
         arrays["arm_position_error"] = (
             arrays["actual_arm_q"] - arrays["reference_arm_q"]
         )
@@ -239,7 +271,7 @@ class EvaluationPlotter:
         np.savez_compressed(
             npz_path,
             **arrays,
-            joint_names=np.asarray(self._arm_names),
+            joint_names=np.asarray(self._arm_names + self._hand_names),
             reward_weights=np.asarray(
                 [self._weights.get(key, 0.0) for key, _ in REWARD_TERMS]
             ),
@@ -257,8 +289,10 @@ class EvaluationPlotter:
         paths.update(self._save_overview(plt, episode_dir, arrays, reason))
         paths.update(self._save_reward_terms(plt, episode_dir, arrays))
         paths.update(self._save_tracking_errors(plt, episode_dir, arrays))
-        paths.update(self._save_joint_tracking(plt, episode_dir, arrays))
-        paths.update(self._save_action_per_joint(plt, episode_dir, arrays))
+        paths.update(self._save_joint_tracking(plt, episode_dir, arrays, "arm"))
+        paths.update(self._save_joint_tracking(plt, episode_dir, arrays, "hand"))
+        paths.update(self._save_action_per_joint(plt, episode_dir, arrays, "arm"))
+        paths.update(self._save_action_per_joint(plt, episode_dir, arrays, "hand"))
         paths.update(self._save_per_term(plt, per_term_dir, arrays))
 
         print(
@@ -363,8 +397,14 @@ class EvaluationPlotter:
         )
         axes[0].plot(
             time_s,
+            data["rms_hand_position_error"],
+            label="hand RMS",
+            linewidth=1.3,
+        )
+        axes[0].plot(
+            time_s,
             data["max_abs_hand_position_error"],
-            label="hand max abs (reference-driven)",
+            label="hand max abs",
             linewidth=1.0,
             alpha=0.7,
         )
@@ -379,10 +419,18 @@ class EvaluationPlotter:
         _finish_axis(axes[0], "Position error [rad]")
 
         axes[1].plot(time_s, data["rms_velocity_error"], label="arm RMS", linewidth=1.3)
+        axes[1].plot(
+            time_s, data["rms_hand_velocity_error"], label="hand RMS", linewidth=1.3
+        )
         _finish_axis(axes[1], "Velocity error [rad/s]")
 
         axes[2].plot(
-            time_s, data["rms_action_rate"], label="RMS |a_t - a_(t-1)|", linewidth=1.3
+            time_s, data["rms_action_rate"], label="arm RMS |a_t - a_(t-1)|",
+            linewidth=1.3,
+        )
+        axes[2].plot(
+            time_s, data["rms_hand_action_rate"], label="hand RMS |a_t - a_(t-1)|",
+            linewidth=1.3,
         )
         _finish_axis(axes[2], "Action rate")
         axes[2].set_xlabel("Episode time [s]")
@@ -394,26 +442,31 @@ class EvaluationPlotter:
         plt.close(fig)
         return {"tracking_errors_png": str(path)}
 
-    def _save_joint_tracking(self, plt, episode_dir, data) -> Dict[str, str]:
+    def _save_joint_tracking(self, plt, episode_dir, data, group) -> Dict[str, str]:
+        """One tracking figure per joint block; 26 joints in one is unreadable."""
         time_s = data["time_s"]
+        prefix = "arm" if group == "arm" else "hand"
+        names = self._arm_names if group == "arm" else self._hand_names
+        # Only the arm carries the termination threshold.
+        threshold = self._position_threshold if group == "arm" else None
         fig, axes = plt.subplots(5, 1, figsize=(14, 16), sharex=True)
 
         _plot_per_joint(
-            axes[0], time_s, data["reference_arm_q"], "reference", self._arm_names
+            axes[0], time_s, data["reference_%s_q" % prefix], "reference", names
         )
         _plot_per_joint(
-            axes[0], time_s, data["actual_arm_q"], "actual", self._arm_names,
+            axes[0], time_s, data["actual_%s_q" % prefix], "actual", names,
             linestyle="--",
         )
         _finish_axis(axes[0], "Joint position [rad]")
 
         _plot_per_joint(
-            axes[1], time_s, data["arm_position_error"], "error", self._arm_names
+            axes[1], time_s, data["%s_position_error" % prefix], "error", names
         )
-        if self._position_threshold is not None:
+        if threshold is not None:
             for sign in (-1.0, 1.0):
                 axes[1].axhline(
-                    sign * self._position_threshold,
+                    sign * threshold,
                     color="red",
                     linestyle="--",
                     linewidth=0.9,
@@ -424,17 +477,17 @@ class EvaluationPlotter:
         # policy swings the measured velocity an order of magnitude wider than
         # the demonstration, which would flatten the reference into the axis.
         _plot_per_joint(
-            axes[2], time_s, data["reference_arm_dq"], "reference", self._arm_names
+            axes[2], time_s, data["reference_%s_dq" % prefix], "reference", names
         )
         _finish_axis(axes[2], "Reference velocity [rad/s]")
 
         _plot_per_joint(
-            axes[3], time_s, data["actual_arm_dq"], "actual", self._arm_names
+            axes[3], time_s, data["actual_%s_dq" % prefix], "actual", names
         )
         _finish_axis(axes[3], "Measured velocity [rad/s]")
 
         _plot_per_joint(
-            axes[4], time_s, data["arm_target_q"], "target", self._arm_names
+            axes[4], time_s, data["%s_target_q" % prefix], "target", names
         )
         _plot_per_joint(
             axes[4], time_s, data["actual_arm_q"], "actual", self._arm_names,
@@ -443,18 +496,22 @@ class EvaluationPlotter:
         _finish_axis(axes[4], "PD target vs measured [rad]")
         axes[4].set_xlabel("Episode time [s]")
 
-        fig.suptitle("Arm joint tracking — {}".format(self._slug))
+        fig.suptitle("{} joint tracking — {}".format(group.capitalize(), self._slug))
         fig.tight_layout()
-        path = episode_dir / "arm_joint_tracking.png"
+        path = episode_dir / "{}_joint_tracking.png".format(group)
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        return {"arm_joint_tracking_png": str(path)}
+        return {"{}_joint_tracking_png".format(group): str(path)}
 
-    def _save_action_per_joint(self, plt, episode_dir, data) -> Dict[str, str]:
-        """One panel per arm joint, to expose per-joint chatter."""
+    def _save_action_per_joint(self, plt, episode_dir, data, group) -> Dict[str, str]:
+        """One panel per joint of the block, to expose per-joint chatter."""
         time_s = data["time_s"]
-        action = data["action"]
-        delta = data["action_delta"]
+        action = data["action"] if group == "arm" else data["hand_action"]
+        delta = (
+            data["action_delta"] if group == "arm" else data["hand_action_delta"]
+        )
+        names = self._arm_names if group == "arm" else self._hand_names
+        scale = self._action_scale if group == "arm" else self._hand_action_scale
         count = action.shape[1]
 
         fig, axes = plt.subplots(count, 1, figsize=(14, 2.3 * count), sharex=True)
@@ -485,12 +542,10 @@ class EvaluationPlotter:
             ax.set_title(
                 "{}    sign-flip rate {:.3f}    RMS delta {:.4f}    "
                 "±1 -> {:+.3f} rad residual".format(
-                    self._arm_names[index]
-                    if index < len(self._arm_names)
-                    else index,
+                    names[index] if index < len(names) else index,
                     flip_rate,
                     rms_delta,
-                    self._action_scale,
+                    scale,
                 ),
                 fontsize=9,
                 loc="left",
@@ -498,12 +553,14 @@ class EvaluationPlotter:
             _finish_axis(ax, "Action")
 
         axes[-1].set_xlabel("Episode time [s]")
-        fig.suptitle("Arm actions per joint — {}".format(self._slug))
+        fig.suptitle(
+            "{} actions per joint — {}".format(group.capitalize(), self._slug)
+        )
         fig.tight_layout()
-        path = episode_dir / "arm_action_per_joint.png"
+        path = episode_dir / "{}_action_per_joint.png".format(group)
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        return {"arm_action_per_joint_png": str(path)}
+        return {"{}_action_per_joint_png".format(group): str(path)}
 
     def _save_per_term(self, plt, per_term_dir, data) -> Dict[str, str]:
         """One PNG per reward term: per-step on top, cumulative below."""

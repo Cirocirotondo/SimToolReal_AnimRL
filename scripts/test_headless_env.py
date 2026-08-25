@@ -86,23 +86,23 @@ def assert_observation_contract(env):
     import torch
 
     obs = env.get_observations()
-    if obs.shape != (env.num_envs, 19):
-        raise AssertionError("Expected 19D observations, got {}".format(obs.shape))
+    if obs.shape != (env.num_envs, 79):
+        raise AssertionError("Expected 79D observations, got {}".format(obs.shape))
 
     expected_phase = (
         env.reference_index.float() / float(env.reference.last_index)
     ).unsqueeze(1)
     expected = torch.cat(
         (
-            env.normalize_arm_positions(env.arm_q),
-            env.previous_arm_targets,
-            env.arm_dq,
+            env.normalize_positions(env.q),
+            env.previous_targets,
+            env.dq,
             expected_phase,
         ),
         dim=1,
     )
     if not bool(torch.allclose(obs, expected, rtol=0.0, atol=1e-6)):
-        raise AssertionError("The 19D observation blocks are inconsistent")
+        raise AssertionError("The 79D observation blocks are inconsistent")
 
     if not bool(((obs[:, :6] >= -1.0) & (obs[:, :6] <= 1.0)).all()):
         raise AssertionError("Normalized arm positions escaped [-1, 1]")
@@ -120,14 +120,17 @@ def assert_arm_only_objective_contract(env):
         raise AssertionError("Hand diagnostics have an unexpected shape")
     if metrics["action_rate_reward"].shape != (env.num_envs,):
         raise AssertionError("Action-rate regularization has an unexpected shape")
+    r = env.cfg.rewards
     expected_reward = (
-        float(env.cfg.rewards.position_weight) * metrics["position_reward"]
-        + float(env.cfg.rewards.velocity_weight) * metrics["velocity_reward"]
-        + float(env.cfg.rewards.action_rate_weight)
-        * metrics["action_rate_reward"]
+        float(r.position_arm_weight) * metrics["position_reward"]
+        + float(r.velocity_arm_weight) * metrics["velocity_reward"]
+        + float(r.action_rate_arm_weight) * metrics["action_rate_reward"]
+        + float(r.position_hand_weight) * metrics["hand_position_reward"]
+        + float(r.velocity_hand_weight) * metrics["hand_velocity_reward"]
+        + float(r.action_rate_hand_weight) * metrics["hand_action_rate_reward"]
     )
     if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-7)):
-        raise AssertionError("Reward contains a non-arm contribution")
+        raise AssertionError("Reward does not match the configured weights")
 
 
 def assert_ppo_step_contract(env, obs, critic_obs, rewards, dones, extras):
@@ -219,13 +222,10 @@ def run_ideal_episode(env, initial_indices):
 
     for step in range(1, env.max_episode_length + 1):
         actions, complete_target = env.next_reference_action()
-        reconstructed_arm_target = env.scale_actions(actions)
+        reconstructed_target = env.scale_actions(actions)
         if not bool(
             torch.allclose(
-                reconstructed_arm_target,
-                complete_target[:, : len(ARM_JOINT_NAMES)],
-                rtol=0.0,
-                atol=1e-6,
+                reconstructed_target, complete_target, rtol=0.0, atol=1e-6
             )
         ):
             raise AssertionError("AnimRL residual action mapping is not invertible")
@@ -236,10 +236,14 @@ def run_ideal_episode(env, initial_indices):
         )
         if not bool(torch_isfinite(rewards)):
             raise AssertionError("Reward contains NaN or infinity")
+        r = env.cfg.rewards
         reward_upper_bound = (
-            float(env.cfg.rewards.position_weight)
-            + float(env.cfg.rewards.velocity_weight)
-            + float(env.cfg.rewards.action_rate_weight)
+            float(r.position_arm_weight)
+            + float(r.velocity_arm_weight)
+            + float(r.action_rate_arm_weight)
+            + float(r.position_hand_weight)
+            + float(r.velocity_hand_weight)
+            + float(r.action_rate_hand_weight)
         )
         if bool((rewards < -1e-7).any()) or bool(
             (rewards > reward_upper_bound + 1e-6).any()
@@ -265,6 +269,8 @@ def run_ideal_episode(env, initial_indices):
                 still_active, len(ARM_JOINT_NAMES):
             ]
             actual_hand_target = env.previous_hand_targets[still_active]
+            # The hand is policy-driven now; under the ideal reference action
+            # its target must still reconstruct the demonstration exactly.
             if not bool(
                 torch.allclose(
                     actual_hand_target,
@@ -274,7 +280,7 @@ def run_ideal_episode(env, initial_indices):
                 )
             ):
                 raise AssertionError(
-                    "Hand position targets do not follow the demonstration"
+                    "Hand position targets do not reconstruct the demonstration"
                 )
 
         early_count = int((extras["early_termination"] & pending).sum())
@@ -488,9 +494,9 @@ def main():
             )
         )
         print("  PD gains                  : verified")
-        print("  19D observation contract  : verified")
-        print("  reference-driven hand     : verified")
-        print("  arm-only reward/termination: verified")
+        print("  79D observation contract  : verified")
+        print("  policy-driven hand        : verified")
+        print("  arm+hand reward contract  : verified")
         print("  PPO step/info contract     : verified")
         print("  horizon/reference timeout : verified")
         print("  early termination/no boot.: verified")

@@ -101,6 +101,11 @@ class DeterministicEvaluator:
         position_reward_sum = torch.zeros_like(episode_steps)
         velocity_reward_sum = torch.zeros_like(episode_steps)
         action_rate_reward_sum = torch.zeros_like(episode_steps)
+        hand_position_reward_sum = torch.zeros_like(episode_steps)
+        hand_velocity_reward_sum = torch.zeros_like(episode_steps)
+        hand_action_rate_reward_sum = torch.zeros_like(episode_steps)
+        rms_hand_position_error_sum = torch.zeros_like(episode_steps)
+        max_hand_position_error = torch.zeros_like(episode_steps)
         rms_position_error_sum = torch.zeros_like(episode_steps)
         rms_action_rate_sum = torch.zeros_like(episode_steps)
         rms_velocity_error_sum = torch.zeros_like(episode_steps)
@@ -119,7 +124,7 @@ class DeterministicEvaluator:
                 clipped_target_components += int(
                     (
                         (
-                            actions.abs() * self.env.action_scale
+                            actions.abs() * self.env.action_scales
                             > self.env.action_target_clip
                         )
                         & active[:, None]
@@ -142,6 +147,22 @@ class DeterministicEvaluator:
                     infos["action_rate_reward"] * active_float
                 )
                 rms_action_rate_sum += infos["rms_action_rate"] * active_float
+                hand_position_reward_sum += (
+                    infos["hand_position_reward"] * active_float
+                )
+                hand_velocity_reward_sum += (
+                    infos["hand_velocity_reward"] * active_float
+                )
+                hand_action_rate_reward_sum += (
+                    infos["hand_action_rate_reward"] * active_float
+                )
+                rms_hand_position_error_sum += (
+                    infos["rms_hand_position_error"] * active_float
+                )
+                max_hand_position_error = torch.maximum(
+                    max_hand_position_error,
+                    infos["max_abs_hand_position_error"] * active_float,
+                )
                 rms_position_error_sum += (
                     infos["rms_position_error"] * active_float
                 )
@@ -165,6 +186,7 @@ class DeterministicEvaluator:
         early |= active
         lengths = episode_steps.clamp_min(1.0)
         per_env_position_reward = position_reward_sum / lengths
+        per_env_hand_position_reward = hand_position_reward_sum / lengths
         return {
             "mean_reward": float((reward_sum / lengths).mean()),
             "mean_position_reward": float(per_env_position_reward.mean()),
@@ -183,6 +205,19 @@ class DeterministicEvaluator:
             "mean_rms_velocity_error": float(
                 (rms_velocity_error_sum / lengths).mean()
             ),
+            "mean_hand_position_reward": float(
+                per_env_hand_position_reward.mean()
+            ),
+            "mean_hand_velocity_reward": float(
+                (hand_velocity_reward_sum / lengths).mean()
+            ),
+            "mean_hand_action_rate_reward": float(
+                (hand_action_rate_reward_sum / lengths).mean()
+            ),
+            "mean_rms_hand_position_error": float(
+                (rms_hand_position_error_sum / lengths).mean()
+            ),
+            "max_abs_hand_position_error": float(max_hand_position_error.max()),
             "max_abs_position_error": float(max_position_error.max()),
             "mean_episode_length": float(episode_steps.mean()),
             "early_termination_fraction": float(early.float().mean()),
@@ -191,11 +226,21 @@ class DeterministicEvaluator:
             / float(max(action_components, 1)),
             "mean_abs_action": abs_action_sum / float(max(action_components, 1)),
             "max_abs_action": max_abs_action,
-            # Position remains the ranking signal. Subtracting the failure
-            # fraction prevents short failed rollouts from looking artificially
-            # good while retaining resolution when every early policy fails.
+            # Position remains the ranking signal, now averaged over the arm
+            # and the hand so a checkpoint cannot be selected on arm accuracy
+            # while the hand it also controls degrades. The two enter with
+            # equal weight, which in practice lets the arm drive the ranking
+            # and the hand act as a veto when it gets worse. Subtracting the
+            # failure fraction prevents short failed rollouts from looking
+            # artificially good while retaining resolution when every early
+            # policy fails.
             "position_score": float(
-                per_env_position_reward.mean() - early.float().mean()
+                0.5
+                * (
+                    per_env_position_reward.mean()
+                    + per_env_hand_position_reward.mean()
+                )
+                - early.float().mean()
             ),
         }
 
