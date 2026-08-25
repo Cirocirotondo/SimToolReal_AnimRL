@@ -94,6 +94,15 @@ class MotionImitationEnv:
                 )
             )
 
+        # Purely a visual benchmark, and it doubles the simulated bodies, so
+        # only an explicit opt-in builds it. evaluate.py ties it to --viewer;
+        # training never sets it. It stays available headless so it can be
+        # exercised by tests.
+        self.reference_ghost_enabled = bool(
+            getattr(self.cfg.viewer, "reference_ghost", False)
+        )
+        self.actors_per_env = 2 if self.reference_ghost_enabled else 1
+
         self.gym = gymapi.acquire_gym()
         self.sim = self._create_sim()
         self._add_ground_plane()
@@ -235,9 +244,22 @@ class MotionImitationEnv:
         pose.p = gymapi.Vec3(*[float(v) for v in self.cfg.init_state.pos])
         pose.r = gymapi.Quat(*[float(v) for v in self.cfg.init_state.rot])
 
+        ghost_pose = None
+        if self.reference_ghost_enabled:
+            offset = [float(v) for v in self.cfg.viewer.reference_ghost_offset]
+            ghost_pose = gymapi.Transform()
+            ghost_pose.p = gymapi.Vec3(
+                pose.p.x + offset[0], pose.p.y + offset[1], pose.p.z + offset[2]
+            )
+            ghost_pose.r = pose.r
+            body_count *= 2
+            shape_count *= 2
+
         self.envs = []
         self.robot_handles = []
+        self.ghost_handles = []
         actor_indices = []
+        ghost_actor_indices = []
         for env_index in range(self.num_envs):
             env = self.gym.create_env(self.sim, lower, upper, per_row)
             if env is None:
@@ -255,6 +277,29 @@ class MotionImitationEnv:
             if actor < 0:
                 raise RuntimeError("Failed to create robot actor {}".format(env_index))
             self.gym.set_actor_dof_properties(env, actor, self.pd_properties)
+            if self.reference_ghost_enabled:
+                # A collision group of its own keeps the ghost from touching the
+                # policy robot, the ground, or itself, so it can never perturb
+                # the run it is meant to illustrate.
+                ghost = self.gym.create_actor(
+                    env,
+                    self.robot_asset,
+                    ghost_pose,
+                    "reference_ghost",
+                    self.num_envs + env_index,
+                    -1,
+                    0,
+                )
+                if ghost < 0:
+                    raise RuntimeError(
+                        "Failed to create ghost actor {}".format(env_index)
+                    )
+                self.gym.set_actor_dof_properties(env, ghost, self.pd_properties)
+                self._paint_ghost(env, ghost)
+                self.ghost_handles.append(ghost)
+                ghost_actor_indices.append(
+                    self.gym.get_actor_index(env, ghost, gymapi.DOMAIN_SIM)
+                )
             self.gym.end_aggregate(env)
             self.envs.append(env)
             self.robot_handles.append(actor)
@@ -265,6 +310,18 @@ class MotionImitationEnv:
         self.actor_indices = torch.as_tensor(
             actor_indices, dtype=torch.int32, device=self.device
         )
+        self.ghost_actor_indices = torch.as_tensor(
+            ghost_actor_indices, dtype=torch.int32, device=self.device
+        )
+
+    def _paint_ghost(self, env, ghost) -> None:
+        color = gymapi.Vec3(
+            *[float(v) for v in self.cfg.viewer.reference_ghost_color]
+        )
+        for body_index in range(self.gym.get_actor_rigid_body_count(env, ghost)):
+            self.gym.set_rigid_body_color(
+                env, ghost, body_index, gymapi.MESH_VISUAL, color
+            )
 
     def _create_viewer(self) -> None:
         camera_properties = gymapi.CameraProperties()
@@ -302,15 +359,40 @@ class MotionImitationEnv:
 
     def _acquire_tensors(self) -> None:
         dof_state_raw = self.gym.acquire_dof_state_tensor(self.sim)
-        self.dof_state = gymtorch.wrap_tensor(dof_state_raw).view(
-            self.num_envs, len(JOINT_NAMES), 2
+        # The simulation buffers cover every actor, so they are kept whole for
+        # the Isaac Gym setters, which require the full contiguous tensor, and
+        # sliced for everything else. The policy robot is always actor 0, so
+        # its slice is the leading block and the rest of the environment sees
+        # exactly the same shapes whether or not the ghost exists.
+        dof_count = len(JOINT_NAMES)
+        self.dof_state_all = gymtorch.wrap_tensor(dof_state_raw).view(
+            self.num_envs, self.actors_per_env * dof_count, 2
         )
+        self.dof_state = self.dof_state_all[:, :dof_count]
         self.dof_position_asset = self.dof_state[..., 0]
         self.dof_velocity_asset = self.dof_state[..., 1]
-        self.position_targets_asset = torch.zeros(
-            (self.num_envs, len(JOINT_NAMES)),
+        self.position_targets_all = torch.zeros(
+            (self.num_envs, self.actors_per_env * dof_count),
             dtype=torch.float32,
             device=self.device,
+        )
+        self.position_targets_asset = self.position_targets_all[:, :dof_count]
+        # The ghost is driven by the same position drive as the policy robot,
+        # fed the reference pose instead of the policy target. That keeps it in
+        # the one target write the step already performs: an extra per-step
+        # DOF-state write conflicts with the GPU pipeline and stalls the step.
+        self.ghost_dof_state = (
+            self.dof_state_all[:, dof_count:]
+            if self.reference_ghost_enabled
+            else None
+        )
+        self.ghost_position_targets = (
+            self.position_targets_all[:, dof_count:]
+            if self.reference_ghost_enabled
+            else None
+        )
+        self.all_env_ids = torch.arange(
+            self.num_envs, device=self.device, dtype=torch.long
         )
         self.gym.refresh_dof_state_tensor(self.sim)
 
@@ -486,15 +568,46 @@ class MotionImitationEnv:
             env_ids.unsqueeze(1), self.demo_to_asset_tensor.unsqueeze(0)
         ] = sample.q
 
-        actor_ids = self.actor_indices[env_ids].contiguous()
+        self._write_ghost_state(env_ids, sample.q, sample.dq)
+        if self.reference_ghost_enabled:
+            self.ghost_position_targets[
+                env_ids.unsqueeze(1), self.demo_to_asset_tensor.unsqueeze(0)
+            ] = sample.q
+        actor_ids = self.actor_indices[env_ids]
+        if self.reference_ghost_enabled:
+            actor_ids = torch.cat((actor_ids, self.ghost_actor_indices[env_ids]))
+        self._upload_dof_state(actor_ids)
+        self.gym.set_dof_position_target_tensor(
+            self.sim, gymtorch.unwrap_tensor(self.position_targets_all)
+        )
+
+    def _write_ghost_state(self, env_ids, q, dq) -> None:
+        """Fill the ghost rows of the DOF-state buffer; the caller uploads.
+
+        Its drive is disabled and gravity is off, so writing the state is the
+        only thing that moves it: the ghost replays the demonstration with no
+        tracking error of its own, which is what makes it a benchmark.
+        """
+        if not self.reference_ghost_enabled:
+            return
+        subset = self.ghost_dof_state[env_ids]
+        subset[:, self.demo_to_asset_tensor, 0] = q
+        subset[:, self.demo_to_asset_tensor, 1] = dq
+        self.ghost_dof_state[env_ids] = subset
+
+    def _upload_dof_state(self, actor_ids) -> None:
+        """Push DOF state for the given actors.
+
+        Isaac Gym keeps only the last indexed DOF-state write of a frame, so
+        the robot and the ghost have to travel in one call: a second call for
+        the ghost silently discards the robot reset.
+        """
+        actor_ids = actor_ids.contiguous()
         self.gym.set_dof_state_tensor_indexed(
             self.sim,
-            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(self.dof_state_all),
             gymtorch.unwrap_tensor(actor_ids),
             actor_ids.numel(),
-        )
-        self.gym.set_dof_position_target_tensor(
-            self.sim, gymtorch.unwrap_tensor(self.position_targets_asset)
         )
 
     def reset(self, reference_index: Optional[int] = None) -> torch.Tensor:
@@ -668,8 +781,14 @@ class MotionImitationEnv:
         self._write_demo_order_to_asset(
             self.position_targets_asset, complete_target_q
         )
+        # The ghost is commanded to the same reference sample the policy robot
+        # is chasing, so the two are directly comparable in every frame.
+        if self.reference_ghost_enabled:
+            self._write_demo_order_to_asset(
+                self.ghost_position_targets, next_reference.q
+            )
         self.gym.set_dof_position_target_tensor(
-            self.sim, gymtorch.unwrap_tensor(self.position_targets_asset)
+            self.sim, gymtorch.unwrap_tensor(self.position_targets_all)
         )
 
         # Physics Step

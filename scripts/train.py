@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -75,6 +76,24 @@ def parse_args():
         help="Disable the deterministic fixed/uniform RSI evaluation.",
     )
     parser.add_argument("--log-interval", type=int, default=1)
+    parser.add_argument(
+        "--no-final-eval",
+        dest="final_eval",
+        action="store_false",
+        help=(
+            "Skip the headless evaluation with diagnostic plots that runs "
+            "once training finishes."
+        ),
+    )
+    parser.add_argument(
+        "--final-eval-rsi-index",
+        type=int,
+        default=0,
+        help=(
+            "Reference sample the final evaluation starts from (default: 0, "
+            "the whole demonstration)."
+        ),
+    )
     parser.add_argument(
         "--set",
         dest="overrides",
@@ -165,6 +184,57 @@ def apply_overrides(env_cfg, train_cfg, overrides):
     return applied
 
 
+def resolve_final_checkpoint(run_dir):
+    """Prefer the evaluation-selected checkpoint, else the newest one saved."""
+    best = run_dir / "best_model.pt"
+    if best.is_file():
+        return best
+    saved = []
+    for path in run_dir.glob("model_*.pt"):
+        try:
+            saved.append((int(path.stem.split("_")[1]), path))
+        except (IndexError, ValueError):
+            continue
+    return max(saved)[1] if saved else None
+
+
+def run_final_evaluation(run_dir, args):
+    """Evaluate the finished policy in a fresh process and write its plots.
+
+    A separate process is required because Isaac Gym allows one simulation per
+    process, and it runs only after the training simulation has been released.
+    """
+    checkpoint = resolve_final_checkpoint(run_dir)
+    if checkpoint is None:
+        print("Final evaluation skipped: the run saved no checkpoint")
+        return
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "evaluate.py"),
+        "--checkpoint",
+        str(checkpoint),
+        "--config",
+        str(run_dir / "config.json"),
+        "--rsi-index",
+        str(args.final_eval_rsi_index),
+        "--sim-device",
+        args.sim_device,
+        "--num-envs",
+        "1",
+        "--print-every",
+        "0",
+    ]
+    print("\nFinal evaluation of {} (headless, with plots)".format(checkpoint.name))
+    completed = subprocess.run(command)
+    if completed.returncode != 0:
+        # Training already succeeded and its checkpoints are on disk, so a
+        # failed evaluation is reported rather than raised.
+        print(
+            "Final evaluation failed with exit code {}; the run itself is "
+            "unaffected.".format(completed.returncode)
+        )
+
+
 def save_configuration(run_dir, env_cfg, train_cfg, args):
     config_path = run_dir / "config.json"
     if config_path.exists():
@@ -235,6 +305,7 @@ def main():
         num_envs_override=None,
     )
     runner = None
+    training_completed = False
     try:
         runner = PPO(env, train_cfg, log_dir=run_dir, device=env.device)
         checkpoint_infos = None
@@ -279,10 +350,16 @@ def main():
             metrics_path=run_dir / "metrics.jsonl",
             evaluation_callback=evaluator,
         )
+        training_completed = True
     finally:
         if runner is not None:
             runner.close()
         env.close()
+
+    # Outside the try block: the training simulation has to be closed before a
+    # second one can start, and an interrupted run should not be evaluated.
+    if training_completed and args.final_eval:
+        run_final_evaluation(run_dir, args)
 
 
 if __name__ == "__main__":

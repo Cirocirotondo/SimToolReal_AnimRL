@@ -70,6 +70,12 @@ class BaseEnvCfg(ABCConfig):
         enable_viewer = False
         camera_position = [-1.8,-2.0, 1.5] # [1.8, 2.0, 1.5]
         camera_lookat = [0.0, 0.6, 0.75]
+        # Second, collision-free actor per environment that replays the
+        # demonstration kinematically as a side-by-side visual benchmark.
+        # It doubles the simulated bodies, so it stays off for training.
+        reference_ghost = False
+        reference_ghost_offset = [0.8, 0.0, 0.0]
+        reference_ghost_color = [0.15, 0.85, 0.25]
 
 
 class BaseTrainCfg(ABCConfig):
