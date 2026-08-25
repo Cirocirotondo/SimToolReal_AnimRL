@@ -108,11 +108,15 @@ class PPO:
         episode_sums = {}
         position_reward_sum = 0.0
         velocity_reward_sum = 0.0
+        action_rate_reward_sum = 0.0
         rms_position_error_sum = 0.0
         rms_velocity_error_sum = 0.0
+        rms_action_rate_sum = 0.0
         max_abs_position_error = 0.0
-        clipped_action_count = 0
+        clipped_action_target_count = 0
         action_value_count = 0
+        abs_action_sum = 0.0
+        max_abs_action = 0.0
 
         with torch.inference_mode():
             for _ in range(int(self.cfg.num_steps_per_env)):
@@ -125,8 +129,15 @@ class PPO:
                 actions, log_prob = self.policy.act_and_log_prob(
                     actor_observations
                 )
-                clipped_action_count += int((actions.abs() > 1.0).sum())
+                clipped_action_target_count += int(
+                    (
+                        actions.abs() * self.env.action_scale
+                        > self.env.action_target_clip
+                    ).sum()
+                )
                 action_value_count += actions.numel()
+                abs_action_sum += float(actions.abs().sum())
+                max_abs_action = max(max_abs_action, float(actions.abs().max()))
                 (
                     next_observations,
                     next_privileged_observations,
@@ -156,6 +167,10 @@ class PPO:
                 reward_sum += float(rewards.mean())
                 position_reward_sum += float(infos["position_reward"].mean())
                 velocity_reward_sum += float(infos["velocity_reward"].mean())
+                action_rate_reward_sum += float(
+                    infos["action_rate_reward"].mean()
+                )
+                rms_action_rate_sum += float(infos["rms_action_rate"].mean())
                 rms_position_error_sum += float(
                     infos["rms_position_error"].mean()
                 )
@@ -196,12 +211,16 @@ class PPO:
             "mean_reward": reward_sum / rollout_steps,
             "mean_position_reward": position_reward_sum / rollout_steps,
             "mean_velocity_reward": velocity_reward_sum / rollout_steps,
+            "mean_action_rate_reward": action_rate_reward_sum / rollout_steps,
             "mean_rms_position_error": rms_position_error_sum / rollout_steps,
             "mean_rms_velocity_error": rms_velocity_error_sum / rollout_steps,
+            "mean_rms_action_rate": rms_action_rate_sum / rollout_steps,
             "max_abs_position_error": max_abs_position_error,
-            "action_clipped_fraction": (
-                clipped_action_count / float(max(action_value_count, 1))
+            "action_target_clipped_fraction": (
+                clipped_action_target_count / float(max(action_value_count, 1))
             ),
+            "mean_abs_action": abs_action_sum / float(max(action_value_count, 1)),
+            "max_abs_action": max_abs_action,
             "done_count": done_count,
             "timeout_count": timeout_count,
             "early_termination_count": early_termination_count,
@@ -481,11 +500,17 @@ class PPO:
             "Train/mean_step_reward": "mean_reward",
             "Reward/position": "mean_position_reward",
             "Reward/velocity": "mean_velocity_reward",
+            "Reward/action_rate": "mean_action_rate_reward",
             "Tracking/rms_arm_position_error": "mean_rms_position_error",
             "Tracking/rms_arm_velocity_error": "mean_rms_velocity_error",
             "Tracking/max_abs_arm_position_error": "max_abs_position_error",
+            "Policy/rms_action_rate": "mean_rms_action_rate",
             "Policy/mean_action_std": "mean_action_std",
-            "Policy/action_clipped_fraction": "action_clipped_fraction",
+            "Policy/action_target_clipped_fraction": (
+                "action_target_clipped_fraction"
+            ),
+            "Policy/mean_abs_action": "mean_abs_action",
+            "Policy/max_abs_action": "max_abs_action",
             "Loss/value": "value_loss",
             "Loss/surrogate": "surrogate_loss",
             "Termination/done_fraction": "done_fraction",
@@ -544,7 +569,7 @@ class PPO:
         print(
             "Iteration {}/{} | reward={:.4f} | {} | "
             "value_loss={:.4f} | surrogate_loss={:.4f} | "
-            "std={:.3f} | clipped={:.3f} | fps={:.0f} | "
+            "std={:.3f} | target_clipped={:.3f} | fps={:.0f} | "
             "dones={} (early={}, timeout={})".format(
                 stats["iteration"],
                 end_iteration - 1,
@@ -553,7 +578,7 @@ class PPO:
                 stats["value_loss"],
                 stats["surrogate_loss"],
                 stats["mean_action_std"],
-                stats["action_clipped_fraction"],
+                stats["action_target_clipped_fraction"],
                 stats["fps"],
                 stats["done_count"],
                 stats["early_termination_count"],

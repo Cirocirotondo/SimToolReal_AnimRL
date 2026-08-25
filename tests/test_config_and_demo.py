@@ -15,6 +15,11 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.env.episode_length, 500)
         self.assertEqual(env_cfg.env.num_observations, 19)
         self.assertEqual(env_cfg.env.num_actions, 6)
+        self.assertEqual(
+            env_cfg.control.action_parameterization, "animrl_residual"
+        )
+        self.assertEqual(env_cfg.control.scale_joint_target, 0.25)
+        self.assertEqual(env_cfg.control.clip_joint_target, 100.0)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)
         self.assertEqual(train_cfg.algorithm.learning_rate, 1.0e-4)

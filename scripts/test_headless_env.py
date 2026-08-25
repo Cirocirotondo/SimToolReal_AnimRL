@@ -16,6 +16,8 @@ sys.path.insert(0, str(REPO_ROOT))
 from simtoolreal_animrl.cfg import SimToolRealCfg
 from simtoolreal_animrl.envs.controller import (
     ARM_JOINT_NAMES,
+    ARM_PD_DAMPING,
+    ARM_PD_STIFFNESS,
     HAND_PD_DAMPING,
     HAND_PD_STIFFNESS,
 )
@@ -49,6 +51,12 @@ def parse_args():
 
 def assert_correct_pd_gains(env):
     gains = env.pd_gain_summary()
+    np.testing.assert_allclose(
+        gains["arm_stiffness"], np.asarray(ARM_PD_STIFFNESS), rtol=0.0, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        gains["arm_damping"], np.asarray(ARM_PD_DAMPING), rtol=0.0, atol=1e-5
+    )
     np.testing.assert_allclose(
         gains["hand_stiffness"], np.asarray(HAND_PD_STIFFNESS), rtol=0.0, atol=1e-5
     )
@@ -86,7 +94,7 @@ def assert_observation_contract(env):
     ).unsqueeze(1)
     expected = torch.cat(
         (
-            env.unscale_arm_positions(env.arm_q),
+            env.normalize_arm_positions(env.arm_q),
             env.previous_arm_targets,
             env.arm_dq,
             expected_phase,
@@ -110,9 +118,13 @@ def assert_arm_only_objective_contract(env):
         raise AssertionError("Velocity reward is not restricted to the arm")
     if metrics["hand_q_error"].shape != (env.num_envs, 20):
         raise AssertionError("Hand diagnostics have an unexpected shape")
+    if metrics["action_rate_reward"].shape != (env.num_envs,):
+        raise AssertionError("Action-rate regularization has an unexpected shape")
     expected_reward = (
         float(env.cfg.rewards.position_weight) * metrics["position_reward"]
         + float(env.cfg.rewards.velocity_weight) * metrics["velocity_reward"]
+        + float(env.cfg.rewards.action_rate_weight)
+        * metrics["action_rate_reward"]
     )
     if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-7)):
         raise AssertionError("Reward contains a non-arm contribution")
@@ -163,8 +175,10 @@ def assert_ppo_step_contract(env, obs, critic_obs, rewards, dones, extras):
             "mean_reward",
             "mean_position_reward",
             "mean_velocity_reward",
+            "mean_action_rate_reward",
             "mean_rms_position_error",
             "mean_rms_velocity_error",
+            "mean_rms_action_rate",
             "early_termination_fraction",
             "horizon_fraction",
             "reference_end_fraction",
@@ -205,8 +219,16 @@ def run_ideal_episode(env, initial_indices):
 
     for step in range(1, env.max_episode_length + 1):
         actions, complete_target = env.next_reference_action()
-        if not bool(((actions >= -1.0) & (actions <= 1.0)).all()):
-            raise AssertionError("Ideal action escaped normalized [-1, 1] bounds")
+        reconstructed_arm_target = env.scale_actions(actions)
+        if not bool(
+            torch.allclose(
+                reconstructed_arm_target,
+                complete_target[:, : len(ARM_JOINT_NAMES)],
+                rtol=0.0,
+                atol=1e-6,
+            )
+        ):
+            raise AssertionError("AnimRL residual action mapping is not invertible")
 
         obs, critic_obs, rewards, dones, extras = env.step(actions)
         assert_ppo_step_contract(
@@ -214,8 +236,19 @@ def run_ideal_episode(env, initial_indices):
         )
         if not bool(torch_isfinite(rewards)):
             raise AssertionError("Reward contains NaN or infinity")
-        if bool((rewards < -1e-7).any()) or bool((rewards > 1.0 + 1e-6).any()):
-            raise AssertionError("Gaussian weighted reward is outside [0, 1]")
+        reward_upper_bound = (
+            float(env.cfg.rewards.position_weight)
+            + float(env.cfg.rewards.velocity_weight)
+            + float(env.cfg.rewards.action_rate_weight)
+        )
+        if bool((rewards < -1e-7).any()) or bool(
+            (rewards > reward_upper_bound + 1e-6).any()
+        ):
+            raise AssertionError(
+                "Gaussian weighted reward is outside [0, {}]".format(
+                    reward_upper_bound
+                )
+            )
 
         peak_position_error = max(
             peak_position_error, float(extras["max_abs_position_error"].max())
