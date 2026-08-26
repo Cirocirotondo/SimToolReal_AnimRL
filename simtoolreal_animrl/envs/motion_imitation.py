@@ -447,7 +447,10 @@ class MotionImitationEnv:
             self.num_envs, dtype=torch.long, device=self.device
         )
         self.reference_index = torch.zeros_like(self.episode_length_buf)
-        self.termination_violation_steps = torch.zeros_like(self.episode_length_buf)
+        self.arm_violation_steps = torch.zeros_like(self.episode_length_buf)
+        self.hand_violation_steps = torch.zeros_like(self.episode_length_buf)
+        self.arm_violation = torch.zeros_like(self.reset_buf)
+        self.hand_violation = torch.zeros_like(self.reset_buf)
         self.actions = torch.zeros(
             (self.num_envs, self.num_actions), dtype=torch.float32, device=self.device
         )
@@ -592,7 +595,8 @@ class MotionImitationEnv:
         sample = self.reference.sample(reference_indices)
         self.reference_index[env_ids] = reference_indices
         self.episode_length_buf[env_ids] = 0
-        self.termination_violation_steps[env_ids] = 0
+        self.arm_violation_steps[env_ids] = 0
+        self.hand_violation_steps[env_ids] = 0
         self.reset_buf[env_ids] = False
         self.time_out_buf[env_ids] = False
         if hasattr(self, "episode_sums"):
@@ -764,23 +768,42 @@ class MotionImitationEnv:
             self.cfg.termination.arm_position_threshold_rad
         )
 
+    def hand_threshold_violation(self, hand_q_error: torch.Tensor) -> torch.Tensor:
+        return hand_q_error.abs().amax(dim=1) > float(
+            self.cfg.termination.hand_position_threshold_rad
+        )
+
     def _compute_termination(
-        self, q_error: torch.Tensor
+        self, q_error: torch.Tensor, hand_q_error: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Either block drifting too far ends the episode. Each keeps its own
+        # grace counter, so a block that returns inside its threshold clears its
+        # count regardless of what the other block is doing.
         if bool(self.cfg.termination.enabled):
-            violation = self.threshold_violation(q_error)
-            self.termination_violation_steps.copy_(
+            self.arm_violation = self.threshold_violation(q_error)
+            self.hand_violation = self.hand_threshold_violation(hand_q_error)
+            grace = int(self.cfg.termination.grace_steps)
+            self.arm_violation_steps.copy_(
                 torch.where(
-                    violation,
-                    self.termination_violation_steps + 1,
-                    torch.zeros_like(self.termination_violation_steps),
+                    self.arm_violation,
+                    self.arm_violation_steps + 1,
+                    torch.zeros_like(self.arm_violation_steps),
                 )
             )
-            early = self.termination_violation_steps >= int(
-                self.cfg.termination.grace_steps
+            self.hand_violation_steps.copy_(
+                torch.where(
+                    self.hand_violation,
+                    self.hand_violation_steps + 1,
+                    torch.zeros_like(self.hand_violation_steps),
+                )
+            )
+            early = (self.arm_violation_steps >= grace) | (
+                self.hand_violation_steps >= grace
             )
         else:
             early = torch.zeros_like(self.reset_buf)
+            self.arm_violation = torch.zeros_like(self.reset_buf)
+            self.hand_violation = torch.zeros_like(self.reset_buf)
 
         reference_end = self.reference_index >= self.reference.last_index
         # AnimRL classifies both the configured horizon and reaching phase 1 as
@@ -835,6 +858,14 @@ class MotionImitationEnv:
             "return": self.episode_sums["reward"][done].mean(),
             "length": lengths.mean(),
             "early_termination_fraction": early[done].float().mean(),
+            # Of the episodes that failed, which block was over threshold. The
+            # two can both be true on the same step, so they need not sum to 1.
+            "arm_failure_fraction": (early & self.arm_violation)[done]
+            .float()
+            .mean(),
+            "hand_failure_fraction": (early & self.hand_violation)[done]
+            .float()
+            .mean(),
             "horizon_fraction": horizon_timeout[done].float().mean(),
             "reference_end_fraction": reference_end[done].float().mean(),
             "completed_episodes": done.sum().to(dtype=torch.float32),
@@ -888,7 +919,9 @@ class MotionImitationEnv:
         self.episode_length_buf += 1
         metrics = self._compute_reward_and_errors()
         self._accumulate_episode_metrics(metrics)
-        done, early, timeout = self._compute_termination(metrics["q_error"])
+        done, early, timeout = self._compute_termination(
+            metrics["q_error"], metrics["hand_q_error"]
+        )
         self.reset_buf.copy_(done)
         self.time_out_buf.copy_(timeout)
         reference_end = self.reference_index >= self.reference.last_index
@@ -901,6 +934,11 @@ class MotionImitationEnv:
             "horizon_time_outs": horizon_timeout.clone(),
             "reference_end": reference_end.clone(),
             "early_termination": early.clone(),
+            # Which block is over its threshold this step. An episode can end
+            # on either, so the two are reported separately to tell an arm
+            # failure from a hand failure.
+            "arm_threshold_violation": self.arm_violation.clone(),
+            "hand_threshold_violation": self.hand_violation.clone(),
             "reference_index": self.reference_index.clone(),
             "max_abs_position_error": metrics["q_error"].abs().amax(dim=1),
             "max_abs_arm_position_error": metrics["q_error"].abs().amax(dim=1),

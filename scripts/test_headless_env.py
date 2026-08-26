@@ -374,15 +374,19 @@ def assert_early_termination_logic(env):
 
     env.episode_length_buf.zero_()
     env.reference_index.zero_()
-    env.termination_violation_steps.zero_()
-    q_error = torch.zeros(
-        (env.num_envs, env.num_actions), dtype=torch.float32, device=env.device
+    env.arm_violation_steps.zero_()
+    env.hand_violation_steps.zero_()
+    arm_error = torch.zeros(
+        (env.num_envs, env.arm_q.shape[1]), dtype=torch.float32, device=env.device
     )
-    q_error[:, 0] = float(env.cfg.termination.arm_position_threshold_rad) + 0.1
+    hand_error = torch.zeros(
+        (env.num_envs, env.hand_q.shape[1]), dtype=torch.float32, device=env.device
+    )
+    arm_error[:, 0] = float(env.cfg.termination.arm_position_threshold_rad) + 0.1
 
     grace = int(env.cfg.termination.grace_steps)
     for count in range(1, grace + 1):
-        done, early, timeout = env._compute_termination(q_error)
+        done, early, timeout = env._compute_termination(arm_error, hand_error)
         if bool(timeout.any()):
             raise AssertionError("Synthetic early-termination test unexpectedly timed out")
         expected = count >= grace
@@ -390,11 +394,50 @@ def assert_early_termination_logic(env):
             raise AssertionError(
                 "Early termination grace mismatch at violation step {}".format(count)
             )
+    if not bool(env.arm_violation.all()) or bool(env.hand_violation.any()):
+        raise AssertionError("Arm-only violation was not attributed to the arm")
+
+    # The hand alone must be able to end an episode.
+    env.arm_violation_steps.zero_()
+    env.hand_violation_steps.zero_()
+    arm_error.zero_()
+    hand_error[:, 0] = float(env.cfg.termination.hand_position_threshold_rad) + 0.1
+    for count in range(1, grace + 1):
+        done, early, timeout = env._compute_termination(arm_error, hand_error)
+        expected = count >= grace
+        if bool(early.all()) != expected or bool(done.all()) != expected:
+            raise AssertionError(
+                "Hand early termination grace mismatch at step {}".format(count)
+            )
+    if not bool(env.hand_violation.all()) or bool(env.arm_violation.any()):
+        raise AssertionError("Hand-only violation was not attributed to the hand")
+
+    # The two counters are independent by design: a block that comes back inside
+    # its threshold clears its own count, so violations that alternate between
+    # arm and hand never accumulate to the grace limit.
+    env.arm_violation_steps.zero_()
+    env.hand_violation_steps.zero_()
+    arm_over = float(env.cfg.termination.arm_position_threshold_rad) + 0.1
+    hand_over = float(env.cfg.termination.hand_position_threshold_rad) + 0.1
+    for step in range(4 * grace):
+        arm_error.zero_()
+        hand_error.zero_()
+        if step % 2 == 0:
+            arm_error[:, 0] = arm_over
+        else:
+            hand_error[:, 0] = hand_over
+        done, early, _ = env._compute_termination(arm_error, hand_error)
+        if bool(early.any()) or bool(done.any()):
+            raise AssertionError(
+                "Alternating arm/hand violations terminated at step {}; the "
+                "grace counters are not independent".format(step)
+            )
 
 
 def assert_early_termination_step_contract(env):
     """Force a task failure and verify that PPO must not bootstrap it."""
     original_arm_threshold = env.cfg.termination.arm_position_threshold_rad
+    original_hand_threshold = env.cfg.termination.hand_position_threshold_rad
     grace = int(env.cfg.termination.grace_steps)
     env.reset(reference_index=0)
 
@@ -402,6 +445,7 @@ def assert_early_termination_step_contract(env):
         # A negative diagnostic threshold makes every finite tracking error a
         # violation without perturbing the simulator state itself.
         env.cfg.termination.arm_position_threshold_rad = -1.0
+        env.cfg.termination.hand_position_threshold_rad = -1.0
         for step in range(1, grace + 1):
             actions, _ = env.next_reference_action()
             obs, critic_obs, rewards, dones, extras = env.step(actions)
@@ -424,6 +468,7 @@ def assert_early_termination_step_contract(env):
             raise AssertionError("Early-termination episode statistics are wrong")
     finally:
         env.cfg.termination.arm_position_threshold_rad = original_arm_threshold
+        env.cfg.termination.hand_position_threshold_rad = original_hand_threshold
         env.reset(reference_index=0)
 
 

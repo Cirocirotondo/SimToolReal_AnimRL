@@ -475,7 +475,9 @@ class PPO:
             )
             if evaluation_callback is not None:
                 evaluation_start = time.perf_counter()
-                evaluation_stats = evaluation_callback(iteration, self)
+                evaluation_stats = evaluation_callback(
+                    iteration, self, is_final=iteration == end_iteration - 1
+                )
                 evaluation_time = time.perf_counter() - evaluation_start
                 if evaluation_stats is not None:
                     stats.update(evaluation_stats)
@@ -550,10 +552,15 @@ class PPO:
             "Perf/iteration_time_s": "iteration_time_s",
             "Perf/total_timesteps": "total_timesteps",
             "Learn/learning_rate": "learning_rate",
+            # This counts the episodes that ended during the rollout, so the
+            # explicit name reads as what it measures.
+            "Episode/count_terminations": "episode_count",
         }
         for tag, key in tags.items():
             self.writer.add_scalar(tag, stats[key], iteration)
         for key, value in stats.items():
+            if key == "episode_count":
+                continue  # Already logged above under its explicit tag.
             if key.startswith("episode_"):
                 self.writer.add_scalar(
                     "Episode/{}".format(key[len("episode_"):]),
