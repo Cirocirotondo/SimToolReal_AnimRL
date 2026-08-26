@@ -110,6 +110,13 @@ class MotionImitationEnv:
             getattr(self.cfg.viewer, "reference_ghost", False)
         )
         self.actors_per_env = 2 if self.reference_ghost_enabled else 1
+        # getattr keeps a config object that predates the field usable; note
+        # that a saved config.json from before it was added carries no value to
+        # restore, so replaying such a run picks up whatever the class default
+        # is now rather than the self-collision it actually trained with.
+        self.self_collision_enabled = bool(
+            getattr(self.cfg.asset, "self_collision", True)
+        )
 
         self.gym = gymapi.acquire_gym()
         self.sim = self._create_sim()
@@ -299,7 +306,12 @@ class MotionImitationEnv:
             env = self.gym.create_env(self.sim, lower, upper, per_row)
             if env is None:
                 raise RuntimeError("Failed to create environment {}".format(env_index))
-            self.gym.begin_aggregate(env, body_count, shape_count, True)
+            # The aggregate's last flag is what actually governs self-collision.
+            # create_actor's own filter argument below never reaches the shapes:
+            # they keep the filter bits the asset gave them.
+            self.gym.begin_aggregate(
+                env, body_count, shape_count, self.self_collision_enabled
+            )
             actor = self.gym.create_actor(
                 env,
                 self.robot_asset,
