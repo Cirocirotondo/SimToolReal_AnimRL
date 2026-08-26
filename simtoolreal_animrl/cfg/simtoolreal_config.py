@@ -96,7 +96,7 @@ class SimToolRealCfg(BaseEnvCfg):
     class termination:
         enabled = True
         arm_position_threshold_rad = 0.35
-        hand_position_threshold_rad = 0.35
+        hand_position_threshold_rad = 1.35
         grace_steps = 5
 
 
