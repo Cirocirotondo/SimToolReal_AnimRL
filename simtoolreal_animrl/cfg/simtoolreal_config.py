@@ -64,12 +64,14 @@ class SimToolRealCfg(BaseEnvCfg):
         # from the default pose against the arm's 0.458, and the smaller scale
         # buys resolution for the contact work that follows.
         scale_hand_joint_target = 0.15
+        # At 100.0 the residual clamp never binds. The finger movements are 
+        # effectively capped by the early terminations.
         clip_joint_target = 100.0
 
     class rewards:
         # Arm and hand keep separate Gaussian terms so neither dilutes the
-        # other's gradient. The arm values are unchanged and the hand mirrors
-        # them, which doubles the maximum per-step reward to 2.4.
+        # other's gradient. The hand weights are 0.6x the arm's, which is what
+        # the handmult_0.6 run is named after: maximum per-step reward 1.92.
         position_arm_weight = 0.8
         velocity_arm_weight = 0.2
         action_rate_arm_weight = 0.2
@@ -78,9 +80,9 @@ class SimToolRealCfg(BaseEnvCfg):
         # Action-rate regularization on a_t - a_{t-1}, per block.
         action_rate_arm_std = 5
 
-        position_hand_weight = 0.8
-        velocity_hand_weight = 0.2
-        action_rate_hand_weight = 0.2
+        position_hand_weight = 0.48
+        velocity_hand_weight = 0.12
+        action_rate_hand_weight = 0.12
         position_hand_std_rad = 0.223607
         velocity_hand_std_rad_per_s = 1.0
         action_rate_hand_std = 5
@@ -88,6 +90,7 @@ class SimToolRealCfg(BaseEnvCfg):
     class termination:
         enabled = True
         arm_position_threshold_rad = 0.35
+        hand_position_threshold_rad = 0.35
         grace_steps = 5
 
 
@@ -96,5 +99,5 @@ class SimToolRealTrainCfg(BaseTrainCfg):
 
     class runner(BaseTrainCfg.runner):
         experiment_name = "simtoolreal"
-        run_name = "llcfix_animrl"
+        run_name = "handmult_0.6"
         max_iterations = 3000

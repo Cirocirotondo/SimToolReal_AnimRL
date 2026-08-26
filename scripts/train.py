@@ -336,7 +336,7 @@ def main():
             )
             print(
                 "Periodic deterministic evaluation: {} envs every {} "
-                "iterations".format(
+                "iterations, plus the final update".format(
                     train_cfg.runner.evaluation_num_envs,
                     train_cfg.runner.evaluation_interval,
                 )

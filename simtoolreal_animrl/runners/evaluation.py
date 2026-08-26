@@ -60,8 +60,11 @@ class DeterministicEvaluator:
             device=self.env.device,
         )
 
-    def __call__(self, iteration, runner):
-        if int(iteration) % self.interval != 0:
+    def __call__(self, iteration, runner, is_final=False):
+        # ``is_final`` marks the last update of the segment, which is always
+        # evaluated: a run length that is not a multiple of the interval would
+        # otherwise leave its final policy unranked.
+        if not is_final and int(iteration) % self.interval != 0:
             return None
         with preserve_random_state():
             runner.eval_mode()
@@ -270,8 +273,11 @@ class SubprocessDeterministicEvaluator:
                 "Evaluation interval and environment count must be positive"
             )
 
-    def __call__(self, iteration, runner):
-        if int(iteration) % self.interval != 0:
+    def __call__(self, iteration, runner, is_final=False):
+        # ``is_final`` marks the last update of the segment, which is always
+        # evaluated: a run length that is not a multiple of the interval would
+        # otherwise leave its final policy unranked.
+        if not is_final and int(iteration) % self.interval != 0:
             return None
         checkpoint = self.run_dir / ".periodic_evaluation_model.pt"
         output = self.run_dir / ".periodic_evaluation_metrics.json"

@@ -240,6 +240,7 @@ def main():
         early_count = 0
         timeout_count = 0
         peak_position_error = 0.0
+        peak_hand_position_error = 0.0
         episode_weight = 0
         episode_totals = {}
         trajectory = {
@@ -300,6 +301,10 @@ def main():
                 peak_position_error = max(
                     peak_position_error,
                     scalar(infos["max_abs_position_error"].max()),
+                )
+                peak_hand_position_error = max(
+                    peak_hand_position_error,
+                    scalar(infos["max_abs_hand_position_error"].max()),
                 )
 
                 trajectory["observations"].append(
@@ -382,12 +387,20 @@ def main():
             "early_termination_count": early_count,
             "timeout_count": timeout_count,
             "peak_position_error": peak_position_error,
+            "peak_hand_position_error": peak_hand_position_error,
             "termination_threshold": float(
                 env_cfg.termination.arm_position_threshold_rad
+            ),
+            "hand_termination_threshold": float(
+                env_cfg.termination.hand_position_threshold_rad
             ),
             "exceeded_termination_threshold": bool(
                 peak_position_error
                 > float(env_cfg.termination.arm_position_threshold_rad)
+            ),
+            "exceeded_hand_termination_threshold": bool(
+                peak_hand_position_error
+                > float(env_cfg.termination.hand_position_threshold_rad)
             ),
             "episode_metrics": episode_metrics,
             "trajectory_env_0": trajectory,
@@ -400,10 +413,15 @@ def main():
         print("  completed episodes : {}".format(completed_episodes))
         print("  environment steps  : {}".format(total_steps))
         print("  mean step reward   : {:.6f}".format(result["mean_step_reward"]))
-        print("  peak |q error|     : {:.6f} rad (threshold {:.2f}{})".format(
+        print("  peak |q error| arm : {:.6f} rad (threshold {:.2f}{})".format(
             peak_position_error,
             result["termination_threshold"],
             ", EXCEEDED" if result["exceeded_termination_threshold"] else "",
+        ))
+        print("  peak |q error| hand: {:.6f} rad (threshold {:.2f}{})".format(
+            peak_hand_position_error,
+            result["hand_termination_threshold"],
+            ", EXCEEDED" if result["exceeded_hand_termination_threshold"] else "",
         ))
         if episode_metrics:
             print("  mean return        : {:.6f}".format(

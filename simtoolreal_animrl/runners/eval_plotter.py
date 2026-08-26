@@ -123,6 +123,7 @@ class EvaluationPlotter:
         self._dt = 1.0
         self._weights: Dict[str, float] = {}
         self._position_threshold: Optional[float] = None
+        self._hand_position_threshold: Optional[float] = None
         self._action_scale = 1.0
         self._hand_action_scale = 1.0
         self._num_arm_dofs = 0
@@ -148,9 +149,15 @@ class EvaluationPlotter:
             info_key: float(getattr(env.cfg.rewards, weight_attribute))
             for info_key, weight_attribute in REWARD_TERMS
         }
+        enabled = bool(env.cfg.termination.enabled)
         self._position_threshold = (
             float(env.cfg.termination.arm_position_threshold_rad)
-            if bool(env.cfg.termination.enabled)
+            if enabled
+            else None
+        )
+        self._hand_position_threshold = (
+            float(env.cfg.termination.hand_position_threshold_rad)
+            if enabled
             else None
         )
         self._records.clear()
@@ -196,6 +203,13 @@ class EvaluationPlotter:
             [reference_index], dtype=torch.long, device=env.device
         )
         reference = env.reference.sample(indices)
+        # The action that would have landed exactly on this reference sample.
+        # step() advances reference_index before publishing it, so the index
+        # recorded here is the one the action applied this step was aiming at,
+        # and inverting the residual mapping on it gives the ideal action.
+        ideal_action = _vector(env.positions_to_actions(reference.q), 0)
+        self._append("reference_action", ideal_action[:arm])
+        self._append("reference_hand_action", ideal_action[arm:])
         self._append("reference_arm_q", _vector(reference.q[:, :arm], 0))
         self._append("reference_arm_dq", _vector(reference.dq[:, :arm], 0))
         self._append("reference_hand_q", _vector(reference.q[:, arm:], 0))
@@ -408,14 +422,18 @@ class EvaluationPlotter:
             linewidth=1.0,
             alpha=0.7,
         )
-        if self._position_threshold is not None:
-            axes[0].axhline(
-                self._position_threshold,
-                color="red",
-                linestyle="--",
-                linewidth=1.0,
-                label="termination threshold",
-            )
+        for threshold, label in (
+            (self._position_threshold, "arm threshold"),
+            (self._hand_position_threshold, "hand threshold"),
+        ):
+            if threshold is not None:
+                axes[0].axhline(
+                    threshold,
+                    color="red",
+                    linestyle="--",
+                    linewidth=1.0,
+                    label=label,
+                )
         _finish_axis(axes[0], "Position error [rad]")
 
         axes[1].plot(time_s, data["rms_velocity_error"], label="arm RMS", linewidth=1.3)
@@ -447,8 +465,11 @@ class EvaluationPlotter:
         time_s = data["time_s"]
         prefix = "arm" if group == "arm" else "hand"
         names = self._arm_names if group == "arm" else self._hand_names
-        # Only the arm carries the termination threshold.
-        threshold = self._position_threshold if group == "arm" else None
+        threshold = (
+            self._position_threshold
+            if group == "arm"
+            else self._hand_position_threshold
+        )
         fig, axes = plt.subplots(5, 1, figsize=(14, 16), sharex=True)
 
         _plot_per_joint(
@@ -510,6 +531,11 @@ class EvaluationPlotter:
         delta = (
             data["action_delta"] if group == "arm" else data["hand_action_delta"]
         )
+        ideal = (
+            data["reference_action"]
+            if group == "arm"
+            else data["reference_hand_action"]
+        )
         names = self._arm_names if group == "arm" else self._hand_names
         scale = self._action_scale if group == "arm" else self._hand_action_scale
         count = action.shape[1]
@@ -519,7 +545,18 @@ class EvaluationPlotter:
         for index in range(count):
             ax = axes[index]
             trace = action[:, index]
+            ideal_trace = ideal[:, index]
             ax.plot(time_s, trace, label="action", linewidth=1.1)
+            # The open-loop action that reproduces the demonstration exactly:
+            # the gap to it is the residual the policy is adding on top.
+            ax.plot(
+                time_s,
+                ideal_trace,
+                label="ideal (demo)",
+                linewidth=1.1,
+                linestyle="--",
+                color="0.25",
+            )
             ax.plot(
                 time_s,
                 delta[:, index],
@@ -539,12 +576,17 @@ class EvaluationPlotter:
                 if finite_delta.size
                 else 0.0
             )
+            gap = trace - ideal_trace
+            rms_gap = (
+                float(np.sqrt(np.nanmean(gap ** 2))) if gap.size else 0.0
+            )
             ax.set_title(
                 "{}    sign-flip rate {:.3f}    RMS delta {:.4f}    "
-                "±1 -> {:+.3f} rad residual".format(
+                "RMS vs ideal {:.3f}    ±1 -> {:+.3f} rad residual".format(
                     names[index] if index < len(names) else index,
                     flip_rate,
                     rms_delta,
+                    rms_gap,
                     scale,
                 ),
                 fontsize=9,

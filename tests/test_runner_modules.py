@@ -21,6 +21,16 @@ from simtoolreal_animrl.runners.evaluation import (
 from simtoolreal_animrl.runners.storage import RolloutStorage
 
 
+class _NullRunner:
+    """Stub runner: the evaluator only flips its train/eval mode."""
+
+    def eval_mode(self):
+        pass
+
+    def train_mode(self):
+        pass
+
+
 class RunnerModulesTest(unittest.TestCase):
     def setUp(self):
         self.env_cfg = SimToolRealCfg()
@@ -92,7 +102,7 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertTrue(train.runner.tensorboard)
         self.assertFalse(train.runner.wandb)
         self.assertTrue(train.runner.evaluation_enabled)
-        self.assertEqual(train.runner.evaluation_interval, 100)
+        self.assertEqual(train.runner.evaluation_interval, 500)
         self.assertEqual(train.runner.evaluation_num_envs, 64)
         self.assertEqual(
             train.runner.evaluation_fixed_phases, [0.0, 0.25, 0.5, 0.75]
@@ -128,6 +138,32 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(first.uniform_indices, second.uniform_indices)
         )
+
+    def test_final_iteration_is_always_evaluated(self):
+        """The last update is ranked even when it is off the interval."""
+
+        class Reference:
+            last_index = 1107
+
+        class Env:
+            num_envs = 4
+            device = torch.device("cpu")
+            reference = Reference()
+
+        evaluator = DeterministicEvaluator(Env(), 500, 123, [0.0, 0.5])
+        calls = []
+        evaluator._evaluate_suite = lambda runner, indices: calls.append(
+            indices
+        ) or {"position_score": 1.0}
+
+        # Off-interval iterations stay skipped.
+        self.assertIsNone(evaluator(2999, runner=None))
+        self.assertEqual(calls, [])
+
+        # The same iteration marked as final is evaluated.
+        stats = evaluator(2999, runner=_NullRunner(), is_final=True)
+        self.assertEqual(stats["evaluation_score"], 1.0)
+        self.assertEqual(len(calls), 2)  # fixed and uniform suites
 
     def test_evaluation_preserves_torch_and_numpy_rng(self):
         torch.manual_seed(17)
