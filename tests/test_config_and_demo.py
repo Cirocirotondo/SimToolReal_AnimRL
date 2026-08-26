@@ -21,6 +21,9 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.control.scale_joint_target, 0.25)
         self.assertEqual(env_cfg.control.scale_hand_joint_target, 0.15)
         self.assertEqual(env_cfg.control.clip_joint_target, 100.0)
+        # The fingers are allowed to pass through each other, which is what
+        # makes the step roughly twice as fast; see asset.self_collision.
+        self.assertFalse(env_cfg.asset.self_collision)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)
         self.assertEqual(train_cfg.algorithm.learning_rate, 1.0e-4)

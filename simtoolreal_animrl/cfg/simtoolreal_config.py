@@ -25,6 +25,12 @@ class SimToolRealCfg(BaseEnvCfg):
         angular_damping = 0.01
         linear_damping = 0.01
         use_physx_armature = True
+        # PhysX aggregate self-collision flag. With it on, the twenty finger
+        # bodies collide with each other and with the palm, which measures
+        # 32.4 ms per step against 21.4 with reference actions and 50.8 against
+        # 23.1 once the policy makes the fingers jitter. Off, the hand can pass
+        # through itself: revisit this before adding object contact.
+        self_collision = False
 
     class init_state:
         # Matches the independently verified Isaac Gym demonstration viewer.
