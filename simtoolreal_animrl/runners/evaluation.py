@@ -210,16 +210,35 @@ class DeterministicEvaluator:
         per_env_object_orientation_reward = (
             object_orientation_reward_sum / lengths
         )
+        # Zero object weights mean the object terms are switched off, so the
+        # weighted mixture would be 0/0. Fall back to a robot-pose-only score
+        # instead of letting a NaN reach best-checkpoint selection, where every
+        # NaN comparison is False and no checkpoint would ever be saved.
         object_weight_sum = float(
             self.env.cfg.rewards.object_position_weight
             + self.env.cfg.rewards.object_orientation_weight
         )
-        per_env_object_pose_score = (
-            float(self.env.cfg.rewards.object_position_weight)
-            * per_env_object_position_reward
-            + float(self.env.cfg.rewards.object_orientation_weight)
-            * per_env_object_orientation_reward
-        ) / object_weight_sum
+        object_pose_rewarded = object_weight_sum > 0.0
+        if object_pose_rewarded:
+            per_env_object_pose_score = (
+                float(self.env.cfg.rewards.object_position_weight)
+                * per_env_object_position_reward
+                + float(self.env.cfg.rewards.object_orientation_weight)
+                * per_env_object_orientation_reward
+            ) / object_weight_sum
+        else:
+            per_env_object_pose_score = torch.zeros_like(
+                per_env_object_position_reward
+            )
+        mean_robot_position_reward = 0.5 * (
+            per_env_position_reward.mean() + per_env_hand_position_reward.mean()
+        )
+        if object_pose_rewarded:
+            mean_pose_score = 0.5 * (
+                mean_robot_position_reward + per_env_object_pose_score.mean()
+            )
+        else:
+            mean_pose_score = mean_robot_position_reward
         return {
             "mean_reward": float((reward_sum / lengths).mean()),
             "mean_position_reward": float(per_env_position_reward.mean()),
@@ -274,19 +293,12 @@ class DeterministicEvaluator:
             "max_abs_action": max_abs_action,
             # Best-checkpoint selection gives equal importance to robot pose
             # (arm/hand position) and object pose (its configured 80/20
-            # position/orientation mixture). Subtracting failure fraction
-            # prevents short failed rollouts from looking artificially good.
+            # position/orientation mixture); with the object weights zeroed the
+            # robot pose carries the score alone, on the same 0-1 scale rather
+            # than a halved one. Subtracting failure fraction prevents short
+            # failed rollouts from looking artificially good.
             "position_score": float(
-                0.5
-                * (
-                    0.5
-                    * (
-                        per_env_position_reward.mean()
-                        + per_env_hand_position_reward.mean()
-                    )
-                    + per_env_object_pose_score.mean()
-                )
-                - early.float().mean()
+                mean_pose_score - early.float().mean()
             ),
         }
 
