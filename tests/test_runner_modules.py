@@ -18,6 +18,7 @@ from simtoolreal_animrl.runners.evaluation import (
     DeterministicEvaluator,
     preserve_random_state,
 )
+from simtoolreal_animrl.runners.algorithms.ppo import PPO
 from simtoolreal_animrl.runners.storage import RolloutStorage
 
 
@@ -29,6 +30,85 @@ class _NullRunner:
 
     def train_mode(self):
         pass
+
+
+class DivergenceGuardTest(unittest.TestCase):
+    """The guard that aborts a run whose action std has run away.
+
+    ``_divergence_reason`` only reads ``self.cfg`` and ``self.divergence_streak``,
+    so it is exercised on a stub rather than a full PPO runner.
+    """
+
+    def setUp(self):
+        self.guard = PPO._divergence_reason.__get__(self._stub())
+
+    def _stub(self, **overrides):
+        cfg = SimToolRealTrainCfg().runner
+        for name, value in overrides.items():
+            setattr(cfg, name, value)
+
+        class Stub:
+            pass
+
+        stub = Stub()
+        stub.cfg = cfg
+        stub.divergence_streak = 0
+        self.stub = stub
+        return stub
+
+    @staticmethod
+    def _stats(action_std=1.0, clipped=0.0, value_loss=1.0):
+        return {
+            "mean_action_std": action_std,
+            "action_target_clipped_fraction": clipped,
+            "value_loss": value_loss,
+            "surrogate_loss": -0.003,
+            "mean_reward": 1.9,
+        }
+
+    def test_healthy_run_never_aborts(self):
+        # The 2026-08-26 runs peak at std 2.45 and never clip a target.
+        for _ in range(50):
+            self.assertIsNone(self.guard(self._stats(action_std=2.45)))
+        self.assertEqual(self.stub.divergence_streak, 0)
+
+    def test_action_std_aborts_only_after_patience(self):
+        patience = int(self.stub.cfg.abort_patience)
+        for _ in range(patience - 1):
+            self.assertIsNone(self.guard(self._stats(action_std=25.0)))
+        reason = self.guard(self._stats(action_std=25.0))
+        self.assertIsNotNone(reason)
+        self.assertIn("mean_action_std", reason)
+
+    def test_a_healthy_iteration_resets_the_streak(self):
+        self.guard(self._stats(action_std=25.0))
+        self.guard(self._stats(action_std=25.0))
+        self.assertIsNone(self.guard(self._stats(action_std=2.0)))
+        self.assertEqual(self.stub.divergence_streak, 0)
+        # The streak restarts from scratch rather than resuming.
+        self.assertIsNone(self.guard(self._stats(action_std=25.0)))
+
+    def test_clipped_fraction_threshold(self):
+        for _ in range(int(self.stub.cfg.abort_patience)):
+            reason = self.guard(self._stats(clipped=0.85))
+        self.assertIn("action_target_clipped_fraction", reason)
+        # Heavy but sub-threshold clipping is tolerated.
+        guard = PPO._divergence_reason.__get__(self._stub())
+        for _ in range(50):
+            self.assertIsNone(guard(self._stats(clipped=0.75)))
+
+    def test_non_finite_metrics_abort(self):
+        """A NaN std would pass every ``>`` test, so it is checked explicitly."""
+        for _ in range(int(self.stub.cfg.abort_patience)):
+            reason = self.guard(self._stats(action_std=float("nan")))
+        self.assertIn("not finite", reason)
+
+    def test_guard_can_be_disabled(self):
+        guard = PPO._divergence_reason.__get__(
+            self._stub(abort_on_divergence=False)
+        )
+        for _ in range(50):
+            self.assertIsNone(guard(self._stats(action_std=1.0e6)))
 
 
 class RunnerModulesTest(unittest.TestCase):

@@ -341,7 +341,7 @@ def main():
                     train_cfg.runner.evaluation_interval,
                 )
             )
-        runner.learn(
+        history = runner.learn(
             num_iterations=num_iterations,
             start_iteration=start_iteration,
             checkpoint_dir=run_dir,
@@ -350,7 +350,10 @@ def main():
             metrics_path=run_dir / "metrics.jsonl",
             evaluation_callback=evaluator,
         )
-        training_completed = True
+        # A run stopped by the divergence guard has no policy worth replaying,
+        # and its last checkpoint is diverged_model.pt rather than a final one.
+        diverged = bool(history and history[-1].get("divergence_abort"))
+        training_completed = not diverged
     finally:
         if runner is not None:
             runner.close()

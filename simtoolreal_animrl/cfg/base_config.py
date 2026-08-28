@@ -122,6 +122,20 @@ class BaseTrainCfg(ABCConfig):
         evaluation_num_envs = 64
         evaluation_seed = 123
         evaluation_fixed_phases = [0.0, 0.25, 0.5, 0.75]
+        # Divergence guard. The entropy bonus is a constant upward force on the
+        # unbounded log_std parameter, so a run whose surrogate loss stops
+        # opposing it grows the action std without limit and never recovers.
+        # These thresholds are deliberately far above anything a healthy run
+        # reaches (the 2026-08-26 runs peak at std 2.45 and never clip a single
+        # action target) so the guard only fires on a policy that is already
+        # unrecoverable, rather than on transient early exploration.
+        abort_on_divergence = True
+        abort_action_std = 20.0
+        abort_action_target_clipped_fraction = 0.8
+        # Consecutive iterations above a threshold before aborting. The metrics
+        # average ~98k samples per iteration and are very smooth, so this is
+        # cheap insurance rather than a necessity.
+        abort_patience = 3
         # W&B remains a future optional backend; this milestone logs locally.
         wandb = False
         wandb_group = "default"
