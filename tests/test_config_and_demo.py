@@ -24,6 +24,11 @@ class ConfigAndDemoTest(unittest.TestCase):
         # The fingers are allowed to pass through each other, which is what
         # makes the step roughly twice as fast; see asset.self_collision.
         self.assertFalse(env_cfg.asset.self_collision)
+        self.assertEqual(env_cfg.object.size_m, [0.15, 0.05, 0.05])
+        self.assertEqual(env_cfg.object.mass_kg, 0.2)
+        self.assertEqual(env_cfg.object.friction, 0.5)
+        self.assertEqual(env_cfg.object.restitution, 0.0)
+        self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.03)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)
         self.assertEqual(train_cfg.algorithm.learning_rate, 1.0e-4)
@@ -36,6 +41,18 @@ class ConfigAndDemoTest(unittest.TestCase):
         )
         self.assertEqual(demo.q.shape, (1108, 26))
         self.assertEqual(demo.dq.shape, (1108, 26))
+        self.assertEqual(demo.cube_pose.shape, (1108, 7))
+        self.assertEqual(demo.cube_linear_velocity.shape, (1108, 3))
+        self.assertEqual(demo.cube_angular_velocity.shape, (1108, 3))
+        self.assertTrue(torch.isfinite(demo.cube_pose).all())
+        self.assertTrue(
+            torch.allclose(
+                torch.linalg.vector_norm(demo.cube_pose[:, 3:7], dim=1),
+                torch.ones(1108),
+                rtol=0.0,
+                atol=1e-6,
+            )
+        )
         self.assertLess(abs(demo.frequency_hz - 60.0), 0.05)
 
 
