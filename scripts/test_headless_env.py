@@ -79,7 +79,116 @@ def assert_reset_matches_reference(env, reference_index):
     if reference_index is not None:
         if not bool((env.reference_index == int(reference_index)).all()):
             raise AssertionError("The requested RSI index was not applied")
-    return position_error, velocity_error
+    expected_cube_root = env._cube_reference_root_states(reference)
+    cube_error = (env.cube_root_state - expected_cube_root).abs().max().item()
+    if cube_error > 1e-6:
+        raise AssertionError(
+            "RSI cube root-state write failed: max error={:.3e}".format(cube_error)
+        )
+    return position_error, velocity_error, cube_error
+
+
+def assert_object_scene_contract(env):
+    robot_shapes = env.gym.get_actor_rigid_shape_properties(
+        env.envs[0], env.robot_handles[0]
+    )
+    cube_shapes = env.gym.get_actor_rigid_shape_properties(
+        env.envs[0], env.cube_handles[0]
+    )
+    table_shapes = env.gym.get_actor_rigid_shape_properties(
+        env.envs[0], env.table_handles[0]
+    )
+    filter_bit = int(env.robot_table_collision_filter_bit)
+    if filter_bit <= 0:
+        raise AssertionError("Robot/table collision filter bit is invalid")
+    if not all(int(shape.filter) & filter_bit for shape in robot_shapes):
+        raise AssertionError("Not every robot shape filters the table")
+    if not all(int(shape.filter) & filter_bit for shape in table_shapes):
+        raise AssertionError("Table does not filter robot collisions")
+    if any(int(shape.filter) != 0 for shape in cube_shapes):
+        raise AssertionError("Cube filter must allow robot and table contacts")
+    if any(
+        int(robot.filter) & int(cube.filter)
+        for robot in robot_shapes
+        for cube in cube_shapes
+    ):
+        raise AssertionError("Robot-cube collisions are filtered")
+    if any(
+        int(table.filter) & int(cube.filter)
+        for table in table_shapes
+        for cube in cube_shapes
+    ):
+        raise AssertionError("Table-cube collisions are filtered")
+
+    cube_body = env.gym.get_actor_rigid_body_properties(
+        env.envs[0], env.cube_handles[0]
+    )[0]
+    expected_inertia = np.asarray(env.cfg.object.inertia_kg_m2, dtype=np.float64)
+    actual_inertia = np.asarray(
+        [cube_body.inertia.x.x, cube_body.inertia.y.y, cube_body.inertia.z.z],
+        dtype=np.float64,
+    )
+    if not np.isclose(cube_body.mass, env.cfg.object.mass_kg, atol=1e-7):
+        raise AssertionError("Cube mass does not match configuration")
+    np.testing.assert_allclose(actual_inertia, expected_inertia, rtol=0.0, atol=1e-8)
+    if not all(
+        np.isclose(shape.friction, env.cfg.object.friction, atol=1e-7)
+        and np.isclose(shape.restitution, env.cfg.object.restitution, atol=1e-7)
+        for shape in cube_shapes
+    ):
+        raise AssertionError("Cube material does not match configuration")
+
+
+def assert_vectorized_object_rsi_contract(env):
+    """Check distinct per-env RSI states and one indexed partial reset."""
+    import torch
+
+    env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
+    env.reset_idx(env_ids)
+    env.gym.refresh_actor_root_state_tensor(env.sim)
+    uniform_expected = env._cube_reference_root_states(
+        env.reference.sample(env.reference_index)
+    )
+    if not bool(
+        torch.allclose(env.cube_root_state, uniform_expected, rtol=0.0, atol=1e-6)
+    ):
+        raise AssertionError("Uniform RSI did not reset cubes from sampled phases")
+
+    spread = torch.linspace(
+        0,
+        env.reference.last_index - 1,
+        steps=env.num_envs,
+        device=env.device,
+    ).round().long()
+    env.reset_idx(env_ids, spread)
+    env.gym.refresh_actor_root_state_tensor(env.sim)
+    expected = env._cube_reference_root_states(env.reference.sample(spread))
+    if not bool(torch.allclose(env.cube_root_state, expected, rtol=0.0, atol=1e-6)):
+        raise AssertionError("Vectorized RSI did not apply each cube reference state")
+
+    if env.num_envs > 1:
+        before = env.cube_root_state.clone()
+        partial_env_ids = env_ids[:1]
+        partial_reference = torch.tensor(
+            [min(850, env.reference.last_index - 1)],
+            dtype=torch.long,
+            device=env.device,
+        )
+        env.reset_idx(partial_env_ids, partial_reference)
+        env.gym.refresh_actor_root_state_tensor(env.sim)
+        expected_partial = env._cube_reference_root_states(
+            env.reference.sample(partial_reference)
+        )
+        if not bool(
+            torch.allclose(
+                env.cube_root_state[:1], expected_partial, rtol=0.0, atol=1e-6
+            )
+        ):
+            raise AssertionError("Partial RSI did not reset the selected cube")
+        if not bool(
+            torch.equal(env.cube_root_state[1:], before[1:])
+        ):
+            raise AssertionError("Partial RSI changed a non-selected cube")
 
 
 def assert_observation_contract(env):
@@ -492,9 +601,14 @@ def main():
             env.reset(reference_index=args.rsi_index)
 
         initial_indices = env.reference_index.clone()
-        reset_q_error, reset_dq_error = assert_reset_matches_reference(
-            env, args.rsi_index
+        reset_q_error, reset_dq_error, reset_cube_error = (
+            assert_reset_matches_reference(env, args.rsi_index)
         )
+        assert_object_scene_contract(env)
+        assert_vectorized_object_rsi_contract(env)
+        env.reset_idx(env.all_env_ids, initial_indices)
+        env.gym.refresh_dof_state_tensor(env.sim)
+        env.gym.refresh_actor_root_state_tensor(env.sim)
         assert_observation_contract(env)
         assert_arm_only_objective_contract(env)
         assert_correct_pd_gains(env)
@@ -515,6 +629,7 @@ def main():
         )
         print("  reset max q error [rad]   : {:.3e}".format(reset_q_error))
         print("  reset max dq error [rad/s]: {:.3e}".format(reset_dq_error))
+        print("  reset max cube-state error : {:.3e}".format(reset_cube_error))
         print(
             "  peak tracking error [rad] : {:.6f}".format(
                 metrics["peak_position_error"]
@@ -539,6 +654,9 @@ def main():
             )
         )
         print("  PD gains                  : verified")
+        print("  cube/table physics        : verified")
+        print("  collision filtering       : verified")
+        print("  vectorized object RSI      : verified")
         print("  79D observation contract  : verified")
         print("  policy-driven hand        : verified")
         print("  arm+hand reward contract  : verified")

@@ -29,8 +29,27 @@ class SimToolRealCfg(BaseEnvCfg):
         # bodies collide with each other and with the palm, which measures
         # 32.4 ms per step against 21.4 with reference actions and 50.8 against
         # 23.1 once the policy makes the fingers jitter. Off, the hand can pass
-        # through itself: revisit this before adding object contact.
+        # through itself, while external robot-cube contacts remain enabled.
         self_collision = False
+        friction = 0.5
+        fingertip_friction = 1.5
+        restitution = 0.0
+
+    class object:
+        # Matches demo_viewer_isaacgym_cube_RSI_test.py exactly.
+        size_m = [0.15, 0.05, 0.05]
+        mass_kg = 0.2
+        inertia_kg_m2 = [0.00008333, 0.00041667, 0.00041667]
+        friction = 0.5
+        restitution = 0.0
+        color = [0.78, 0.78, 0.82]
+
+    class table:
+        size_m = [0.475, 0.4, 0.3]
+        surface_below_robot_base_m = 0.03
+        friction = 0.5
+        restitution = 0.0
+        color = [0.82, 0.56, 0.35]
 
     class init_state:
         # Matches the independently verified Isaac Gym demonstration viewer.
@@ -58,7 +77,7 @@ class SimToolRealCfg(BaseEnvCfg):
         ]
 
     class motion:
-        file = "demonstrations/demo_20260727_152551_335339_60hz.npz"
+        file = "demonstrations/demo_20260727_152551_335339_60hz_cube.npz"
         frequency_hz = 60.0
 
     class control:

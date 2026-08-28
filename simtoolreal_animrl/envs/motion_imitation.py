@@ -109,7 +109,11 @@ class MotionImitationEnv:
         self.reference_ghost_enabled = bool(
             getattr(self.cfg.viewer, "reference_ghost", False)
         )
+        # Only the robot and optional ghost have DOFs. The physical cube and
+        # fixed table are root-state actors and therefore do not change the
+        # layout of the global DOF tensor.
         self.actors_per_env = 2 if self.reference_ghost_enabled else 1
+        self.total_actors_per_env = 4 if self.reference_ghost_enabled else 3
         # getattr keeps a config object that predates the field usable; note
         # that a saved config.json from before it was added carries no value to
         # restore, so replaying such a run picks up whatever the class default
@@ -122,6 +126,7 @@ class MotionImitationEnv:
         self.sim = self._create_sim()
         self._add_ground_plane()
         self.robot_asset = self._load_robot_asset()
+        self._create_object_assets()
         self._create_envs()
         self.gym.prepare_sim(self.sim)
         self.viewer = None
@@ -208,6 +213,7 @@ class MotionImitationEnv:
         self.collision_filter_bits = configure_asset_wrist_collision_filters(
             self.gym, asset
         )
+        self._configure_robot_contact_properties(asset)
 
         lower_asset = np.asarray(self.pd_properties["lower"], dtype=np.float32)
         upper_asset = np.asarray(self.pd_properties["upper"], dtype=np.float32)
@@ -274,6 +280,109 @@ class MotionImitationEnv:
             raise ValueError("The demonstration exceeds the robot position limits")
         return asset
 
+    def _configure_robot_contact_properties(self, asset) -> None:
+        """Match the RSI viewer materials and reserve the table-filter bit."""
+        body_names = tuple(self.gym.get_asset_rigid_body_names(asset))
+        shape_ranges = self.gym.get_asset_rigid_body_shape_indices(asset)
+        shape_properties = self.gym.get_asset_rigid_shape_properties(asset)
+
+        used_bits = 0
+        for properties in shape_properties:
+            used_bits |= int(properties.filter)
+        filter_bit = 1
+        while used_bits & filter_bit:
+            filter_bit <<= 1
+        if filter_bit >= (1 << 31):
+            raise RuntimeError("No collision-filter bit remains for robot/table")
+        self.robot_table_collision_filter_bit = filter_bit
+
+        for properties in shape_properties:
+            properties.friction = float(self.cfg.asset.friction)
+            properties.restitution = float(self.cfg.asset.restitution)
+            # Robot and table share this bit, while the cube has filter zero:
+            # robot-table is filtered, robot-cube remains enabled.
+            properties.filter |= filter_bit
+
+        fingertip_names = {
+            "rl_dg_{}_4".format(finger) for finger in range(1, 6)
+        }
+        for body_name, shape_range in zip(body_names, shape_ranges):
+            if body_name not in fingertip_names:
+                continue
+            for shape_index in range(
+                shape_range.start, shape_range.start + shape_range.count
+            ):
+                shape_properties[shape_index].friction = float(
+                    self.cfg.asset.fingertip_friction
+                )
+
+        self.gym.set_asset_rigid_shape_properties(asset, shape_properties)
+
+    def _create_object_assets(self) -> None:
+        cube_options = gymapi.AssetOptions()
+        cube_options.disable_gravity = False
+        cube_options.fix_base_link = False
+        self.cube_asset = self.gym.create_box(
+            self.sim,
+            *[float(v) for v in self.cfg.object.size_m],
+            cube_options,
+        )
+        if self.cube_asset is None:
+            raise RuntimeError("Isaac Gym failed to create the cuboid asset")
+        cube_shapes = self.gym.get_asset_rigid_shape_properties(self.cube_asset)
+        for properties in cube_shapes:
+            properties.filter = 0
+            properties.friction = float(self.cfg.object.friction)
+            properties.restitution = float(self.cfg.object.restitution)
+        self.gym.set_asset_rigid_shape_properties(self.cube_asset, cube_shapes)
+
+        table_options = gymapi.AssetOptions()
+        table_options.disable_gravity = True
+        table_options.fix_base_link = True
+        self.table_asset = self.gym.create_box(
+            self.sim,
+            *[float(v) for v in self.cfg.table.size_m],
+            table_options,
+        )
+        if self.table_asset is None:
+            raise RuntimeError("Isaac Gym failed to create the table asset")
+        table_shapes = self.gym.get_asset_rigid_shape_properties(self.table_asset)
+        for properties in table_shapes:
+            properties.filter = self.robot_table_collision_filter_bit
+            properties.friction = float(self.cfg.table.friction)
+            properties.restitution = float(self.cfg.table.restitution)
+        self.gym.set_asset_rigid_shape_properties(self.table_asset, table_shapes)
+
+    def _cube_pose_ur_base_to_world(self, pose_xyzw: np.ndarray) -> np.ndarray:
+        pose_xyzw = np.asarray(pose_xyzw, dtype=np.float64)
+        if pose_xyzw.shape != (7,) or not np.all(np.isfinite(pose_xyzw)):
+            raise ValueError("Expected one finite cube pose with shape (7,)")
+        world = np.empty(7, dtype=np.float64)
+        world[:3] = np.asarray(self.cfg.init_state.pos, dtype=np.float64) + (
+            pose_xyzw[:3] * np.asarray([-1.0, -1.0, 1.0])
+        )
+        # q_world = q_z(pi) * q_ur, in xyzw order.
+        x, y, z, w = pose_xyzw[3:7]
+        world[3:7] = (-y, x, w, -z)
+        world[3:7] /= np.linalg.norm(world[3:7])
+        return world
+
+    @staticmethod
+    def _pose_array_to_transform(pose_xyzw: np.ndarray) -> gymapi.Transform:
+        transform = gymapi.Transform()
+        transform.p = gymapi.Vec3(*[float(v) for v in pose_xyzw[:3]])
+        transform.r = gymapi.Quat(*[float(v) for v in pose_xyzw[3:7]])
+        return transform
+
+    def _set_cube_body_properties(self, env, actor: int) -> None:
+        properties = self.gym.get_actor_rigid_body_properties(env, actor)
+        properties[0].mass = float(self.cfg.object.mass_kg)
+        inertia = [float(v) for v in self.cfg.object.inertia_kg_m2]
+        properties[0].inertia.x = gymapi.Vec3(inertia[0], 0.0, 0.0)
+        properties[0].inertia.y = gymapi.Vec3(0.0, inertia[1], 0.0)
+        properties[0].inertia.z = gymapi.Vec3(0.0, 0.0, inertia[2])
+        self.gym.set_actor_rigid_body_properties(env, actor, properties, False)
+
     def _create_envs(self) -> None:
         spacing = float(self.cfg.env.env_spacing)
         lower = gymapi.Vec3(-spacing, -spacing, 0.0)
@@ -285,6 +394,18 @@ class MotionImitationEnv:
         pose = gymapi.Transform()
         pose.p = gymapi.Vec3(*[float(v) for v in self.cfg.init_state.pos])
         pose.r = gymapi.Quat(*[float(v) for v in self.cfg.init_state.rot])
+        cube_pose_array = self._cube_pose_ur_base_to_world(
+            self.reference.cube_pose[0].detach().cpu().numpy()
+        )
+        cube_pose = self._pose_array_to_transform(cube_pose_array)
+        table_pose = gymapi.Transform()
+        table_pose.p = gymapi.Vec3(
+            0.0,
+            0.0,
+            float(self.cfg.init_state.pos[2])
+            - float(self.cfg.table.surface_below_robot_base_m)
+            - float(self.cfg.table.size_m[2]) / 2.0,
+        )
 
         ghost_pose = None
         if self.reference_ghost_enabled:
@@ -294,23 +415,36 @@ class MotionImitationEnv:
                 pose.p.x + offset[0], pose.p.y + offset[1], pose.p.z + offset[2]
             )
             ghost_pose.r = pose.r
-            body_count *= 2
-            shape_count *= 2
 
         self.envs = []
         self.robot_handles = []
         self.ghost_handles = []
+        self.cube_handles = []
+        self.table_handles = []
         actor_indices = []
         ghost_actor_indices = []
+        cube_actor_indices = []
+        table_actor_indices = []
         for env_index in range(self.num_envs):
             env = self.gym.create_env(self.sim, lower, upper, per_row)
             if env is None:
                 raise RuntimeError("Failed to create environment {}".format(env_index))
+            # Keep only articulated robots in the aggregate. Putting the cube
+            # in an aggregate with self-collision disabled would also suppress
+            # the robot-cube contacts that this environment needs.
+            aggregate_body_count = body_count
+            aggregate_shape_count = shape_count
+            if self.reference_ghost_enabled:
+                aggregate_body_count *= 2
+                aggregate_shape_count *= 2
             # The aggregate's last flag is what actually governs self-collision.
             # create_actor's own filter argument below never reaches the shapes:
             # they keep the filter bits the asset gave them.
             self.gym.begin_aggregate(
-                env, body_count, shape_count, self.self_collision_enabled
+                env,
+                aggregate_body_count,
+                aggregate_shape_count,
+                self.self_collision_enabled,
             )
             actor = self.gym.create_actor(
                 env,
@@ -348,10 +482,58 @@ class MotionImitationEnv:
                     self.gym.get_actor_index(env, ghost, gymapi.DOMAIN_SIM)
                 )
             self.gym.end_aggregate(env)
+
+            cube = self.gym.create_actor(
+                env,
+                self.cube_asset,
+                cube_pose,
+                "cube",
+                env_index,
+                -1,
+                0,
+            )
+            if cube < 0:
+                raise RuntimeError("Failed to create cuboid actor {}".format(env_index))
+            self._set_cube_body_properties(env, cube)
+            self.gym.set_rigid_body_color(
+                env,
+                cube,
+                0,
+                gymapi.MESH_VISUAL,
+                gymapi.Vec3(*[float(v) for v in self.cfg.object.color]),
+            )
+
+            table = self.gym.create_actor(
+                env,
+                self.table_asset,
+                table_pose,
+                "table",
+                env_index,
+                -1,
+                0,
+            )
+            if table < 0:
+                raise RuntimeError("Failed to create table actor {}".format(env_index))
+            self.gym.set_rigid_body_color(
+                env,
+                table,
+                0,
+                gymapi.MESH_VISUAL,
+                gymapi.Vec3(*[float(v) for v in self.cfg.table.color]),
+            )
+
             self.envs.append(env)
             self.robot_handles.append(actor)
+            self.cube_handles.append(cube)
+            self.table_handles.append(table)
             actor_indices.append(
                 self.gym.get_actor_index(env, actor, gymapi.DOMAIN_SIM)
+            )
+            cube_actor_indices.append(
+                self.gym.get_actor_index(env, cube, gymapi.DOMAIN_SIM)
+            )
+            table_actor_indices.append(
+                self.gym.get_actor_index(env, table, gymapi.DOMAIN_SIM)
             )
 
         self.actor_indices = torch.as_tensor(
@@ -359,6 +541,12 @@ class MotionImitationEnv:
         )
         self.ghost_actor_indices = torch.as_tensor(
             ghost_actor_indices, dtype=torch.int32, device=self.device
+        )
+        self.cube_actor_indices = torch.as_tensor(
+            cube_actor_indices, dtype=torch.int32, device=self.device
+        )
+        self.table_actor_indices = torch.as_tensor(
+            table_actor_indices, dtype=torch.int32, device=self.device
         )
 
     def _paint_ghost(self, env, ghost) -> None:
@@ -441,7 +629,16 @@ class MotionImitationEnv:
         self.all_env_ids = torch.arange(
             self.num_envs, device=self.device, dtype=torch.long
         )
+        root_state_raw = self.gym.acquire_actor_root_state_tensor(self.sim)
+        self.root_state_all = gymtorch.wrap_tensor(root_state_raw).view(-1, 13)
+        self.world_axis_sign = torch.tensor(
+            [-1.0, -1.0, 1.0], dtype=torch.float32, device=self.device
+        )
+        self.robot_base_position = torch.tensor(
+            self.cfg.init_state.pos, dtype=torch.float32, device=self.device
+        )
         self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
 
     def _allocate_buffers(self) -> None:
         self.obs_buf = torch.zeros(
@@ -504,6 +701,26 @@ class MotionImitationEnv:
         return self.position_targets_asset[:, self.demo_to_asset_tensor]
 
     @property
+    def cube_root_state(self) -> torch.Tensor:
+        return self.root_state_all[self.cube_actor_indices.long()]
+
+    @property
+    def cube_position(self) -> torch.Tensor:
+        return self.cube_root_state[:, 0:3]
+
+    @property
+    def cube_orientation(self) -> torch.Tensor:
+        return self.cube_root_state[:, 3:7]
+
+    @property
+    def cube_linear_velocity(self) -> torch.Tensor:
+        return self.cube_root_state[:, 7:10]
+
+    @property
+    def cube_angular_velocity(self) -> torch.Tensor:
+        return self.cube_root_state[:, 10:13]
+
+    @property
     def arm_q(self) -> torch.Tensor:
         return self.q[:, : len(ARM_JOINT_NAMES)]
 
@@ -531,6 +748,47 @@ class MotionImitationEnv:
         self, destination: torch.Tensor, values: torch.Tensor
     ) -> None:
         destination[:, self.demo_to_asset_tensor] = values
+
+    def _cube_reference_root_states(self, sample) -> torch.Tensor:
+        """Convert recorded UR-base object state to Isaac Gym world state."""
+        position = (
+            self.robot_base_position
+            + sample.cube_pose[:, :3] * self.world_axis_sign
+        )
+        quaternion_ur = sample.cube_pose[:, 3:7]
+        x, y, z, w = quaternion_ur.unbind(dim=1)
+        quaternion_world = torch.stack((-y, x, w, -z), dim=1)
+        quaternion_world = torch.nn.functional.normalize(
+            quaternion_world, dim=1
+        )
+        return torch.cat(
+            (
+                position,
+                quaternion_world,
+                sample.cube_linear_velocity * self.world_axis_sign,
+                sample.cube_angular_velocity * self.world_axis_sign,
+            ),
+            dim=1,
+        )
+
+    def _reset_cube_from_reference(self, env_ids: torch.Tensor, sample) -> None:
+        """Reset selected physical cubes to their matching RSI object states.
+
+        Pose, linear velocity, and angular velocity come from the exact same
+        reference samples used to reset the corresponding robot DOF states.
+        The indexed root-state upload leaves all non-reset environments and
+        every fixed table untouched.
+        """
+        cube_actor_ids = self.cube_actor_indices[env_ids].contiguous()
+        self.root_state_all[cube_actor_ids.long()] = (
+            self._cube_reference_root_states(sample)
+        )
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_state_all),
+            gymtorch.unwrap_tensor(cube_actor_ids),
+            cube_actor_ids.numel(),
+        )
 
     def scale_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """Apply AnimRL's unbounded residual-action target mapping."""
@@ -639,6 +897,7 @@ class MotionImitationEnv:
         if self.reference_ghost_enabled:
             actor_ids = torch.cat((actor_ids, self.ghost_actor_indices[env_ids]))
         self._upload_dof_state(actor_ids)
+        self._reset_cube_from_reference(env_ids, sample)
         self.gym.set_dof_position_target_tensor(
             self.sim, gymtorch.unwrap_tensor(self.position_targets_all)
         )
@@ -684,6 +943,7 @@ class MotionImitationEnv:
             )
         self.reset_idx(env_ids, indices)
         self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
         self.compute_observations()
         return self.obs_buf
 
@@ -924,6 +1184,7 @@ class MotionImitationEnv:
             self.gym.simulate(self.sim)
         self.gym.fetch_results(self.sim, True)
         self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
         self.render(sync_frame_time=True)
 
         # Post-Physics Step: update the reference index, compute rewards and termination, and reset completed environments.

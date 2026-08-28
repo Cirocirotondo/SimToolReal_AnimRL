@@ -11,6 +11,9 @@ import torch
 class ReferenceSample(NamedTuple):
     q: torch.Tensor
     dq: torch.Tensor
+    cube_pose: torch.Tensor
+    cube_linear_velocity: torch.Tensor
+    cube_angular_velocity: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,9 @@ class JointDemonstration60Hz:
     monotonic_timestamp: torch.Tensor
     q: torch.Tensor
     dq: torch.Tensor
+    cube_pose: torch.Tensor
+    cube_linear_velocity: torch.Tensor
+    cube_angular_velocity: torch.Tensor
     frequency_hz: float
 
     @classmethod
@@ -40,6 +46,10 @@ class JointDemonstration60Hz:
             "arm_dq",
             "hand_q_measured",
             "hand_dq_measured",
+            "cube_pose",
+            "cube_pose_valid",
+            "cube_linear_velocity",
+            "cube_angular_velocity",
         }
         with np.load(str(resolved)) as archive:
             missing = sorted(required - set(archive.files))
@@ -53,6 +63,14 @@ class JointDemonstration60Hz:
         arm_dq = arrays["arm_dq"].astype(np.float32, copy=False)
         hand_q = arrays["hand_q_measured"].astype(np.float32, copy=False)
         hand_dq = arrays["hand_dq_measured"].astype(np.float32, copy=False)
+        cube_pose = arrays["cube_pose"].astype(np.float32, copy=True)
+        cube_pose_valid = arrays["cube_pose_valid"].astype(bool, copy=False)
+        cube_linear_velocity = arrays["cube_linear_velocity"].astype(
+            np.float32, copy=False
+        )
+        cube_angular_velocity = arrays["cube_angular_velocity"].astype(
+            np.float32, copy=False
+        )
 
         sample_count = len(timestamp)
         expected_shapes = {
@@ -61,6 +79,10 @@ class JointDemonstration60Hz:
             "arm_dq": (sample_count, 6),
             "hand_q_measured": (sample_count, 20),
             "hand_dq_measured": (sample_count, 20),
+            "cube_pose": (sample_count, 7),
+            "cube_pose_valid": (sample_count,),
+            "cube_linear_velocity": (sample_count, 3),
+            "cube_angular_velocity": (sample_count, 3),
         }
         for name, shape in expected_shapes.items():
             if arrays[name].shape != shape:
@@ -74,6 +96,12 @@ class JointDemonstration60Hz:
         for name, values in arrays.items():
             if not np.all(np.isfinite(values)):
                 raise ValueError("{} contains NaN or infinite values".format(name))
+        if not np.all(cube_pose_valid):
+            raise ValueError("cube_pose contains samples marked invalid")
+        quaternion_norms = np.linalg.norm(cube_pose[:, 3:7], axis=1)
+        if np.any(quaternion_norms <= 1e-8):
+            raise ValueError("cube_pose contains a zero quaternion")
+        cube_pose[:, 3:7] /= quaternion_norms[:, None]
 
         relative_time = monotonic - monotonic[0]
         intervals = np.diff(relative_time)
@@ -98,6 +126,15 @@ class JointDemonstration60Hz:
             ),
             q=torch.as_tensor(q, dtype=torch.float32, device=torch_device),
             dq=torch.as_tensor(dq, dtype=torch.float32, device=torch_device),
+            cube_pose=torch.as_tensor(
+                cube_pose, dtype=torch.float32, device=torch_device
+            ),
+            cube_linear_velocity=torch.as_tensor(
+                cube_linear_velocity, dtype=torch.float32, device=torch_device
+            ),
+            cube_angular_velocity=torch.as_tensor(
+                cube_angular_velocity, dtype=torch.float32, device=torch_device
+            ),
             frequency_hz=measured_hz,
         )
 
@@ -114,4 +151,10 @@ class JointDemonstration60Hz:
             indices = indices.long()
         if torch.any(indices < 0) or torch.any(indices > self.last_index):
             raise IndexError("Reference index outside demonstration")
-        return ReferenceSample(q=self.q[indices], dq=self.dq[indices])
+        return ReferenceSample(
+            q=self.q[indices],
+            dq=self.dq[indices],
+            cube_pose=self.cube_pose[indices],
+            cube_linear_velocity=self.cube_linear_velocity[indices],
+            cube_angular_velocity=self.cube_angular_velocity[indices],
+        )
