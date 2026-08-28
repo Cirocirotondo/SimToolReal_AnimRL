@@ -118,8 +118,8 @@ class SimToolRealCfg(BaseEnvCfg):
         # Full object-pose imitation. Position is the Euclidean center error in
         # metres; orientation is the sign-invariant quaternion geodesic angle
         # in radians. Cube velocity is deliberately not rewarded.
-        object_position_weight = 0.8
-        object_orientation_weight = 0.2
+        object_position_weight = 0.0
+        object_orientation_weight = 0.0
         object_position_std_m = 0.05
         object_orientation_std_rad = 0.5
 
@@ -136,4 +136,4 @@ class SimToolRealTrainCfg(BaseTrainCfg):
     class runner(BaseTrainCfg.runner):
         experiment_name = "simtoolreal"
         run_name = "handmult_0.6"
-        max_iterations = 3000
+        max_iterations = 6000
