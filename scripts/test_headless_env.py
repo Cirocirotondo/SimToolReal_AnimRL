@@ -195,29 +195,55 @@ def assert_observation_contract(env):
     import torch
 
     obs = env.get_observations()
-    if obs.shape != (env.num_envs, 79):
-        raise AssertionError("Expected 79D observations, got {}".format(obs.shape))
+    if obs.shape != (env.num_envs, 114):
+        raise AssertionError("Expected 114D observations, got {}".format(obs.shape))
 
     expected_phase = (
         env.reference_index.float() / float(env.reference.last_index)
     ).unsqueeze(1)
+    task_space = env._task_space_observation_components()
     expected = torch.cat(
         (
             env.normalize_positions(env.q),
             env.previous_targets,
             env.dq,
             expected_phase,
+            *task_space,
         ),
         dim=1,
     )
     if not bool(torch.allclose(obs, expected, rtol=0.0, atol=1e-6)):
-        raise AssertionError("The 79D observation blocks are inconsistent")
+        raise AssertionError("The 114D observation blocks are inconsistent")
 
     if not bool(((obs[:, :6] >= -1.0) & (obs[:, :6] <= 1.0)).all()):
         raise AssertionError("Normalized arm positions escaped [-1, 1]")
 
+    block_widths = (3, 4, 3, 4, 15, 3, 3)
+    if tuple(component.shape[1] for component in task_space) != block_widths:
+        raise AssertionError("Task-space observation block widths are incorrect")
+    palm_quaternion = obs[:, 82:86]
+    cube_quaternion = obs[:, 89:93]
+    for name, quaternion in (
+        ("palm", palm_quaternion),
+        ("cube relative to palm", cube_quaternion),
+    ):
+        if not bool(
+            torch.allclose(
+                torch.linalg.vector_norm(quaternion, dim=1),
+                torch.ones(env.num_envs, device=env.device),
+                rtol=0.0,
+                atol=1e-5,
+            )
+        ):
+            raise AssertionError("{} quaternion is not normalized".format(name))
+        if not bool((quaternion[:, 3] >= 0.0).all()):
+            raise AssertionError("{} quaternion sign is not canonical".format(name))
 
-def assert_arm_only_objective_contract(env):
+    if not bool(torch.isfinite(obs).all()):
+        raise AssertionError("The 114D observation contains NaN or infinity")
+
+
+def assert_reward_contract(env):
     import torch
 
     metrics = env._compute_reward_and_errors()
@@ -229,6 +255,19 @@ def assert_arm_only_objective_contract(env):
         raise AssertionError("Hand diagnostics have an unexpected shape")
     if metrics["action_rate_reward"].shape != (env.num_envs,):
         raise AssertionError("Action-rate regularization has an unexpected shape")
+    if metrics["object_position_error_m"].shape != (env.num_envs,):
+        raise AssertionError("Object position error has an unexpected shape")
+    if metrics["object_orientation_error_rad"].shape != (env.num_envs,):
+        raise AssertionError("Object orientation error has an unexpected shape")
+    if not bool(
+        (
+            (metrics["object_position_reward"] >= 0.0)
+            & (metrics["object_position_reward"] <= 1.0)
+            & (metrics["object_orientation_reward"] >= 0.0)
+            & (metrics["object_orientation_reward"] <= 1.0)
+        ).all()
+    ):
+        raise AssertionError("Object Gaussian rewards escaped [0, 1]")
     r = env.cfg.rewards
     expected_reward = (
         float(r.position_arm_weight) * metrics["position_reward"]
@@ -237,6 +276,9 @@ def assert_arm_only_objective_contract(env):
         + float(r.position_hand_weight) * metrics["hand_position_reward"]
         + float(r.velocity_hand_weight) * metrics["hand_velocity_reward"]
         + float(r.action_rate_hand_weight) * metrics["hand_action_rate_reward"]
+        + float(r.object_position_weight) * metrics["object_position_reward"]
+        + float(r.object_orientation_weight)
+        * metrics["object_orientation_reward"]
     )
     if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-7)):
         raise AssertionError("Reward does not match the configured weights")
@@ -353,6 +395,8 @@ def run_ideal_episode(env, initial_indices):
             + float(r.position_hand_weight)
             + float(r.velocity_hand_weight)
             + float(r.action_rate_hand_weight)
+            + float(r.object_position_weight)
+            + float(r.object_orientation_weight)
         )
         if bool((rewards < -1e-7).any()) or bool(
             (rewards > reward_upper_bound + 1e-6).any()
@@ -610,7 +654,7 @@ def main():
         env.gym.refresh_dof_state_tensor(env.sim)
         env.gym.refresh_actor_root_state_tensor(env.sim)
         assert_observation_contract(env)
-        assert_arm_only_objective_contract(env)
+        assert_reward_contract(env)
         assert_correct_pd_gains(env)
         metrics = run_ideal_episode(env, initial_indices)
         assert_observation_contract(env)
@@ -657,9 +701,9 @@ def main():
         print("  cube/table physics        : verified")
         print("  collision filtering       : verified")
         print("  vectorized object RSI      : verified")
-        print("  79D observation contract  : verified")
+        print("  114D observation contract : verified")
         print("  policy-driven hand        : verified")
-        print("  arm+hand reward contract  : verified")
+        print("  robot+object reward       : verified")
         print("  PPO step/info contract     : verified")
         print("  horizon/reference timeout : verified")
         print("  early termination/no boot.: verified")

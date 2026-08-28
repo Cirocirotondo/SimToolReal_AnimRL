@@ -60,7 +60,7 @@ def main():
         if ppo.storage.observations.shape != (
             train_cfg.runner.num_steps_per_env,
             env.num_envs,
-            79,
+            114,
         ):
             raise AssertionError("Unexpected rollout observation shape")
         if ppo.storage.actions.shape[-1] != 26:
@@ -83,6 +83,10 @@ def main():
             "mean_hand_velocity_reward",
             "mean_hand_action_rate_reward",
             "mean_rms_hand_position_error",
+            "mean_object_position_reward",
+            "mean_object_orientation_reward",
+            "mean_object_position_error_m",
+            "mean_object_orientation_error_rad",
             "max_abs_position_error",
             "action_target_clipped_fraction",
             "mean_abs_action",

@@ -13,7 +13,7 @@ class ConfigAndDemoTest(unittest.TestCase):
         train_cfg = SimToolRealTrainCfg()
         self.assertEqual(env_cfg.env.num_envs, 4096)
         self.assertEqual(env_cfg.env.episode_length, 100)
-        self.assertEqual(env_cfg.env.num_observations, 79)
+        self.assertEqual(env_cfg.env.num_observations, 114)
         self.assertEqual(env_cfg.env.num_actions, 26)
         self.assertEqual(
             env_cfg.control.action_parameterization, "animrl_residual"
@@ -28,6 +28,10 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.object.mass_kg, 0.2)
         self.assertEqual(env_cfg.object.friction, 0.5)
         self.assertEqual(env_cfg.object.restitution, 0.0)
+        self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
+        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.2)
+        self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
+        self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
         self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.03)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)

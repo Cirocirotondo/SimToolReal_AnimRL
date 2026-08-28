@@ -182,8 +182,8 @@ def main():
     # sample, so the tracking threshold must not cut the episode short. The
     # threshold is still reported: see max_abs_position_error below.
     env_cfg.termination.enabled = False
-    if int(env_cfg.env.num_observations) != 79:
-        raise ValueError("This evaluator requires the 79D observation contract")
+    if int(env_cfg.env.num_observations) != 114:
+        raise ValueError("This evaluator requires the 114D observation contract")
     if int(env_cfg.env.num_actions) != 26:
         raise ValueError("This evaluator requires 26 AnimRL residual actions")
 

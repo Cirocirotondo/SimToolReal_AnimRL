@@ -3,9 +3,9 @@
 Minimal UR5e + Tesollo DG5F motion-imitation environment using the training
 structure and Python configuration style of `cmm-25-a3-animrl`.
 
-This repository intentionally does not depend on `rl_games`.  The first
-milestone is a headless reference-action test; PPO will be added only after the
-environment is verified independently.
+This repository intentionally does not depend on `rl_games`. It contains a
+small AnimRL-compatible PPO stack plus an independently testable Isaac Gym
+environment.
 
 ## Headless environment test
 
@@ -23,31 +23,26 @@ and Cartwheel configurations:
 ```
 
 The test loads the local robot asset and 60 Hz demonstration, applies the
-corrected DG5F gains, resets uniformly over the complete motion, executes ideal
-AnimRL residual arm actions while driving the hand directly from the demo,
-and validates tracking, arm-only reward, arm-only early termination, and the
-Cartwheel-style reference-end timeout.
+corrected arm/DG5F gains, resets the robot and physical cuboid uniformly over
+the complete motion, executes ideal AnimRL residual actions, and validates
+tracking, reward, early termination, object physics, collision filtering, and
+the Cartwheel-style reference-end timeout.
 
-The arm-only policy observation has 19 values: 6 normalized arm positions, 6
-previously applied physical arm targets, 6 arm velocities, and the normalized
-reference phase. Its 6 actions use AnimRL's original unbounded residual
-parameterization: `q_target = q_default + clip(0.25 * action, -100, 100)`.
-The fixed `q_default` is the first arm pose of the demonstration. The 20 hand
-targets are read directly from the next demonstration sample inside the
-environment, so the policy neither observes nor controls the hand.
+The policy observation has 114 values. The first 79 are 26 normalized joint
+positions, 26 previously applied physical joint targets, 26 joint velocities,
+and phase. They are followed by palm pose in the robot-base frame (7), cube
+pose relative to the palm (7), cube-center vectors from the five fingertips in
+the palm frame (15), and cube linear/angular velocity relative to the palm (6).
+The 26 actions use AnimRL's unbounded residual parameterization around the
+first pose of the demonstration, with separate arm and hand residual scales.
 
-The Gaussian position/velocity imitation reward and early termination use only
-the six arm joints. Hand tracking errors remain available as diagnostics but do
-not affect reward or termination.
+The Gaussian joint imitation terms cover arm and hand separately. The object
+is tracked at every reference sample with Gaussian center-position and
+orientation rewards; object velocity is observed but is not rewarded. Early
+termination remains based on arm and hand joint drift only.
 
-This replaces the former 79D/26D full-robot policy contract. Checkpoints made
-with that earlier architecture cannot be loaded by the 19D/6D networks and must
-not be resumed for this training family.
-
-Checkpoints trained with the earlier normalized absolute-action version of the
-19D/6D environment are also behaviorally incompatible and must not be resumed:
-the network shape is unchanged, but the meaning and scale of every action have
-changed.
+The 114D network input is checkpoint-incompatible with the earlier 79D policy.
+Those checkpoints must not be resumed for this object-training family.
 
 The environment follows AnimRL's five-value vectorized step contract:
 
@@ -146,7 +141,7 @@ from reference sample zero with one headless environment:
 ```
 
 The evaluator automatically loads `config.json` from the checkpoint directory,
-validates the 19D/6D arm-only environment contract, and writes
+validates the 114D/26D environment contract, and writes
 `eval_model_3000.json`. To display the same rollout in Isaac Gym:
 
 ```bash
