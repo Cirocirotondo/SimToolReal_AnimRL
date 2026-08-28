@@ -85,6 +85,7 @@ class PPO:
         self.total_time_s = 0.0
         self.best_evaluation_score = -math.inf
         self.best_evaluation_iteration = -1
+        self.divergence_streak = 0
         self.env.reset()
 
     def collect_rollout(self):
@@ -501,10 +502,21 @@ class PPO:
                     "fps": iteration_timesteps / max(iteration_time, 1.0e-12),
                 }
             )
+            abort_reason = self._divergence_reason(stats)
+            if abort_reason is not None:
+                stats["divergence_abort"] = 1.0
+
             if evaluation_callback is not None:
                 evaluation_start = time.perf_counter()
+                # An aborting iteration counts as final so the run still gets
+                # its last evaluation and can keep the best checkpoint.
                 evaluation_stats = evaluation_callback(
-                    iteration, self, is_final=iteration == end_iteration - 1
+                    iteration,
+                    self,
+                    is_final=(
+                        iteration == end_iteration - 1
+                        or abort_reason is not None
+                    ),
                 )
                 evaluation_time = time.perf_counter() - evaluation_start
                 if evaluation_stats is not None:
@@ -537,6 +549,25 @@ class PPO:
                     checkpoint_dir / "model_{}.pt".format(iteration),
                     infos=self._checkpoint_infos(stats),
                 )
+
+            # Placed last so the triggering iteration is fully written to the
+            # history, metrics file and tensorboard before the run stops.
+            if abort_reason is not None:
+                if checkpoint_dir is not None:
+                    self.save(
+                        checkpoint_dir / "diverged_model.pt",
+                        infos=self._checkpoint_infos(stats),
+                    )
+                print(
+                    "Aborting training at iteration {}: {}. Best evaluation "
+                    "score {:.4f} at iteration {}.".format(
+                        iteration,
+                        abort_reason,
+                        self.best_evaluation_score,
+                        self.best_evaluation_iteration,
+                    )
+                )
+                return history
 
         if checkpoint_dir is not None:
             final_stats = history[-1]
@@ -609,6 +640,52 @@ class PPO:
                     value,
                     iteration,
                 )
+
+    def _divergence_reason(self, stats):
+        """Name the divergence this iteration shows, or None if it is healthy.
+
+        Checked before the evaluation callback runs so an aborting run can
+        still request its final evaluation and keep the best checkpoint.
+        """
+        if not bool(getattr(self.cfg, "abort_on_divergence", False)):
+            return None
+
+        reasons = []
+        # NaN first: a NaN action std would silently pass every ``>`` test
+        # below, so without this the guard would not fire on the worst case.
+        for name in ("mean_action_std", "value_loss", "surrogate_loss",
+                     "mean_reward"):
+            value = stats.get(name)
+            if value is not None and not math.isfinite(float(value)):
+                reasons.append("{} is not finite ({})".format(name, value))
+
+        threshold = float(self.cfg.abort_action_std)
+        action_std = float(stats["mean_action_std"])
+        if action_std > threshold:
+            reasons.append(
+                "mean_action_std {:.4g} > {:.4g}".format(action_std, threshold)
+            )
+
+        threshold = float(self.cfg.abort_action_target_clipped_fraction)
+        clipped = float(stats["action_target_clipped_fraction"])
+        if clipped > threshold:
+            reasons.append(
+                "action_target_clipped_fraction {:.4g} > {:.4g}".format(
+                    clipped, threshold
+                )
+            )
+
+        if not reasons:
+            self.divergence_streak = 0
+            return None
+
+        self.divergence_streak += 1
+        patience = max(1, int(self.cfg.abort_patience))
+        if self.divergence_streak < patience:
+            return None
+        return "{} (for {} consecutive iterations)".format(
+            "; ".join(reasons), self.divergence_streak
+        )
 
     def _checkpoint_infos(self, stats):
         infos = {
