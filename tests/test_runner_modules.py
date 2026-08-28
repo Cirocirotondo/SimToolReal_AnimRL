@@ -165,6 +165,112 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertEqual(stats["evaluation_score"], 1.0)
         self.assertEqual(len(calls), 2)  # fixed and uniform suites
 
+    def _score_with_object_weights(self, position_weight, orientation_weight):
+        """Run one evaluation step over a stub env and return its statistics."""
+        cfg = SimToolRealCfg()
+        cfg.rewards.object_position_weight = position_weight
+        cfg.rewards.object_orientation_weight = orientation_weight
+
+        num_envs = 4
+        ones = torch.ones(num_envs)
+        infos = {
+            "position_reward": 0.6 * ones,
+            "velocity_reward": ones,
+            "action_rate_reward": ones,
+            "rms_action_rate": torch.zeros(num_envs),
+            "hand_position_reward": 0.4 * ones,
+            "hand_velocity_reward": ones,
+            "hand_action_rate_reward": ones,
+            # Perfect position, worst orientation: the two object terms differ
+            # so a mis-weighted mixture would not go unnoticed.
+            "object_position_reward": ones.clone(),
+            "object_orientation_reward": torch.zeros(num_envs),
+            "object_position_error_m": torch.zeros(num_envs),
+            "object_orientation_error_rad": torch.zeros(num_envs),
+            "rms_hand_position_error": torch.zeros(num_envs),
+            "max_abs_hand_position_error": torch.zeros(num_envs),
+            "rms_position_error": torch.zeros(num_envs),
+            "rms_velocity_error": torch.zeros(num_envs),
+            "max_abs_arm_position_error": torch.zeros(num_envs),
+            "early_termination": torch.zeros(num_envs, dtype=torch.bool),
+            "time_outs": torch.ones(num_envs, dtype=torch.bool),
+        }
+
+        class Gym:
+            def refresh_dof_state_tensor(self, sim):
+                pass
+
+        class Reference:
+            last_index = 1107
+
+        class Env:
+            num_envs = 4
+            num_actions = 2
+            max_episode_length = 1
+            device = torch.device("cpu")
+            reference = Reference()
+            gym = Gym()
+            sim = None
+            action_scales = torch.ones(2)
+            action_target_clip = 100.0
+
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def reset_idx(self, env_ids, indices):
+                pass
+
+            def compute_observations(self):
+                pass
+
+            def get_observations(self):
+                return torch.zeros(self.num_envs, 3)
+
+            def step(self, actions):
+                return (
+                    torch.zeros(self.num_envs, 3),
+                    None,
+                    ones.clone(),
+                    torch.ones(self.num_envs, dtype=torch.bool),
+                    infos,
+                )
+
+        class Policy:
+            def act_inference(self, observations):
+                return torch.zeros(observations.shape[0], 2)
+
+        class Runner(_NullRunner):
+            policy = Policy()
+
+            @staticmethod
+            def actor_obs_normalizer(observations):
+                return observations
+
+        evaluator = DeterministicEvaluator(Env(cfg), 100, 123, [0.0])
+        return evaluator._evaluate_suite(Runner(), evaluator.fixed_indices)
+
+    def test_object_pose_score_uses_configured_weights(self):
+        stats = self._score_with_object_weights(0.8, 0.2)
+        self.assertAlmostEqual(stats["mean_object_pose_score"], 0.8, places=6)
+        # 0.5 * (0.5 * (0.6 + 0.4) + 0.8), with no early terminations.
+        self.assertAlmostEqual(stats["position_score"], 0.65, places=6)
+
+    def test_zero_object_weights_score_on_robot_pose_alone(self):
+        """Disabling the object reward must not put a NaN in the score.
+
+        A NaN would compare False against every best score in PPO, so no best
+        checkpoint would ever be written for the run.
+        """
+        stats = self._score_with_object_weights(0.0, 0.0)
+        self.assertEqual(stats["mean_object_pose_score"], 0.0)
+        # Robot pose alone, on the same 0-1 scale: 0.5 * (0.6 + 0.4).
+        self.assertAlmostEqual(stats["position_score"], 0.5, places=6)
+        for name, value in stats.items():
+            if isinstance(value, float):
+                self.assertFalse(
+                    np.isnan(value), "{} is NaN".format(name)
+                )
+
     def test_evaluation_preserves_torch_and_numpy_rng(self):
         torch.manual_seed(17)
         np.random.seed(17)
