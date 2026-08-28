@@ -8,9 +8,11 @@ class SimToolRealCfg(BaseEnvCfg):
         num_envs = 4096
         episode_length = 100
         num_actions = 26
-        # 26 normalized q + 26 previous physical targets + 26 dq + 1 normalized
-        # reference phase, over the 6 arm and 20 hand joints alike.
-        num_observations = 79
+        # Existing 79D proprioception, followed by: palm pose in the robot-base
+        # frame (3+4), cube pose relative to palm (3+4), cube center relative
+        # to five fingertips in the palm frame (15), and cube linear/angular
+        # velocity relative to the palm (3+3).
+        num_observations = 114
         num_privileged_obs = None
         reference_state_initialization = True
         reference_init_distribution = "uniform"
@@ -96,7 +98,8 @@ class SimToolRealCfg(BaseEnvCfg):
     class rewards:
         # Arm and hand keep separate Gaussian terms so neither dilutes the
         # other's gradient. The hand weights are 0.6x the arm's, which is what
-        # the handmult_0.6 run is named after: maximum per-step reward 1.92.
+        # the handmult_0.6 run is named after. Robot terms sum to 1.92 and the
+        # object pose terms add 1.0, for a maximum per-step reward of 2.92.
         position_arm_weight = 0.8
         velocity_arm_weight = 0.2
         action_rate_arm_weight = 0.2
@@ -111,6 +114,14 @@ class SimToolRealCfg(BaseEnvCfg):
         position_hand_std_rad = 0.223607
         velocity_hand_std_rad_per_s = 1.0
         action_rate_hand_std = 5
+
+        # Full object-pose imitation. Position is the Euclidean center error in
+        # metres; orientation is the sign-invariant quaternion geodesic angle
+        # in radians. Cube velocity is deliberately not rewarded.
+        object_position_weight = 0.8
+        object_orientation_weight = 0.2
+        object_position_std_m = 0.05
+        object_orientation_std_rad = 0.5
 
     class termination:
         enabled = True

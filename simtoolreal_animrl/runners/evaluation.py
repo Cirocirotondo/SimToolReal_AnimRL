@@ -107,6 +107,10 @@ class DeterministicEvaluator:
         hand_position_reward_sum = torch.zeros_like(episode_steps)
         hand_velocity_reward_sum = torch.zeros_like(episode_steps)
         hand_action_rate_reward_sum = torch.zeros_like(episode_steps)
+        object_position_reward_sum = torch.zeros_like(episode_steps)
+        object_orientation_reward_sum = torch.zeros_like(episode_steps)
+        object_position_error_sum = torch.zeros_like(episode_steps)
+        object_orientation_error_sum = torch.zeros_like(episode_steps)
         rms_hand_position_error_sum = torch.zeros_like(episode_steps)
         max_hand_position_error = torch.zeros_like(episode_steps)
         rms_position_error_sum = torch.zeros_like(episode_steps)
@@ -159,6 +163,18 @@ class DeterministicEvaluator:
                 hand_action_rate_reward_sum += (
                     infos["hand_action_rate_reward"] * active_float
                 )
+                object_position_reward_sum += (
+                    infos["object_position_reward"] * active_float
+                )
+                object_orientation_reward_sum += (
+                    infos["object_orientation_reward"] * active_float
+                )
+                object_position_error_sum += (
+                    infos["object_position_error_m"] * active_float
+                )
+                object_orientation_error_sum += (
+                    infos["object_orientation_error_rad"] * active_float
+                )
                 rms_hand_position_error_sum += (
                     infos["rms_hand_position_error"] * active_float
                 )
@@ -190,6 +206,20 @@ class DeterministicEvaluator:
         lengths = episode_steps.clamp_min(1.0)
         per_env_position_reward = position_reward_sum / lengths
         per_env_hand_position_reward = hand_position_reward_sum / lengths
+        per_env_object_position_reward = object_position_reward_sum / lengths
+        per_env_object_orientation_reward = (
+            object_orientation_reward_sum / lengths
+        )
+        object_weight_sum = float(
+            self.env.cfg.rewards.object_position_weight
+            + self.env.cfg.rewards.object_orientation_weight
+        )
+        per_env_object_pose_score = (
+            float(self.env.cfg.rewards.object_position_weight)
+            * per_env_object_position_reward
+            + float(self.env.cfg.rewards.object_orientation_weight)
+            * per_env_object_orientation_reward
+        ) / object_weight_sum
         return {
             "mean_reward": float((reward_sum / lengths).mean()),
             "mean_position_reward": float(per_env_position_reward.mean()),
@@ -217,6 +247,19 @@ class DeterministicEvaluator:
             "mean_hand_action_rate_reward": float(
                 (hand_action_rate_reward_sum / lengths).mean()
             ),
+            "mean_object_position_reward": float(
+                per_env_object_position_reward.mean()
+            ),
+            "mean_object_orientation_reward": float(
+                per_env_object_orientation_reward.mean()
+            ),
+            "mean_object_position_error_m": float(
+                (object_position_error_sum / lengths).mean()
+            ),
+            "mean_object_orientation_error_rad": float(
+                (object_orientation_error_sum / lengths).mean()
+            ),
+            "mean_object_pose_score": float(per_env_object_pose_score.mean()),
             "mean_rms_hand_position_error": float(
                 (rms_hand_position_error_sum / lengths).mean()
             ),
@@ -229,19 +272,19 @@ class DeterministicEvaluator:
             / float(max(action_components, 1)),
             "mean_abs_action": abs_action_sum / float(max(action_components, 1)),
             "max_abs_action": max_abs_action,
-            # Position remains the ranking signal, now averaged over the arm
-            # and the hand so a checkpoint cannot be selected on arm accuracy
-            # while the hand it also controls degrades. The two enter with
-            # equal weight, which in practice lets the arm drive the ranking
-            # and the hand act as a veto when it gets worse. Subtracting the
-            # failure fraction prevents short failed rollouts from looking
-            # artificially good while retaining resolution when every early
-            # policy fails.
+            # Best-checkpoint selection gives equal importance to robot pose
+            # (arm/hand position) and object pose (its configured 80/20
+            # position/orientation mixture). Subtracting failure fraction
+            # prevents short failed rollouts from looking artificially good.
             "position_score": float(
                 0.5
                 * (
-                    per_env_position_reward.mean()
-                    + per_env_hand_position_reward.mean()
+                    0.5
+                    * (
+                        per_env_position_reward.mean()
+                        + per_env_hand_position_reward.mean()
+                    )
+                    + per_env_object_pose_score.mean()
                 )
                 - early.float().mean()
             ),

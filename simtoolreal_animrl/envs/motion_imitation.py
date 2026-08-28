@@ -24,6 +24,65 @@ from simtoolreal_animrl.envs.controller import (
 from simtoolreal_animrl.envs.demonstration import JointDemonstration60Hz
 
 
+# The fixed wrist -> mount -> base -> palm chain is collapsed while loading the
+# robot asset.  These constants reconstruct the exact rl_dg_palm URDF frame
+# from the surviving wrist_3_link rigid body (xyzw quaternion convention).
+PALM_PARENT_BODY_NAME = "wrist_3_link"
+PALM_POSITION_IN_WRIST = (0.0, 0.0, 0.0738)
+# Fixed 60-degree rotation of the hand/palm frame relative to wrist_3_link,
+# introduced by the ur5e_dg5f_mount joint. In xyzw form this is
+# (0, 0, sin(60 deg / 2), cos(60 deg / 2)).
+PALM_ORIENTATION_IN_WRIST = (0.0, 0.0, 0.5, 0.8660254037844386)
+FINGERTIP_BODY_NAMES = tuple(
+    "rl_dg_{}_4".format(finger) for finger in range(1, 6)
+)
+FINGERTIP_OFFSETS = (
+    # Exact origins of the fixed rj_dg_<finger>_tip joints in the respective
+    # rl_dg_<finger>_4 frames. The tip bodies themselves are collapsed.
+    (0.0, 0.0363, 0.0),
+    (0.0, 0.0, 0.0255),
+    (0.0, 0.0, 0.0255),
+    (0.0, 0.0, 0.0255),
+    (0.0, 0.0, 0.0363),
+)
+
+
+def _quat_conjugate(quaternion: torch.Tensor) -> torch.Tensor:
+    return torch.cat((-quaternion[..., :3], quaternion[..., 3:4]), dim=-1)
+
+
+def _quat_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Hamilton product for xyzw quaternions."""
+    left_xyz, left_w = left[..., :3], left[..., 3:4]
+    right_xyz, right_w = right[..., :3], right[..., 3:4]
+    xyz = (
+        left_w * right_xyz
+        + right_w * left_xyz
+        + torch.cross(left_xyz, right_xyz, dim=-1)
+    )
+    w = left_w * right_w - (left_xyz * right_xyz).sum(dim=-1, keepdim=True)
+    return torch.cat((xyz, w), dim=-1)
+
+
+def _quat_rotate(quaternion: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    """Rotate a vector by a unit xyzw quaternion without constructing matrices."""
+    quaternion_xyz = quaternion[..., :3]
+    uv = torch.cross(quaternion_xyz, vector, dim=-1)
+    uuv = torch.cross(quaternion_xyz, uv, dim=-1)
+    return vector + 2.0 * (quaternion[..., 3:4] * uv + uuv)
+
+
+def _quat_rotate_inverse(
+    quaternion: torch.Tensor, vector: torch.Tensor
+) -> torch.Tensor:
+    return _quat_rotate(_quat_conjugate(quaternion), vector)
+
+
+def _normalize_canonical_quaternion(quaternion: torch.Tensor) -> torch.Tensor:
+    quaternion = torch.nn.functional.normalize(quaternion, dim=-1)
+    return torch.where(quaternion[..., 3:4] < 0.0, -quaternion, quaternion)
+
+
 class MotionImitationEnv:
     """AnimRL-compatible environment API without an RL algorithm dependency."""
 
@@ -128,6 +187,7 @@ class MotionImitationEnv:
         self.robot_asset = self._load_robot_asset()
         self._create_object_assets()
         self._create_envs()
+        self._resolve_observation_body_indices()
         self.gym.prepare_sim(self.sim)
         self.viewer = None
         if not self.headless:
@@ -549,6 +609,26 @@ class MotionImitationEnv:
             table_actor_indices, dtype=torch.int32, device=self.device
         )
 
+    def _resolve_observation_body_indices(self) -> None:
+        """Resolve the surviving rigid bodies used by the 114D observation."""
+        env = self.envs[0]
+        actor = self.robot_handles[0]
+
+        def body_index(name: str) -> int:
+            index = self.gym.find_actor_rigid_body_index(
+                env, actor, name, gymapi.DOMAIN_ENV
+            )
+            if index < 0:
+                raise ValueError("Robot rigid body {!r} was not found".format(name))
+            return int(index)
+
+        self.wrist_body_index = body_index(PALM_PARENT_BODY_NAME)
+        self.fingertip_body_indices = torch.as_tensor(
+            [body_index(name) for name in FINGERTIP_BODY_NAMES],
+            dtype=torch.long,
+            device=self.device,
+        )
+
     def _paint_ghost(self, env, ghost) -> None:
         color = gymapi.Vec3(
             *[float(v) for v in self.cfg.viewer.reference_ghost_color]
@@ -631,6 +711,20 @@ class MotionImitationEnv:
         )
         root_state_raw = self.gym.acquire_actor_root_state_tensor(self.sim)
         self.root_state_all = gymtorch.wrap_tensor(root_state_raw).view(-1, 13)
+        rigid_body_state_raw = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        rigid_bodies_per_env = self.gym.get_env_rigid_body_count(self.envs[0])
+        self.rigid_body_state = gymtorch.wrap_tensor(rigid_body_state_raw).view(
+            self.num_envs, rigid_bodies_per_env, 13
+        )
+        self.palm_position_in_wrist = torch.tensor(
+            PALM_POSITION_IN_WRIST, dtype=torch.float32, device=self.device
+        ).expand(self.num_envs, -1)
+        self.palm_orientation_in_wrist = torch.tensor(
+            PALM_ORIENTATION_IN_WRIST, dtype=torch.float32, device=self.device
+        ).expand(self.num_envs, -1)
+        self.fingertip_offsets = torch.tensor(
+            FINGERTIP_OFFSETS, dtype=torch.float32, device=self.device
+        ).unsqueeze(0).expand(self.num_envs, -1, -1)
         self.world_axis_sign = torch.tensor(
             [-1.0, -1.0, 1.0], dtype=torch.float32, device=self.device
         )
@@ -639,6 +733,7 @@ class MotionImitationEnv:
         )
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
 
     def _allocate_buffers(self) -> None:
         self.obs_buf = torch.zeros(
@@ -677,12 +772,16 @@ class MotionImitationEnv:
                 "hand_position_reward",
                 "hand_velocity_reward",
                 "hand_action_rate_reward",
+                "object_position_reward",
+                "object_orientation_reward",
                 "rms_position_error",
                 "rms_velocity_error",
                 "rms_action_rate",
                 "rms_hand_position_error",
                 "rms_hand_velocity_error",
                 "rms_hand_action_rate",
+                "object_position_error_m",
+                "object_orientation_error_rad",
             )
         }
         self.extras = {}
@@ -719,6 +818,97 @@ class MotionImitationEnv:
     @property
     def cube_angular_velocity(self) -> torch.Tensor:
         return self.cube_root_state[:, 10:13]
+
+    @property
+    def robot_root_state(self) -> torch.Tensor:
+        return self.root_state_all[self.actor_indices.long()]
+
+    def _task_space_observation_components(self) -> Tuple[torch.Tensor, ...]:
+        """Return the seven object/task-space blocks appended to the old 79D.
+
+        All cube-relative vectors are expressed in the palm frame.  Palm pose
+        is expressed in the robot actor-base frame.  Relative linear velocity
+        includes the rotating-frame transport term, so it is the derivative of
+        the palm-frame cube displacement rather than only a velocity difference.
+        """
+        wrist = self.rigid_body_state[:, self.wrist_body_index]
+        wrist_position = wrist[:, 0:3]
+        wrist_orientation = _normalize_canonical_quaternion(wrist[:, 3:7])
+        wrist_linear_velocity = wrist[:, 7:10]
+        wrist_angular_velocity = wrist[:, 10:13]
+
+        palm_offset_world = _quat_rotate(
+            wrist_orientation, self.palm_position_in_wrist
+        )
+        palm_position_world = wrist_position + palm_offset_world
+        palm_orientation_world = _normalize_canonical_quaternion(
+            _quat_multiply(
+                wrist_orientation, self.palm_orientation_in_wrist
+            )
+        )
+        palm_linear_velocity_world = wrist_linear_velocity + torch.cross(
+            wrist_angular_velocity, palm_offset_world, dim=-1
+        )
+        palm_angular_velocity_world = wrist_angular_velocity
+
+        robot_root = self.robot_root_state
+        robot_position_world = robot_root[:, 0:3]
+        robot_orientation_world = _normalize_canonical_quaternion(
+            robot_root[:, 3:7]
+        )
+        palm_position_robot = _quat_rotate_inverse(
+            robot_orientation_world, palm_position_world - robot_position_world
+        )
+        palm_orientation_robot = _normalize_canonical_quaternion(
+            _quat_multiply(
+                _quat_conjugate(robot_orientation_world), palm_orientation_world
+            )
+        )
+
+        cube_displacement_world = self.cube_position - palm_position_world
+        cube_center_palm = _quat_rotate_inverse(
+            palm_orientation_world, cube_displacement_world
+        )
+        cube_orientation_palm = _normalize_canonical_quaternion(
+            _quat_multiply(
+                _quat_conjugate(palm_orientation_world),
+                _normalize_canonical_quaternion(self.cube_orientation),
+            )
+        )
+
+        fingertip_states = self.rigid_body_state[:, self.fingertip_body_indices]
+        fingertip_orientations = _normalize_canonical_quaternion(
+            fingertip_states[..., 3:7]
+        )
+        fingertip_positions_world = fingertip_states[..., 0:3] + _quat_rotate(
+            fingertip_orientations, self.fingertip_offsets
+        )
+        cube_center_fingertips_palm = _quat_rotate_inverse(
+            palm_orientation_world.unsqueeze(1).expand(-1, 5, -1),
+            self.cube_position.unsqueeze(1) - fingertip_positions_world,
+        ).reshape(self.num_envs, 15)
+
+        cube_linear_velocity_palm = _quat_rotate_inverse(
+            palm_orientation_world,
+            self.cube_linear_velocity
+            - palm_linear_velocity_world
+            - torch.cross(
+                palm_angular_velocity_world, cube_displacement_world, dim=-1
+            ),
+        )
+        cube_angular_velocity_palm = _quat_rotate_inverse(
+            palm_orientation_world,
+            self.cube_angular_velocity - palm_angular_velocity_world,
+        )
+        return (
+            palm_position_robot,
+            palm_orientation_robot,
+            cube_center_palm,
+            cube_orientation_palm,
+            cube_center_fingertips_palm,
+            cube_linear_velocity_palm,
+            cube_angular_velocity_palm,
+        )
 
     @property
     def arm_q(self) -> torch.Tensor:
@@ -901,6 +1091,11 @@ class MotionImitationEnv:
         self.gym.set_dof_position_target_tensor(
             self.sim, gymtorch.unwrap_tensor(self.position_targets_all)
         )
+        # The new observation contains link-space kinematics. Refresh here,
+        # rather than relying on a caller to do it, so an auto-reset and the
+        # evaluator's direct reset_idx() both return the newly reset palm and
+        # fingertip poses on their very first observation.
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
 
     def _write_ghost_state(self, env_ids, q, dq) -> None:
         """Fill the ghost rows of the DOF-state buffer; the caller uploads.
@@ -944,6 +1139,7 @@ class MotionImitationEnv:
         self.reset_idx(env_ids, indices)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
         self.compute_observations()
         return self.obs_buf
 
@@ -958,6 +1154,7 @@ class MotionImitationEnv:
                     self.previous_targets,
                     self.dq,
                     phase,
+                    *self._task_space_observation_components(),
                 ),
                 dim=1,
             )
@@ -990,6 +1187,28 @@ class MotionImitationEnv:
         hand_velocity_mse = hand_dq_error.square().mean(dim=1)
         hand_action_rate_mse = hand_action_rate.square().mean(dim=1)
 
+        reference_cube_root_state = self._cube_reference_root_states(reference)
+        object_position_error = (
+            self.cube_position - reference_cube_root_state[:, 0:3]
+        )
+        object_position_error_m = torch.linalg.vector_norm(
+            object_position_error, dim=1
+        )
+        # q and -q represent the same rotation, hence abs(dot). The resulting
+        # angle is the shortest geodesic rotation between the two orientations.
+        actual_cube_orientation = _normalize_canonical_quaternion(
+            self.cube_orientation
+        )
+        reference_cube_orientation = _normalize_canonical_quaternion(
+            reference_cube_root_state[:, 3:7]
+        )
+        object_orientation_dot = (
+            actual_cube_orientation * reference_cube_orientation
+        ).sum(dim=1).abs().clamp(max=1.0)
+        object_orientation_error_rad = 2.0 * torch.acos(
+            object_orientation_dot
+        )
+
         gaussian = lambda mse, std: torch.exp(-mse / (2.0 * float(std) ** 2))
         position_reward = gaussian(position_mse, rewards_cfg.position_arm_std_rad)
         velocity_reward = gaussian(
@@ -1007,6 +1226,14 @@ class MotionImitationEnv:
         hand_action_rate_reward = gaussian(
             hand_action_rate_mse, rewards_cfg.action_rate_hand_std
         )
+        object_position_reward = gaussian(
+            object_position_error_m.square(),
+            rewards_cfg.object_position_std_m,
+        )
+        object_orientation_reward = gaussian(
+            object_orientation_error_rad.square(),
+            rewards_cfg.object_orientation_std_rad,
+        )
         self.rew_buf.copy_(
             float(rewards_cfg.position_arm_weight) * position_reward
             + float(rewards_cfg.velocity_arm_weight) * velocity_reward
@@ -1015,6 +1242,10 @@ class MotionImitationEnv:
             + float(rewards_cfg.velocity_hand_weight) * hand_velocity_reward
             + float(rewards_cfg.action_rate_hand_weight)
             * hand_action_rate_reward
+            + float(rewards_cfg.object_position_weight)
+            * object_position_reward
+            + float(rewards_cfg.object_orientation_weight)
+            * object_orientation_reward
         )
         return {
             "q_error": arm_q_error,
@@ -1033,6 +1264,10 @@ class MotionImitationEnv:
             "hand_position_reward": hand_position_reward,
             "hand_velocity_reward": hand_velocity_reward,
             "hand_action_rate_reward": hand_action_rate_reward,
+            "object_position_error_m": object_position_error_m,
+            "object_orientation_error_rad": object_orientation_error_rad,
+            "object_position_reward": object_position_reward,
+            "object_orientation_reward": object_orientation_reward,
         }
 
     def threshold_violation(self, q_error: torch.Tensor) -> torch.Tensor:
@@ -1097,6 +1332,18 @@ class MotionImitationEnv:
         self.episode_sums["hand_velocity_reward"] += metrics["hand_velocity_reward"]
         self.episode_sums["hand_action_rate_reward"] += metrics[
             "hand_action_rate_reward"
+        ]
+        self.episode_sums["object_position_reward"] += metrics[
+            "object_position_reward"
+        ]
+        self.episode_sums["object_orientation_reward"] += metrics[
+            "object_orientation_reward"
+        ]
+        self.episode_sums["object_position_error_m"] += metrics[
+            "object_position_error_m"
+        ]
+        self.episode_sums["object_orientation_error_rad"] += metrics[
+            "object_orientation_error_rad"
         ]
         self.episode_sums["rms_hand_position_error"] += metrics[
             "hand_position_mse"
@@ -1185,6 +1432,7 @@ class MotionImitationEnv:
         self.gym.fetch_results(self.sim, True)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
         self.render(sync_frame_time=True)
 
         # Post-Physics Step: update the reference index, compute rewards and termination, and reset completed environments.
@@ -1231,6 +1479,12 @@ class MotionImitationEnv:
             "hand_position_reward": metrics["hand_position_reward"],
             "hand_velocity_reward": metrics["hand_velocity_reward"],
             "hand_action_rate_reward": metrics["hand_action_rate_reward"],
+            "object_position_reward": metrics["object_position_reward"],
+            "object_orientation_reward": metrics["object_orientation_reward"],
+            "object_position_error_m": metrics["object_position_error_m"],
+            "object_orientation_error_rad": metrics[
+                "object_orientation_error_rad"
+            ],
         }
         rewards = self.rew_buf.clone()
         dones = done.clone()

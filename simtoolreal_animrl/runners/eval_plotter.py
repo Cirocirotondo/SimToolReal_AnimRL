@@ -26,6 +26,8 @@ REWARD_TERMS: Tuple[Tuple[str, str], ...] = (
     ("hand_position_reward", "position_hand_weight"),
     ("hand_velocity_reward", "velocity_hand_weight"),
     ("hand_action_rate_reward", "action_rate_hand_weight"),
+    ("object_position_reward", "object_position_weight"),
+    ("object_orientation_reward", "object_orientation_weight"),
 )
 
 # Scalar per-step diagnostics copied straight out of the step extras.
@@ -38,6 +40,8 @@ SCALAR_INFO_KEYS: Tuple[str, ...] = (
     "rms_hand_action_rate",
     "max_abs_position_error",
     "max_abs_hand_position_error",
+    "object_position_error_m",
+    "object_orientation_error_rad",
 )
 
 

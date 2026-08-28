@@ -112,6 +112,10 @@ class PPO:
         hand_position_reward_sum = 0.0
         hand_velocity_reward_sum = 0.0
         hand_action_rate_reward_sum = 0.0
+        object_position_reward_sum = 0.0
+        object_orientation_reward_sum = 0.0
+        object_position_error_sum = 0.0
+        object_orientation_error_sum = 0.0
         rms_hand_position_error_sum = 0.0
         rms_position_error_sum = 0.0
         rms_velocity_error_sum = 0.0
@@ -184,6 +188,18 @@ class PPO:
                 hand_action_rate_reward_sum += float(
                     infos["hand_action_rate_reward"].mean()
                 )
+                object_position_reward_sum += float(
+                    infos["object_position_reward"].mean()
+                )
+                object_orientation_reward_sum += float(
+                    infos["object_orientation_reward"].mean()
+                )
+                object_position_error_sum += float(
+                    infos["object_position_error_m"].mean()
+                )
+                object_orientation_error_sum += float(
+                    infos["object_orientation_error_rad"].mean()
+                )
                 rms_hand_position_error_sum += float(
                     infos["rms_hand_position_error"].mean()
                 )
@@ -232,6 +248,18 @@ class PPO:
             "mean_hand_velocity_reward": hand_velocity_reward_sum / rollout_steps,
             "mean_hand_action_rate_reward": (
                 hand_action_rate_reward_sum / rollout_steps
+            ),
+            "mean_object_position_reward": (
+                object_position_reward_sum / rollout_steps
+            ),
+            "mean_object_orientation_reward": (
+                object_orientation_reward_sum / rollout_steps
+            ),
+            "mean_object_position_error_m": (
+                object_position_error_sum / rollout_steps
+            ),
+            "mean_object_orientation_error_rad": (
+                object_orientation_error_sum / rollout_steps
             ),
             "mean_rms_hand_position_error": (
                 rms_hand_position_error_sum / rollout_steps
@@ -530,6 +558,14 @@ class PPO:
             "Reward/hand_position": "mean_hand_position_reward",
             "Reward/hand_velocity": "mean_hand_velocity_reward",
             "Reward/hand_action_rate": "mean_hand_action_rate_reward",
+            "Reward/object_position": "mean_object_position_reward",
+            "Reward/object_orientation": "mean_object_orientation_reward",
+            "Tracking/object_position_error_m": (
+                "mean_object_position_error_m"
+            ),
+            "Tracking/object_orientation_error_rad": (
+                "mean_object_orientation_error_rad"
+            ),
             "Tracking/rms_hand_position_error": "mean_rms_hand_position_error",
             "Tracking/rms_arm_position_error": "mean_rms_position_error",
             "Tracking/rms_arm_velocity_error": "mean_rms_velocity_error",
@@ -624,12 +660,18 @@ class PPO:
             print(
                 "  Evaluation | score={:.4f} | arm_pos(fixed/uniform)="
                 "{:.4f}/{:.4f} | hand_pos(fixed/uniform)={:.4f}/{:.4f} | "
+                "object_pos(fixed/uniform)={:.4f}/{:.4f} | "
+                "object_rot(fixed/uniform)={:.4f}/{:.4f} | "
                 "early(fixed/uniform)={:.3f}/{:.3f}{}".format(
                     stats["evaluation_score"],
                     stats["evaluation_fixed_mean_position_reward"],
                     stats["evaluation_uniform_mean_position_reward"],
                     stats["evaluation_fixed_mean_hand_position_reward"],
                     stats["evaluation_uniform_mean_hand_position_reward"],
+                    stats["evaluation_fixed_mean_object_position_reward"],
+                    stats["evaluation_uniform_mean_object_position_reward"],
+                    stats["evaluation_fixed_mean_object_orientation_reward"],
+                    stats["evaluation_uniform_mean_object_orientation_reward"],
                     stats["evaluation_fixed_early_termination_fraction"],
                     stats["evaluation_uniform_early_termination_fraction"],
                     " | new best" if stats["evaluation_is_best"] else "",
