@@ -9,6 +9,8 @@ import sys
 import numpy as np
 import torch
 
+from simtoolreal_animrl.envs.rsi import sample_rsi_indices
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -48,16 +50,26 @@ class DeterministicEvaluator:
 
         max_start = int(self.env.reference.last_index - 1)
         fixed_base = np.rint(phases * max_start).astype(np.int64)
+        # A configured phase may point into the post-grasp region, but periodic
+        # evaluation must obey the same automatic-reset ceiling as training.
+        fixed_base = np.minimum(fixed_base, self.env.rsi_max_start_index)
         self.fixed_indices = torch.as_tensor(
             np.resize(fixed_base, self.env.num_envs),
             dtype=torch.long,
             device=self.env.device,
         )
-        rng = np.random.RandomState(int(seed))
-        self.uniform_indices = torch.as_tensor(
-            rng.randint(0, max_start + 1, size=self.env.num_envs),
-            dtype=torch.long,
-            device=self.env.device,
+        generator = torch.Generator(device=self.env.device)
+        generator.manual_seed(int(seed))
+        # Keep the historical "uniform" metric prefix for log compatibility,
+        # but this cohort now follows the configured training RSI distribution.
+        self.uniform_indices = sample_rsi_indices(
+            self.env.num_envs,
+            self.env.device,
+            self.env.rsi_distribution,
+            self.env.rsi_max_start_index,
+            self.env.rsi_pregrasp_start_index,
+            self.env.rsi_early_probability,
+            generator=generator,
         )
 
     def __call__(self, iteration, runner, is_final=False):
@@ -111,6 +123,9 @@ class DeterministicEvaluator:
         object_orientation_reward_sum = torch.zeros_like(episode_steps)
         object_position_error_sum = torch.zeros_like(episode_steps)
         object_orientation_error_sum = torch.zeros_like(episode_steps)
+        fingertip_contact_reward_sum = torch.zeros_like(episode_steps)
+        fingertip_contact_fraction_sum = torch.zeros_like(episode_steps)
+        fingertip_contact_force_sum = torch.zeros_like(episode_steps)
         rms_hand_position_error_sum = torch.zeros_like(episode_steps)
         max_hand_position_error = torch.zeros_like(episode_steps)
         rms_position_error_sum = torch.zeros_like(episode_steps)
@@ -174,6 +189,15 @@ class DeterministicEvaluator:
                 )
                 object_orientation_error_sum += (
                     infos["object_orientation_error_rad"] * active_float
+                )
+                fingertip_contact_reward_sum += (
+                    infos["fingertip_contact_reward"] * active_float
+                )
+                fingertip_contact_fraction_sum += (
+                    infos["fingertip_contact_fraction"] * active_float
+                )
+                fingertip_contact_force_sum += (
+                    infos["mean_fingertip_contact_force_n"] * active_float
                 )
                 rms_hand_position_error_sum += (
                     infos["rms_hand_position_error"] * active_float
@@ -277,6 +301,15 @@ class DeterministicEvaluator:
             ),
             "mean_object_orientation_error_rad": float(
                 (object_orientation_error_sum / lengths).mean()
+            ),
+            "mean_fingertip_contact_reward": float(
+                (fingertip_contact_reward_sum / lengths).mean()
+            ),
+            "mean_fingertip_contact_fraction": float(
+                (fingertip_contact_fraction_sum / lengths).mean()
+            ),
+            "mean_fingertip_contact_force_n": float(
+                (fingertip_contact_force_sum / lengths).mean()
             ),
             "mean_object_pose_score": float(per_env_object_pose_score.mean()),
             "mean_rms_hand_position_error": float(

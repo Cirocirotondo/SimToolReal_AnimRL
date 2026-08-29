@@ -73,7 +73,7 @@ def parse_args():
     parser.add_argument(
         "--no-periodic-eval",
         action="store_true",
-        help="Disable the deterministic fixed/uniform RSI evaluation.",
+        help="Disable the deterministic fixed/configured-RSI evaluation.",
     )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument(

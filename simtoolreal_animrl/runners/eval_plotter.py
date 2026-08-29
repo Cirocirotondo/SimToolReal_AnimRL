@@ -17,9 +17,10 @@ import torch
 # it from this package would put isaacgym after torch, which Isaac Gym rejects.
 
 
-# (info key, cfg.rewards weight attribute). Order fixes the legend order and
+# (info key, cfg.rewards weight attribute). ``None`` denotes the optional
+# contact weight, which lives in cfg.contact. Order fixes the legend order and
 # must stay aligned with MotionImitationEnv._compute_reward_and_errors.
-REWARD_TERMS: Tuple[Tuple[str, str], ...] = (
+REWARD_TERMS: Tuple[Tuple[str, Optional[str]], ...] = (
     ("position_reward", "position_arm_weight"),
     ("velocity_reward", "velocity_arm_weight"),
     ("action_rate_reward", "action_rate_arm_weight"),
@@ -28,6 +29,7 @@ REWARD_TERMS: Tuple[Tuple[str, str], ...] = (
     ("hand_action_rate_reward", "action_rate_hand_weight"),
     ("object_position_reward", "object_position_weight"),
     ("object_orientation_reward", "object_orientation_weight"),
+    ("fingertip_contact_reward", None),
 )
 
 # Scalar per-step diagnostics copied straight out of the step extras.
@@ -42,6 +44,8 @@ SCALAR_INFO_KEYS: Tuple[str, ...] = (
     "max_abs_hand_position_error",
     "object_position_error_m",
     "object_orientation_error_rad",
+    "fingertip_contact_fraction",
+    "mean_fingertip_contact_force_n",
 )
 
 
@@ -150,7 +154,11 @@ class EvaluationPlotter:
         self._arm_names = names[: self._num_arm_dofs]
         self._hand_names = names[self._num_arm_dofs:]
         self._weights = {
-            info_key: float(getattr(env.cfg.rewards, weight_attribute))
+            info_key: (
+                float(env.cfg.contact.reward_per_finger)
+                if weight_attribute is None
+                else float(getattr(env.cfg.rewards, weight_attribute))
+            )
             for info_key, weight_attribute in REWARD_TERMS
         }
         enabled = bool(env.cfg.termination.enabled)

@@ -36,7 +36,10 @@ def parse_args():
         "--rsi-index",
         type=int,
         default=None,
-        help="Use one explicit valid RSI index for every env; default is uniform RSI.",
+        help=(
+            "Use one explicit valid RSI index for every env; by default use "
+            "the configured RSI mixture."
+        ),
     )
     parser.add_argument(
         "--sim-device", default="cuda:0", help="Isaac Gym simulation device."
@@ -146,13 +149,15 @@ def assert_vectorized_object_rsi_contract(env):
     env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
     env.reset_idx(env_ids)
     env.gym.refresh_actor_root_state_tensor(env.sim)
-    uniform_expected = env._cube_reference_root_states(
+    sampled_expected = env._cube_reference_root_states(
         env.reference.sample(env.reference_index)
     )
     if not bool(
-        torch.allclose(env.cube_root_state, uniform_expected, rtol=0.0, atol=1e-6)
+        torch.allclose(env.cube_root_state, sampled_expected, rtol=0.0, atol=1e-6)
     ):
-        raise AssertionError("Uniform RSI did not reset cubes from sampled phases")
+        raise AssertionError("Configured RSI did not reset cubes from sampled phases")
+    if bool((env.reference_index > env.rsi_max_start_index).any()):
+        raise AssertionError("Automatic RSI sampled a forbidden post-grasp frame")
 
     spread = torch.linspace(
         0,
@@ -259,6 +264,19 @@ def assert_reward_contract(env):
         raise AssertionError("Object position error has an unexpected shape")
     if metrics["object_orientation_error_rad"].shape != (env.num_envs,):
         raise AssertionError("Object orientation error has an unexpected shape")
+    if metrics["fingertip_contact_reward"].shape != (env.num_envs,):
+        raise AssertionError("Fingertip-contact reward has an unexpected shape")
+    expected_max_contacts = float(len(env.contact_fingertip_names))
+    if not bool(
+        (
+            (metrics["fingertip_contact_reward"] >= 0.0)
+            & (metrics["fingertip_contact_reward"] <= expected_max_contacts)
+            & (metrics["fingertip_contact_fraction"] >= 0.0)
+            & (metrics["fingertip_contact_fraction"] <= 1.0)
+            & (metrics["mean_fingertip_contact_force_n"] >= 0.0)
+        ).all()
+    ):
+        raise AssertionError("Fingertip-contact diagnostics are outside their bounds")
     if not bool(
         (
             (metrics["object_position_reward"] >= 0.0)
@@ -279,6 +297,8 @@ def assert_reward_contract(env):
         + float(r.object_position_weight) * metrics["object_position_reward"]
         + float(r.object_orientation_weight)
         * metrics["object_orientation_reward"]
+        + float(env.contact_reward_per_finger)
+        * metrics["fingertip_contact_reward"]
     )
     if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-7)):
         raise AssertionError("Reward does not match the configured weights")
@@ -529,17 +549,23 @@ def assert_early_termination_logic(env):
     env.reference_index.zero_()
     env.arm_violation_steps.zero_()
     env.hand_violation_steps.zero_()
+    env.object_violation_steps.zero_()
     arm_error = torch.zeros(
         (env.num_envs, env.arm_q.shape[1]), dtype=torch.float32, device=env.device
     )
     hand_error = torch.zeros(
         (env.num_envs, env.hand_q.shape[1]), dtype=torch.float32, device=env.device
     )
+    object_error = torch.zeros(
+        env.num_envs, dtype=torch.float32, device=env.device
+    )
     arm_error[:, 0] = float(env.cfg.termination.arm_position_threshold_rad) + 0.1
 
     grace = int(env.cfg.termination.grace_steps)
     for count in range(1, grace + 1):
-        done, early, timeout = env._compute_termination(arm_error, hand_error)
+        done, early, timeout = env._compute_termination(
+            arm_error, hand_error, object_error
+        )
         if bool(timeout.any()):
             raise AssertionError("Synthetic early-termination test unexpectedly timed out")
         expected = count >= grace
@@ -547,42 +573,103 @@ def assert_early_termination_logic(env):
             raise AssertionError(
                 "Early termination grace mismatch at violation step {}".format(count)
             )
-    if not bool(env.arm_violation.all()) or bool(env.hand_violation.any()):
+    if (
+        not bool(env.arm_violation.all())
+        or bool(env.hand_violation.any())
+        or bool(env.object_violation.any())
+    ):
         raise AssertionError("Arm-only violation was not attributed to the arm")
 
     # The hand alone must be able to end an episode.
     env.arm_violation_steps.zero_()
     env.hand_violation_steps.zero_()
+    env.object_violation_steps.zero_()
     arm_error.zero_()
     hand_error[:, 0] = float(env.cfg.termination.hand_position_threshold_rad) + 0.1
     for count in range(1, grace + 1):
-        done, early, timeout = env._compute_termination(arm_error, hand_error)
+        done, early, timeout = env._compute_termination(
+            arm_error, hand_error, object_error
+        )
         expected = count >= grace
         if bool(early.all()) != expected or bool(done.all()) != expected:
             raise AssertionError(
                 "Hand early termination grace mismatch at step {}".format(count)
             )
-    if not bool(env.hand_violation.all()) or bool(env.arm_violation.any()):
+    if (
+        not bool(env.hand_violation.all())
+        or bool(env.arm_violation.any())
+        or bool(env.object_violation.any())
+    ):
         raise AssertionError("Hand-only violation was not attributed to the hand")
 
-    # The two counters are independent by design: a block that comes back inside
-    # its threshold clears its own count, so violations that alternate between
-    # arm and hand never accumulate to the grace limit.
+    # The cube alone must also end the episode after the same grace period.
     env.arm_violation_steps.zero_()
     env.hand_violation_steps.zero_()
+    env.object_violation_steps.zero_()
+    hand_error.zero_()
+    object_error.fill_(
+        float(env.cfg.termination.object_position_threshold_m) + 0.01
+    )
+    for count in range(1, grace + 1):
+        done, early, timeout = env._compute_termination(
+            arm_error, hand_error, object_error
+        )
+        expected = count >= grace
+        if bool(early.all()) != expected or bool(done.all()) != expected:
+            raise AssertionError(
+                "Object early termination grace mismatch at step {}".format(count)
+            )
+    if (
+        not bool(env.object_violation.all())
+        or bool(env.arm_violation.any())
+        or bool(env.hand_violation.any())
+    ):
+        raise AssertionError("Object-only violation was not attributed to the object")
+
+    # The object condition can be disabled without switching off the arm and
+    # hand early-termination machinery.
+    original_object_enabled = env.cfg.termination.object_position_enabled
+    env.cfg.termination.object_position_enabled = False
+    env.arm_violation_steps.zero_()
+    env.hand_violation_steps.zero_()
+    env.object_violation_steps.zero_()
+    for _ in range(2 * grace):
+        done, early, timeout = env._compute_termination(
+            arm_error, hand_error, object_error
+        )
+        if bool(done.any()) or bool(early.any()) or bool(timeout.any()):
+            raise AssertionError(
+                "Disabled object early termination still ended an episode"
+            )
+    if bool(env.object_violation.any()) or bool(env.object_violation_steps.any()):
+        raise AssertionError("Disabled object termination retained a violation")
+    env.cfg.termination.object_position_enabled = original_object_enabled
+
+    # The three counters are independent by design: a source that comes back
+    # inside its threshold clears its own count, so alternating violations
+    # never accumulate to the grace limit.
+    env.arm_violation_steps.zero_()
+    env.hand_violation_steps.zero_()
+    env.object_violation_steps.zero_()
     arm_over = float(env.cfg.termination.arm_position_threshold_rad) + 0.1
     hand_over = float(env.cfg.termination.hand_position_threshold_rad) + 0.1
-    for step in range(4 * grace):
+    object_over = float(env.cfg.termination.object_position_threshold_m) + 0.01
+    for step in range(6 * grace):
         arm_error.zero_()
         hand_error.zero_()
-        if step % 2 == 0:
+        object_error.zero_()
+        if step % 3 == 0:
             arm_error[:, 0] = arm_over
-        else:
+        elif step % 3 == 1:
             hand_error[:, 0] = hand_over
-        done, early, _ = env._compute_termination(arm_error, hand_error)
+        else:
+            object_error.fill_(object_over)
+        done, early, _ = env._compute_termination(
+            arm_error, hand_error, object_error
+        )
         if bool(early.any()) or bool(done.any()):
             raise AssertionError(
-                "Alternating arm/hand violations terminated at step {}; the "
+                "Alternating arm/hand/object violations terminated at step {}; the "
                 "grace counters are not independent".format(step)
             )
 
@@ -656,7 +743,18 @@ def main():
         assert_observation_contract(env)
         assert_reward_contract(env)
         assert_correct_pd_gains(env)
-        metrics = run_ideal_episode(env, initial_indices)
+        # Exact joint targets do not guarantee that the dynamic cube remains
+        # grasped, so exercise the complete horizon without the object-distance
+        # reset here. Its threshold, grace period and opt-out behavior are
+        # verified independently by assert_early_termination_logic().
+        object_termination_enabled = env.cfg.termination.object_position_enabled
+        env.cfg.termination.object_position_enabled = False
+        try:
+            metrics = run_ideal_episode(env, initial_indices)
+        finally:
+            env.cfg.termination.object_position_enabled = (
+                object_termination_enabled
+            )
         assert_observation_contract(env)
         assert_early_termination_logic(env)
         assert_early_termination_step_contract(env)

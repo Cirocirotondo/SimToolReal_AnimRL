@@ -12,9 +12,15 @@ class ConfigAndDemoTest(unittest.TestCase):
         env_cfg = SimToolRealCfg()
         train_cfg = SimToolRealTrainCfg()
         self.assertEqual(env_cfg.env.num_envs, 4096)
-        self.assertEqual(env_cfg.env.episode_length, 100)
+        self.assertEqual(env_cfg.env.episode_length, 300)
         self.assertEqual(env_cfg.env.num_observations, 114)
         self.assertEqual(env_cfg.env.num_actions, 26)
+        self.assertEqual(
+            env_cfg.env.reference_init_distribution, "pregrasp_mixture"
+        )
+        self.assertEqual(env_cfg.env.rsi_early_probability, 0.20)
+        self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 650)
+        self.assertEqual(env_cfg.env.rsi_max_start_index, 830)
         self.assertEqual(
             env_cfg.control.action_parameterization, "animrl_residual"
         )
@@ -28,14 +34,16 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.object.mass_kg, 0.2)
         self.assertEqual(env_cfg.object.friction, 0.5)
         self.assertEqual(env_cfg.object.restitution, 0.0)
-        # The object reward is currently switched off: it started at 0.804 with
-        # an untrained policy and only ever went down, so it contributed a near
-        # constant offset and no gradient. The Gaussian widths are kept so the
-        # terms can be re-enabled by restoring the weights alone.
-        self.assertEqual(env_cfg.rewards.object_position_weight, 0.0)
-        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.0)
+        # Fine-tuning from the no-object checkpoint reintroduces full cube-pose
+        # tracking while the independently configurable contact reward stays
+        # disabled.
+        self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
+        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.2)
+        self.assertFalse(env_cfg.contact.enabled)
         self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
         self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
+        self.assertTrue(env_cfg.termination.object_position_enabled)
+        self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.05)
         self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.03)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)

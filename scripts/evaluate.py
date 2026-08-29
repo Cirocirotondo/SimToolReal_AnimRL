@@ -69,9 +69,14 @@ def parse_args():
         ),
     )
     rsi.add_argument(
+        "--sampled-rsi",
         "--uniform-rsi",
+        dest="sampled_rsi",
         action="store_true",
-        help="Use the same seeded uniform RSI distribution as training.",
+        help=(
+            "Use the same seeded configured RSI distribution as training. "
+            "--uniform-rsi is retained as a compatibility alias."
+        ),
     )
     parser.add_argument(
         "--viewer", action="store_true", help="Open the Isaac Gym viewer."
@@ -207,7 +212,7 @@ def main():
     )
     try:
         max_start = int(env.reference.last_index - 1)
-        if not args.uniform_rsi and not 0 <= int(args.rsi_index) <= max_start:
+        if not args.sampled_rsi and not 0 <= int(args.rsi_index) <= max_start:
             raise ValueError(
                 "--rsi-index must lie in [0, {}], got {}".format(
                     max_start, args.rsi_index
@@ -226,7 +231,7 @@ def main():
         )
         policy = runner.get_inference_policy(device=env.device)
 
-        fixed_rsi = None if args.uniform_rsi else int(args.rsi_index)
+        fixed_rsi = None if args.sampled_rsi else int(args.rsi_index)
         if fixed_rsi is not None:
             env.reset(reference_index=fixed_rsi)
         else:

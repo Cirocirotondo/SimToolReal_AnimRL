@@ -53,7 +53,7 @@ def parse_args():
         default=None,
         help=(
             "Force the episode to begin at this demonstration sample; "
-            "by default the environment uses the same uniform RSI as training."
+            "by default it uses the configured training RSI mixture."
         ),
     )
     parser.add_argument(
@@ -92,7 +92,7 @@ def main() -> None:
 
         print(
             "Loaded the training environment: {} env(s), {}-step episodes, "
-            "uniform RSI={}.".format(
+            "sampled RSI={}.".format(
                 env.num_envs,
                 env.max_episode_length,
                 args.rsi_index is None,
