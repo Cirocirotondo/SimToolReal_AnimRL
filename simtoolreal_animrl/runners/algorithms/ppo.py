@@ -117,6 +117,9 @@ class PPO:
         object_orientation_reward_sum = 0.0
         object_position_error_sum = 0.0
         object_orientation_error_sum = 0.0
+        fingertip_contact_reward_sum = 0.0
+        fingertip_contact_fraction_sum = 0.0
+        fingertip_contact_force_sum = 0.0
         rms_hand_position_error_sum = 0.0
         rms_position_error_sum = 0.0
         rms_velocity_error_sum = 0.0
@@ -201,6 +204,15 @@ class PPO:
                 object_orientation_error_sum += float(
                     infos["object_orientation_error_rad"].mean()
                 )
+                fingertip_contact_reward_sum += float(
+                    infos["fingertip_contact_reward"].mean()
+                )
+                fingertip_contact_fraction_sum += float(
+                    infos["fingertip_contact_fraction"].mean()
+                )
+                fingertip_contact_force_sum += float(
+                    infos["mean_fingertip_contact_force_n"].mean()
+                )
                 rms_hand_position_error_sum += float(
                     infos["rms_hand_position_error"].mean()
                 )
@@ -261,6 +273,15 @@ class PPO:
             ),
             "mean_object_orientation_error_rad": (
                 object_orientation_error_sum / rollout_steps
+            ),
+            "mean_fingertip_contact_reward": (
+                fingertip_contact_reward_sum / rollout_steps
+            ),
+            "mean_fingertip_contact_fraction": (
+                fingertip_contact_fraction_sum / rollout_steps
+            ),
+            "mean_fingertip_contact_force_n": (
+                fingertip_contact_force_sum / rollout_steps
             ),
             "mean_rms_hand_position_error": (
                 rms_hand_position_error_sum / rollout_steps
@@ -591,6 +612,11 @@ class PPO:
             "Reward/hand_action_rate": "mean_hand_action_rate_reward",
             "Reward/object_position": "mean_object_position_reward",
             "Reward/object_orientation": "mean_object_orientation_reward",
+            "Reward/fingertip_contact": "mean_fingertip_contact_reward",
+            "Contact/fingertip_fraction": "mean_fingertip_contact_fraction",
+            "Contact/mean_fingertip_force_n": (
+                "mean_fingertip_contact_force_n"
+            ),
             "Tracking/object_position_error_m": (
                 "mean_object_position_error_m"
             ),
@@ -735,11 +761,11 @@ class PPO:
         )
         if "evaluation_score" in stats:
             print(
-                "  Evaluation | score={:.4f} | arm_pos(fixed/uniform)="
-                "{:.4f}/{:.4f} | hand_pos(fixed/uniform)={:.4f}/{:.4f} | "
-                "object_pos(fixed/uniform)={:.4f}/{:.4f} | "
-                "object_rot(fixed/uniform)={:.4f}/{:.4f} | "
-                "early(fixed/uniform)={:.3f}/{:.3f}{}".format(
+                "  Evaluation | score={:.4f} | arm_pos(fixed/sampled)="
+                "{:.4f}/{:.4f} | hand_pos(fixed/sampled)={:.4f}/{:.4f} | "
+                "object_pos(fixed/sampled)={:.4f}/{:.4f} | "
+                "object_rot(fixed/sampled)={:.4f}/{:.4f} | "
+                "early(fixed/sampled)={:.3f}/{:.3f}{}".format(
                     stats["evaluation_score"],
                     stats["evaluation_fixed_mean_position_reward"],
                     stats["evaluation_uniform_mean_position_reward"],

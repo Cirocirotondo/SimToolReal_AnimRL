@@ -9,6 +9,8 @@ from simtoolreal_animrl.cfg import (
     config_to_dict,
     update_config_from_dict,
 )
+from simtoolreal_animrl.envs.contact import fingertip_contact_diagnostics
+from simtoolreal_animrl.envs.rsi import resolve_rsi_settings, sample_rsi_indices
 from simtoolreal_animrl.runners.modules import (
     EmpiricalNormalization,
     Policy,
@@ -201,6 +203,20 @@ class RunnerModulesTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             update_config_from_dict(restored, {"unknown": 1})
 
+    def test_pregrasp_rsi_mixture_respects_ranges_and_probability(self):
+        settings = resolve_rsi_settings(self.env_cfg.env, 1107)
+        self.assertEqual(settings, ("pregrasp_mixture", 830, 650, 0.20))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(123)
+        indices = sample_rsi_indices(
+            100000, torch.device("cpu"), *settings, generator=generator
+        )
+        self.assertGreaterEqual(int(indices.min()), 0)
+        self.assertLessEqual(int(indices.max()), 830)
+        early_fraction = float((indices < 650).float().mean())
+        self.assertAlmostEqual(early_fraction, 0.20, delta=0.01)
+        self.assertTrue(bool((indices[indices >= 650] <= 830).all()))
+
     def test_evaluation_cohorts_are_repeatable(self):
         class Reference:
             last_index = 1107
@@ -209,15 +225,20 @@ class RunnerModulesTest(unittest.TestCase):
             num_envs = 7
             device = torch.device("cpu")
             reference = Reference()
+            rsi_distribution = "pregrasp_mixture"
+            rsi_max_start_index = 830
+            rsi_pregrasp_start_index = 650
+            rsi_early_probability = 0.20
 
         first = DeterministicEvaluator(Env(), 100, 123, [0.0, 0.5, 1.0])
         second = DeterministicEvaluator(Env(), 100, 123, [0.0, 0.5, 1.0])
         self.assertEqual(
-            first.fixed_indices.tolist(), [0, 553, 1106, 0, 553, 1106, 0]
+            first.fixed_indices.tolist(), [0, 553, 830, 0, 553, 830, 0]
         )
         self.assertTrue(
             torch.equal(first.uniform_indices, second.uniform_indices)
         )
+        self.assertLessEqual(int(first.uniform_indices.max()), 830)
 
     def test_final_iteration_is_always_evaluated(self):
         """The last update is ranked even when it is off the interval."""
@@ -229,6 +250,10 @@ class RunnerModulesTest(unittest.TestCase):
             num_envs = 4
             device = torch.device("cpu")
             reference = Reference()
+            rsi_distribution = "pregrasp_mixture"
+            rsi_max_start_index = 830
+            rsi_pregrasp_start_index = 650
+            rsi_early_probability = 0.20
 
         evaluator = DeterministicEvaluator(Env(), 500, 123, [0.0, 0.5])
         calls = []
@@ -267,6 +292,9 @@ class RunnerModulesTest(unittest.TestCase):
             "object_orientation_reward": torch.zeros(num_envs),
             "object_position_error_m": torch.zeros(num_envs),
             "object_orientation_error_rad": torch.zeros(num_envs),
+            "fingertip_contact_reward": torch.zeros(num_envs),
+            "fingertip_contact_fraction": torch.zeros(num_envs),
+            "mean_fingertip_contact_force_n": torch.zeros(num_envs),
             "rms_hand_position_error": torch.zeros(num_envs),
             "max_abs_hand_position_error": torch.zeros(num_envs),
             "rms_position_error": torch.zeros(num_envs),
@@ -293,6 +321,10 @@ class RunnerModulesTest(unittest.TestCase):
             sim = None
             action_scales = torch.ones(2)
             action_target_clip = 100.0
+            rsi_distribution = "pregrasp_mixture"
+            rsi_max_start_index = 830
+            rsi_pregrasp_start_index = 650
+            rsi_early_probability = 0.20
 
             def __init__(self, cfg):
                 self.cfg = cfg
@@ -350,6 +382,49 @@ class RunnerModulesTest(unittest.TestCase):
                 self.assertFalse(
                     np.isnan(value), "{} is NaN".format(name)
                 )
+
+    def test_contact_reward_configuration_round_trip(self):
+        cfg = SimToolRealCfg()
+        self.assertFalse(cfg.contact.enabled)
+        self.assertEqual(cfg.contact.collection, 1)
+        self.assertEqual(
+            cfg.contact.fingertip_names, ["thumb", "index", "middle"]
+        )
+        self.assertGreater(cfg.contact.force_threshold_n, 0.0)
+        self.assertGreater(cfg.contact.reward_per_finger, 0.0)
+
+        snapshot = config_to_dict(cfg)
+        restored = SimToolRealCfg()
+        restored.contact.enabled = True
+        update_config_from_dict(restored, snapshot)
+        self.assertFalse(restored.contact.enabled)
+        self.assertEqual(
+            restored.contact.fingertip_names,
+            snapshot["contact"]["fingertip_names"],
+        )
+
+    def test_fingertip_contact_diagnostics_count_each_selected_finger(self):
+        forces = torch.zeros(2, 5, 3)
+        # Environment zero: thumb and middle exceed 0.5 N, index does not.
+        forces[0, 0, 0] = 0.6
+        forces[0, 2, 1] = 0.5
+        forces[0, 4, 2] = 2.0
+        # Environment one: all three selected fingers exceed the threshold.
+        forces[1, 0, 0] = 1.0
+        forces[1, 2, 0] = 1.0
+        forces[1, 4, 0] = 1.0
+        selected = torch.tensor([0, 2, 4])
+
+        count, fraction, mean_force = fingertip_contact_diagnostics(
+            forces, selected, 0.5
+        )
+        self.assertTrue(torch.equal(count, torch.tensor([2.0, 3.0])))
+        self.assertTrue(
+            torch.allclose(fraction, torch.tensor([2.0 / 3.0, 1.0]))
+        )
+        self.assertTrue(
+            torch.allclose(mean_force, torch.tensor([3.1 / 3.0, 1.0]))
+        )
 
     def test_evaluation_preserves_torch_and_numpy_rng(self):
         torch.manual_seed(17)

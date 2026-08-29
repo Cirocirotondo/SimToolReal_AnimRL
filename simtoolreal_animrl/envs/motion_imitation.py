@@ -21,7 +21,9 @@ from simtoolreal_animrl.envs.controller import (
     configure_pd_properties,
     validate_joint_order,
 )
+from simtoolreal_animrl.envs.contact import fingertip_contact_diagnostics
 from simtoolreal_animrl.envs.demonstration import JointDemonstration60Hz
+from simtoolreal_animrl.envs.rsi import resolve_rsi_settings, sample_rsi_indices
 
 
 # The fixed wrist -> mount -> base -> palm chain is collapsed while loading the
@@ -33,9 +35,14 @@ PALM_POSITION_IN_WRIST = (0.0, 0.0, 0.0738)
 # introduced by the ur5e_dg5f_mount joint. In xyzw form this is
 # (0, 0, sin(60 deg / 2), cos(60 deg / 2)).
 PALM_ORIENTATION_IN_WRIST = (0.0, 0.0, 0.5, 0.8660254037844386)
-FINGERTIP_BODY_NAMES = tuple(
-    "rl_dg_{}_4".format(finger) for finger in range(1, 6)
-)
+FINGERTIP_BODY_NAMES_BY_SEMANTIC_NAME = {
+    "thumb": "rl_dg_1_4",
+    "index": "rl_dg_2_4",
+    "middle": "rl_dg_3_4",
+    "ring": "rl_dg_4_4",
+    "pinky": "rl_dg_5_4",
+}
+FINGERTIP_BODY_NAMES = tuple(FINGERTIP_BODY_NAMES_BY_SEMANTIC_NAME.values())
 FINGERTIP_OFFSETS = (
     # Exact origins of the fixed rj_dg_<finger>_tip joints in the respective
     # rl_dg_<finger>_4 frames. The tip bodies themselves are collapsed.
@@ -125,6 +132,46 @@ class MotionImitationEnv:
             or self.action_target_clip <= 0.0
         ):
             raise ValueError("AnimRL action scales and target clip must be positive")
+        self.contact_enabled = bool(self.cfg.contact.enabled)
+        self.contact_collection = int(self.cfg.contact.collection)
+        self.contact_force_threshold_n = float(
+            self.cfg.contact.force_threshold_n
+        )
+        self.contact_reward_per_finger = float(
+            self.cfg.contact.reward_per_finger
+        )
+        self.contact_fingertip_names = tuple(
+            str(name).strip().lower() for name in self.cfg.contact.fingertip_names
+        )
+        if self.contact_collection not in (1, 2):
+            raise ValueError("contact.collection must be 1 or 2")
+        if (
+            not math.isfinite(self.contact_force_threshold_n)
+            or self.contact_force_threshold_n <= 0.0
+        ):
+            raise ValueError("contact.force_threshold_n must be finite and positive")
+        if (
+            not math.isfinite(self.contact_reward_per_finger)
+            or self.contact_reward_per_finger < 0.0
+        ):
+            raise ValueError(
+                "contact.reward_per_finger must be finite and non-negative"
+            )
+        if not self.contact_fingertip_names:
+            raise ValueError("contact.fingertip_names must not be empty")
+        if len(set(self.contact_fingertip_names)) != len(
+            self.contact_fingertip_names
+        ):
+            raise ValueError("contact.fingertip_names must not contain duplicates")
+        unknown_contact_fingers = set(self.contact_fingertip_names).difference(
+            FINGERTIP_BODY_NAMES_BY_SEMANTIC_NAME
+        )
+        if unknown_contact_fingers:
+            raise ValueError(
+                "Unknown contact fingertip names: {}".format(
+                    sorted(unknown_contact_fingers)
+                )
+            )
         if not math.isclose(
             self.dt,
             1.0 / float(self.cfg.motion.frequency_hz),
@@ -160,6 +207,12 @@ class MotionImitationEnv:
                     self.reference.sample_count
                 )
             )
+        (
+            self.rsi_distribution,
+            self.rsi_max_start_index,
+            self.rsi_pregrasp_start_index,
+            self.rsi_early_probability,
+        ) = resolve_rsi_settings(self.cfg.env, self.reference.last_index)
 
         # Purely a visual benchmark, and it doubles the simulated bodies, so
         # only an explicit opt-in builds it. evaluate.py ties it to --viewer;
@@ -222,8 +275,12 @@ class MotionImitationEnv:
         params.physx.default_buffer_size_multiplier = float(
             physx.default_buffer_size_multiplier
         )
+        # Contact reporting is a measurable GPU cost at 4096 environments.
+        # Preserve the old zero-overhead CC_NEVER path unless the optional
+        # fingertip-contact feature is explicitly enabled.
+        contact_collection = self.contact_collection if self.contact_enabled else 0
         params.physx.contact_collection = gymapi.ContactCollection(
-            int(physx.contact_collection)
+            contact_collection
         )
 
         sim = self.gym.create_sim(
@@ -628,6 +685,14 @@ class MotionImitationEnv:
             dtype=torch.long,
             device=self.device,
         )
+        self.contact_fingertip_body_indices = torch.as_tensor(
+            [
+                body_index(FINGERTIP_BODY_NAMES_BY_SEMANTIC_NAME[name])
+                for name in self.contact_fingertip_names
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
 
     def _paint_ghost(self, env, ghost) -> None:
         color = gymapi.Vec3(
@@ -716,6 +781,14 @@ class MotionImitationEnv:
         self.rigid_body_state = gymtorch.wrap_tensor(rigid_body_state_raw).view(
             self.num_envs, rigid_bodies_per_env, 13
         )
+        self.net_contact_forces = None
+        if self.contact_enabled:
+            net_contact_force_raw = self.gym.acquire_net_contact_force_tensor(
+                self.sim
+            )
+            self.net_contact_forces = gymtorch.wrap_tensor(
+                net_contact_force_raw
+            ).view(self.num_envs, rigid_bodies_per_env, 3)
         self.palm_position_in_wrist = torch.tensor(
             PALM_POSITION_IN_WRIST, dtype=torch.float32, device=self.device
         ).expand(self.num_envs, -1)
@@ -734,6 +807,8 @@ class MotionImitationEnv:
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        if self.contact_enabled:
+            self.gym.refresh_net_contact_force_tensor(self.sim)
 
     def _allocate_buffers(self) -> None:
         self.obs_buf = torch.zeros(
@@ -753,8 +828,10 @@ class MotionImitationEnv:
         self.reference_index = torch.zeros_like(self.episode_length_buf)
         self.arm_violation_steps = torch.zeros_like(self.episode_length_buf)
         self.hand_violation_steps = torch.zeros_like(self.episode_length_buf)
+        self.object_violation_steps = torch.zeros_like(self.episode_length_buf)
         self.arm_violation = torch.zeros_like(self.reset_buf)
         self.hand_violation = torch.zeros_like(self.reset_buf)
+        self.object_violation = torch.zeros_like(self.reset_buf)
         self.actions = torch.zeros(
             (self.num_envs, self.num_actions), dtype=torch.float32, device=self.device
         )
@@ -782,6 +859,9 @@ class MotionImitationEnv:
                 "rms_hand_action_rate",
                 "object_position_error_m",
                 "object_orientation_error_rad",
+                "fingertip_contact_reward",
+                "fingertip_contact_fraction",
+                "fingertip_contact_force_n",
             )
         }
         self.extras = {}
@@ -1024,18 +1104,14 @@ class MotionImitationEnv:
         if env_ids.numel() == 0:
             return
         env_ids = env_ids.to(device=self.device, dtype=torch.long)
-        # Match AnimRL Cartwheel RSI: sample uniformly over the complete motion,
-        # even when fewer than max_episode_length reference steps remain. The
-        # episode then terminates naturally when it reaches the final sample.
-        max_start = self.reference.last_index - 1
         if reference_indices is None:
-            if self.cfg.env.reference_init_distribution != "uniform":
-                raise ValueError("Only uniform RSI is supported")
-            reference_indices = torch.randint(
-                low=0,
-                high=max_start + 1,
-                size=(env_ids.numel(),),
-                device=self.device,
+            reference_indices = sample_rsi_indices(
+                env_ids.numel(),
+                self.device,
+                self.rsi_distribution,
+                self.rsi_max_start_index,
+                self.rsi_pregrasp_start_index,
+                self.rsi_early_probability,
             )
         else:
             reference_indices = reference_indices.to(
@@ -1045,6 +1121,10 @@ class MotionImitationEnv:
                 reference_indices = reference_indices.repeat(env_ids.numel())
             if reference_indices.shape != (env_ids.numel(),):
                 raise ValueError("reference_indices has the wrong shape")
+            # Explicit indices remain available across the complete motion for
+            # diagnostics and the viewer. Only automatically sampled training
+            # and evaluation resets are capped at rsi_max_start_index.
+            max_start = self.reference.last_index - 1
             if torch.any(reference_indices < 0) or torch.any(
                 reference_indices > max_start
             ):
@@ -1057,6 +1137,7 @@ class MotionImitationEnv:
         self.episode_length_buf[env_ids] = 0
         self.arm_violation_steps[env_ids] = 0
         self.hand_violation_steps[env_ids] = 0
+        self.object_violation_steps[env_ids] = 0
         self.reset_buf[env_ids] = False
         self.time_out_buf[env_ids] = False
         if hasattr(self, "episode_sums"):
@@ -1234,6 +1315,20 @@ class MotionImitationEnv:
             object_orientation_error_rad.square(),
             rewards_cfg.object_orientation_std_rad,
         )
+        if self.contact_enabled:
+            (
+                fingertip_contact_reward,
+                fingertip_contact_fraction,
+                mean_fingertip_contact_force_n,
+            ) = fingertip_contact_diagnostics(
+                self.net_contact_forces,
+                self.contact_fingertip_body_indices,
+                self.contact_force_threshold_n,
+            )
+        else:
+            fingertip_contact_reward = torch.zeros_like(position_reward)
+            fingertip_contact_fraction = torch.zeros_like(position_reward)
+            mean_fingertip_contact_force_n = torch.zeros_like(position_reward)
         self.rew_buf.copy_(
             float(rewards_cfg.position_arm_weight) * position_reward
             + float(rewards_cfg.velocity_arm_weight) * velocity_reward
@@ -1246,6 +1341,7 @@ class MotionImitationEnv:
             * object_position_reward
             + float(rewards_cfg.object_orientation_weight)
             * object_orientation_reward
+            + self.contact_reward_per_finger * fingertip_contact_reward
         )
         return {
             "q_error": arm_q_error,
@@ -1268,6 +1364,9 @@ class MotionImitationEnv:
             "object_orientation_error_rad": object_orientation_error_rad,
             "object_position_reward": object_position_reward,
             "object_orientation_reward": object_orientation_reward,
+            "fingertip_contact_reward": fingertip_contact_reward,
+            "fingertip_contact_fraction": fingertip_contact_fraction,
+            "mean_fingertip_contact_force_n": mean_fingertip_contact_force_n,
         }
 
     def threshold_violation(self, q_error: torch.Tensor) -> torch.Tensor:
@@ -1280,15 +1379,31 @@ class MotionImitationEnv:
             self.cfg.termination.hand_position_threshold_rad
         )
 
+    def object_threshold_violation(
+        self, object_position_error_m: torch.Tensor
+    ) -> torch.Tensor:
+        return object_position_error_m > float(
+            self.cfg.termination.object_position_threshold_m
+        )
+
     def _compute_termination(
-        self, q_error: torch.Tensor, hand_q_error: torch.Tensor
+        self,
+        q_error: torch.Tensor,
+        hand_q_error: torch.Tensor,
+        object_position_error_m: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Either block drifting too far ends the episode. Each keeps its own
-        # grace counter, so a block that returns inside its threshold clears its
-        # count regardless of what the other block is doing.
+        # Arm, hand and object each keep an independent grace counter. Returning
+        # inside one threshold clears only that source's count, regardless of
+        # what the other tracking errors are doing.
         if bool(self.cfg.termination.enabled):
             self.arm_violation = self.threshold_violation(q_error)
             self.hand_violation = self.hand_threshold_violation(hand_q_error)
+            if bool(self.cfg.termination.object_position_enabled):
+                self.object_violation = self.object_threshold_violation(
+                    object_position_error_m
+                )
+            else:
+                self.object_violation = torch.zeros_like(self.reset_buf)
             grace = int(self.cfg.termination.grace_steps)
             self.arm_violation_steps.copy_(
                 torch.where(
@@ -1304,13 +1419,23 @@ class MotionImitationEnv:
                     torch.zeros_like(self.hand_violation_steps),
                 )
             )
+            self.object_violation_steps.copy_(
+                torch.where(
+                    self.object_violation,
+                    self.object_violation_steps + 1,
+                    torch.zeros_like(self.object_violation_steps),
+                )
+            )
             early = (self.arm_violation_steps >= grace) | (
                 self.hand_violation_steps >= grace
+            ) | (
+                self.object_violation_steps >= grace
             )
         else:
             early = torch.zeros_like(self.reset_buf)
             self.arm_violation = torch.zeros_like(self.reset_buf)
             self.hand_violation = torch.zeros_like(self.reset_buf)
+            self.object_violation = torch.zeros_like(self.reset_buf)
 
         reference_end = self.reference_index >= self.reference.last_index
         # AnimRL classifies both the configured horizon and reaching phase 1 as
@@ -1344,6 +1469,15 @@ class MotionImitationEnv:
         ]
         self.episode_sums["object_orientation_error_rad"] += metrics[
             "object_orientation_error_rad"
+        ]
+        self.episode_sums["fingertip_contact_reward"] += metrics[
+            "fingertip_contact_reward"
+        ]
+        self.episode_sums["fingertip_contact_fraction"] += metrics[
+            "fingertip_contact_fraction"
+        ]
+        self.episode_sums["fingertip_contact_force_n"] += metrics[
+            "mean_fingertip_contact_force_n"
         ]
         self.episode_sums["rms_hand_position_error"] += metrics[
             "hand_position_mse"
@@ -1383,6 +1517,9 @@ class MotionImitationEnv:
             .float()
             .mean(),
             "hand_failure_fraction": (early & self.hand_violation)[done]
+            .float()
+            .mean(),
+            "object_failure_fraction": (early & self.object_violation)[done]
             .float()
             .mean(),
             "horizon_fraction": horizon_timeout[done].float().mean(),
@@ -1433,6 +1570,8 @@ class MotionImitationEnv:
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        if self.contact_enabled:
+            self.gym.refresh_net_contact_force_tensor(self.sim)
         self.render(sync_frame_time=True)
 
         # Post-Physics Step: update the reference index, compute rewards and termination, and reset completed environments.
@@ -1441,7 +1580,9 @@ class MotionImitationEnv:
         metrics = self._compute_reward_and_errors()
         self._accumulate_episode_metrics(metrics)
         done, early, timeout = self._compute_termination(
-            metrics["q_error"], metrics["hand_q_error"]
+            metrics["q_error"],
+            metrics["hand_q_error"],
+            metrics["object_position_error_m"],
         )
         self.reset_buf.copy_(done)
         self.time_out_buf.copy_(timeout)
@@ -1460,6 +1601,7 @@ class MotionImitationEnv:
             # failure from a hand failure.
             "arm_threshold_violation": self.arm_violation.clone(),
             "hand_threshold_violation": self.hand_violation.clone(),
+            "object_threshold_violation": self.object_violation.clone(),
             "reference_index": self.reference_index.clone(),
             "max_abs_position_error": metrics["q_error"].abs().amax(dim=1),
             "max_abs_arm_position_error": metrics["q_error"].abs().amax(dim=1),
@@ -1484,6 +1626,13 @@ class MotionImitationEnv:
             "object_position_error_m": metrics["object_position_error_m"],
             "object_orientation_error_rad": metrics[
                 "object_orientation_error_rad"
+            ],
+            "fingertip_contact_reward": metrics["fingertip_contact_reward"],
+            "fingertip_contact_fraction": metrics[
+                "fingertip_contact_fraction"
+            ],
+            "mean_fingertip_contact_force_n": metrics[
+                "mean_fingertip_contact_force_n"
             ],
         }
         rewards = self.rew_buf.clone()

@@ -6,7 +6,7 @@ from .base_config import BaseEnvCfg, BaseTrainCfg
 class SimToolRealCfg(BaseEnvCfg):
     class env(BaseEnvCfg.env):
         num_envs = 4096
-        episode_length = 100
+        episode_length = 300
         num_actions = 26
         # Existing 79D proprioception, followed by: palm pose in the robot-base
         # frame (3+4), cube pose relative to palm (3+4), cube center relative
@@ -15,7 +15,13 @@ class SimToolRealCfg(BaseEnvCfg):
         num_observations = 114
         num_privileged_obs = None
         reference_state_initialization = True
-        reference_init_distribution = "uniform"
+        # Avoid initializing a dynamic cube in the unstable post-grasp part of
+        # the demonstration. Twenty percent of resets preserve the approach;
+        # the rest focus on the pre-grasp window. Bounds are inclusive.
+        reference_init_distribution = "pregrasp_mixture"
+        rsi_early_probability = 0.20
+        rsi_pregrasp_start_index = 650
+        rsi_max_start_index = 830
 
     class asset:
         file = "assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf"
@@ -95,6 +101,22 @@ class SimToolRealCfg(BaseEnvCfg):
         # effectively capped by the early terminations.
         clip_joint_target = 100.0
 
+    class contact:
+        # Optional GPU contact shaping for the three fingers used by the
+        # grasp.  When disabled, MotionImitationEnv keeps PhysX contact
+        # reporting at CC_NEVER and does not acquire/refresh its tensor.
+        enabled = False
+        # Isaac Gym ContactCollection value: 1 = CC_LAST_SUBSTEP and
+        # 2 = CC_ALL_SUBSTEPS. LAST_SUBSTEP is the cheaper production default
+        # for the stable contacts expected during a grasp.
+        collection = 1
+        force_threshold_n = 0.5
+        # DG5F semantic mapping: finger 1=thumb, 2=index, 3=middle.
+        fingertip_names = ["thumb", "index", "middle"]
+        # Add this amount once per selected fingertip over the force threshold:
+        # 0, x, 2x or 3x at each control step with the default selection.
+        reward_per_finger = 0.05
+
     class rewards:
         # Arm and hand keep separate Gaussian terms so neither dilutes the
         # other's gradient. The hand weights are 0.6x the arm's, which is what
@@ -118,8 +140,8 @@ class SimToolRealCfg(BaseEnvCfg):
         # Full object-pose imitation. Position is the Euclidean center error in
         # metres; orientation is the sign-invariant quaternion geodesic angle
         # in radians. Cube velocity is deliberately not rewarded.
-        object_position_weight = 0.0
-        object_orientation_weight = 0.0
+        object_position_weight = 0.8
+        object_orientation_weight = 0.2
         object_position_std_m = 0.05
         object_orientation_std_rad = 0.5
 
@@ -127,6 +149,10 @@ class SimToolRealCfg(BaseEnvCfg):
         enabled = True
         arm_position_threshold_rad = 0.35
         hand_position_threshold_rad = 1.35
+        object_position_enabled = True
+        # End an episode when the physical cube remains farther than this
+        # Euclidean center distance from the demonstrated cube target.
+        object_position_threshold_m = 0.05
         grace_steps = 5
 
 
