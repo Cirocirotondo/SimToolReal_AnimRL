@@ -7,4 +7,5 @@ setup(
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=["numpy", "tensorboard", "torch"],
+    extras_require={"video": ["imageio", "imageio-ffmpeg"]},
 )

@@ -232,7 +232,27 @@ class MotionImitationEnv:
             self.device = torch.device(sim_device)
         else:
             self.device = torch.device("cpu")
-        self.graphics_device_id = -1 if headless else self.sim_device_id
+        self.training_camera_enabled = bool(
+            getattr(self.cfg.viewer, "training_camera_enabled", False)
+        )
+        self.training_camera_env_index = int(
+            getattr(self.cfg.viewer, "training_camera_env_index", 0)
+        )
+        self.training_camera_width = int(
+            getattr(self.cfg.viewer, "training_camera_width", 640)
+        )
+        self.training_camera_height = int(
+            getattr(self.cfg.viewer, "training_camera_height", 480)
+        )
+        if not 0 <= self.training_camera_env_index < self.num_envs:
+            raise ValueError("viewer.training_camera_env_index is out of range")
+        if self.training_camera_width <= 0 or self.training_camera_height <= 0:
+            raise ValueError("Training-camera dimensions must be positive")
+        # Headless camera sensors still require a graphics context. Preserve
+        # graphics_device=-1 exactly when recording is disabled so compute-only
+        # servers follow the original path without graphics initialization.
+        graphics_required = not headless or self.training_camera_enabled
+        self.graphics_device_id = self.sim_device_id if graphics_required else -1
 
         torch.manual_seed(int(self.cfg.seed))
         np.random.seed(int(self.cfg.seed))
@@ -282,6 +302,9 @@ class MotionImitationEnv:
         self.robot_asset = self._load_robot_asset()
         self._create_object_assets()
         self._create_envs()
+        self.training_camera_handle = None
+        if self.training_camera_enabled:
+            self._create_training_camera()
         self._resolve_observation_body_indices()
         self.gym.prepare_sim(self.sim)
         self.viewer = None
@@ -440,7 +463,13 @@ class MotionImitationEnv:
         return asset
 
     def _configure_robot_contact_properties(self, asset) -> None:
-        """Match the RSI viewer materials and reserve the table-filter bit."""
+        """Configure materials and external robot collision-filter bits.
+
+        Every UR5e body, including ``wrist_3_link``, is filtered against the
+        cube. With fixed joints collapsed, wrist_3 also owns the static DG5F
+        mount/palm shapes, so those are necessarily filtered with it. The
+        articulated ``rl_dg_*`` finger bodies remain able to contact the cube.
+        """
         body_names = tuple(self.gym.get_asset_rigid_body_names(asset))
         shape_ranges = self.gym.get_asset_rigid_body_shape_indices(asset)
         shape_properties = self.gym.get_asset_rigid_shape_properties(asset)
@@ -448,19 +477,45 @@ class MotionImitationEnv:
         used_bits = 0
         for properties in shape_properties:
             used_bits |= int(properties.filter)
-        filter_bit = 1
-        while used_bits & filter_bit:
-            filter_bit <<= 1
-        if filter_bit >= (1 << 31):
-            raise RuntimeError("No collision-filter bit remains for robot/table")
-        self.robot_table_collision_filter_bit = filter_bit
+        def allocate_filter_bit(label):
+            nonlocal used_bits
+            filter_bit = 1
+            while used_bits & filter_bit:
+                filter_bit <<= 1
+            if filter_bit >= (1 << 31):
+                raise RuntimeError(
+                    "No collision-filter bit remains for {}".format(label)
+                )
+            used_bits |= filter_bit
+            return filter_bit
 
-        for properties in shape_properties:
-            properties.friction = float(self.cfg.asset.friction)
-            properties.restitution = float(self.cfg.asset.restitution)
-            # Robot and table share this bit, while the cube has filter zero:
-            # robot-table is filtered, robot-cube remains enabled.
-            properties.filter |= filter_bit
+        self.robot_table_collision_filter_bit = allocate_filter_bit(
+            "robot/table"
+        )
+        self.arm_cube_collision_filter_bit = allocate_filter_bit("arm/cube")
+
+        arm_body_names = []
+        hand_body_names = []
+        for body_name, shape_range in zip(body_names, shape_ranges):
+            is_hand = body_name.startswith("rl_dg_")
+            (hand_body_names if is_hand else arm_body_names).append(body_name)
+            for shape_index in range(
+                shape_range.start, shape_range.start + shape_range.count
+            ):
+                properties = shape_properties[shape_index]
+                properties.friction = float(self.cfg.asset.friction)
+                properties.restitution = float(self.cfg.asset.restitution)
+                # Every robot shape filters the table. UR5e shapes share the
+                # cube bit; articulated DG5F finger shapes do not.
+                properties.filter |= self.robot_table_collision_filter_bit
+                if not is_hand:
+                    properties.filter |= self.arm_cube_collision_filter_bit
+        if not arm_body_names or not hand_body_names:
+            raise RuntimeError(
+                "Could not split robot collision bodies into arm and hand"
+            )
+        self.arm_collision_body_names = tuple(arm_body_names)
+        self.hand_collision_body_names = tuple(hand_body_names)
 
         fingertip_names = {
             "rl_dg_{}_4".format(finger) for finger in range(1, 6)
@@ -490,7 +545,9 @@ class MotionImitationEnv:
             raise RuntimeError("Isaac Gym failed to create the cuboid asset")
         cube_shapes = self.gym.get_asset_rigid_shape_properties(self.cube_asset)
         for properties in cube_shapes:
-            properties.filter = 0
+            # Shared only by UR5e shapes. The table and articulated fingers
+            # lack this bit, so cube-table and cube-finger contacts stay active.
+            properties.filter = self.arm_cube_collision_filter_bit
             properties.friction = float(self.cfg.object.friction)
             properties.restitution = float(self.cfg.object.restitution)
         self.gym.set_asset_rigid_shape_properties(self.cube_asset, cube_shapes)
@@ -775,6 +832,56 @@ class MotionImitationEnv:
         self.gym.viewer_camera_look_at(
             self.viewer, None, camera_position, camera_lookat
         )
+
+    def _create_training_camera(self) -> None:
+        """Create one off-screen sensor aimed at a real training environment."""
+        camera_properties = gymapi.CameraProperties()
+        camera_properties.width = self.training_camera_width
+        camera_properties.height = self.training_camera_height
+        camera_properties.enable_tensors = False
+        env = self.envs[self.training_camera_env_index]
+        handle = self.gym.create_camera_sensor(env, camera_properties)
+        if handle < 0:
+            raise RuntimeError("Isaac Gym failed to create the training camera")
+        origin = self.gym.get_env_origin(env)
+        position = gymapi.Vec3(
+            origin.x + float(self.cfg.viewer.camera_position[0]),
+            origin.y + float(self.cfg.viewer.camera_position[1]),
+            origin.z + float(self.cfg.viewer.camera_position[2]),
+        )
+        lookat = gymapi.Vec3(
+            origin.x + float(self.cfg.viewer.camera_lookat[0]),
+            origin.y + float(self.cfg.viewer.camera_lookat[1]),
+            origin.z + float(self.cfg.viewer.camera_lookat[2]),
+        )
+        self.gym.set_camera_location(handle, env, position, lookat)
+        self.training_camera_handle = handle
+
+    def capture_training_camera_frame(self) -> np.ndarray:
+        """Render and return one RGB frame from the selected training env."""
+        if not self.training_camera_enabled or self.training_camera_handle is None:
+            raise RuntimeError("Training-camera capture is not enabled")
+        self.gym.step_graphics(self.sim)
+        self.gym.render_all_camera_sensors(self.sim)
+        env = self.envs[self.training_camera_env_index]
+        color = self.gym.get_camera_image(
+            self.sim,
+            env,
+            self.training_camera_handle,
+            gymapi.IMAGE_COLOR,
+        )
+        rgba = np.asarray(color, dtype=np.uint8)
+        expected = self.training_camera_height * self.training_camera_width * 4
+        if rgba.size != expected:
+            raise RuntimeError(
+                "Camera returned {} values, expected {}".format(
+                    rgba.size, expected
+                )
+            )
+        rgba = rgba.reshape(
+            self.training_camera_height, self.training_camera_width, 4
+        )
+        return np.ascontiguousarray(rgba[:, :, :3])
 
     def viewer_closed(self) -> bool:
         return self.viewer is not None and self.gym.query_viewer_has_closed(

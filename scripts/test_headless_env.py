@@ -49,6 +49,11 @@ def parse_args():
         action="store_true",
         help="Use CPU PhysX and the CPU tensor pipeline.",
     )
+    parser.add_argument(
+        "--training-camera",
+        action="store_true",
+        help="Create the off-screen training camera and verify one RGB frame.",
+    )
     return parser.parse_args()
 
 
@@ -101,21 +106,44 @@ def assert_object_scene_contract(env):
     table_shapes = env.gym.get_actor_rigid_shape_properties(
         env.envs[0], env.table_handles[0]
     )
-    filter_bit = int(env.robot_table_collision_filter_bit)
-    if filter_bit <= 0:
+    table_filter_bit = int(env.robot_table_collision_filter_bit)
+    arm_cube_filter_bit = int(env.arm_cube_collision_filter_bit)
+    if table_filter_bit <= 0 or arm_cube_filter_bit <= 0:
         raise AssertionError("Robot/table collision filter bit is invalid")
-    if not all(int(shape.filter) & filter_bit for shape in robot_shapes):
+    if table_filter_bit == arm_cube_filter_bit:
+        raise AssertionError("Table and arm/cube filters share one bit")
+    if not all(int(shape.filter) & table_filter_bit for shape in robot_shapes):
         raise AssertionError("Not every robot shape filters the table")
-    if not all(int(shape.filter) & filter_bit for shape in table_shapes):
+    if not all(int(shape.filter) & table_filter_bit for shape in table_shapes):
         raise AssertionError("Table does not filter robot collisions")
-    if any(int(shape.filter) != 0 for shape in cube_shapes):
-        raise AssertionError("Cube filter must allow robot and table contacts")
-    if any(
-        int(robot.filter) & int(cube.filter)
-        for robot in robot_shapes
-        for cube in cube_shapes
-    ):
-        raise AssertionError("Robot-cube collisions are filtered")
+    if not all(int(shape.filter) & arm_cube_filter_bit for shape in cube_shapes):
+        raise AssertionError("Cube does not carry the arm collision-filter bit")
+
+    asset_body_names = tuple(
+        env.gym.get_asset_rigid_body_names(env.robot_asset)
+    )
+    asset_shape_ranges = env.gym.get_asset_rigid_body_shape_indices(
+        env.robot_asset
+    )
+    asset_shapes = env.gym.get_asset_rigid_shape_properties(env.robot_asset)
+    for body_name, shape_range in zip(asset_body_names, asset_shape_ranges):
+        shapes = asset_shapes[
+            shape_range.start:shape_range.start + shape_range.count
+        ]
+        if body_name in env.arm_collision_body_names:
+            if not all(int(shape.filter) & arm_cube_filter_bit for shape in shapes):
+                raise AssertionError(
+                    "Arm body {!r} still collides with the cube".format(body_name)
+                )
+        elif body_name in env.hand_collision_body_names:
+            if any(int(shape.filter) & arm_cube_filter_bit for shape in shapes):
+                raise AssertionError(
+                    "Hand body {!r} is filtered from the cube".format(body_name)
+                )
+        else:
+            raise AssertionError(
+                "Collision body {!r} belongs to neither group".format(body_name)
+            )
     if any(
         int(table.filter) & int(cube.filter)
         for table in table_shapes
@@ -764,6 +792,7 @@ def main():
         sim_device = "cpu"
         cfg.sim.use_gpu_pipeline = False
         cfg.sim.physx.use_gpu = False
+    cfg.viewer.training_camera_enabled = bool(args.training_camera)
 
     env = MotionImitationEnv(
         cfg,
@@ -774,6 +803,19 @@ def main():
     try:
         if args.rsi_index is not None:
             env.reset(reference_index=args.rsi_index)
+        if args.training_camera:
+            frame = env.capture_training_camera_frame()
+            expected_shape = (
+                int(cfg.viewer.training_camera_height),
+                int(cfg.viewer.training_camera_width),
+                3,
+            )
+            if frame.shape != expected_shape or frame.dtype != np.uint8:
+                raise AssertionError(
+                    "Training camera returned {} {}, expected {} uint8".format(
+                        frame.shape, frame.dtype, expected_shape
+                    )
+                )
 
         initial_indices = env.reference_index.clone()
         reset_q_error, reset_dq_error, reset_cube_error = (
