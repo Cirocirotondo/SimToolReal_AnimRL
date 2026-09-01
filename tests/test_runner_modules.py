@@ -277,8 +277,31 @@ class RunnerModulesTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             update_config_from_dict(restored, {"unknown": 1})
 
-    def test_pregrasp_rsi_mixture_respects_ranges_and_probability(self):
+    def test_default_rsi_is_uniform_over_the_reachable_range(self):
+        """Every start the cube survives is equally likely by default.
+
+        The skewed pre-grasp default left the approach at a few percent of
+        episode coverage, which teaches the grasp from an RSI reset but not
+        how to reach it from frame 0.
+        """
         settings = resolve_rsi_settings(self.env_cfg.env, 1107)
+        self.assertEqual(settings, ("uniform", 830, 740, 0.20))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(123)
+        indices = sample_rsi_indices(
+            100000, torch.device("cpu"), *settings, generator=generator
+        )
+        self.assertGreaterEqual(int(indices.min()), 0)
+        self.assertLessEqual(int(indices.max()), 830)
+        # 91 of the 831 reachable frames lie in the old pre-grasp window.
+        pregrasp_fraction = float((indices >= 740).float().mean())
+        self.assertAlmostEqual(pregrasp_fraction, 91.0 / 831.0, delta=0.01)
+
+    def test_pregrasp_rsi_mixture_respects_ranges_and_probability(self):
+        """The skewed sampler stays correct even though it is no longer default."""
+        env_cfg = SimToolRealCfg()
+        env_cfg.env.reference_init_distribution = "pregrasp_mixture"
+        settings = resolve_rsi_settings(env_cfg.env, 1107)
         self.assertEqual(settings, ("pregrasp_mixture", 830, 740, 0.20))
         generator = torch.Generator(device="cpu")
         generator.manual_seed(123)

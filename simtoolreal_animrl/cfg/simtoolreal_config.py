@@ -15,10 +15,16 @@ class SimToolRealCfg(BaseEnvCfg):
         num_observations = 114
         num_privileged_obs = None
         reference_state_initialization = True
-        # Avoid initializing a dynamic cube in the unstable post-grasp part of
-        # the demonstration. Twenty percent of resets preserve the approach;
-        # the rest focus on the pre-grasp window. Bounds are inclusive.
-        reference_init_distribution = "pregrasp_mixture"
+        # Uniform over every start the cube can survive. The 830 ceiling still
+        # keeps resets out of the unstable post-grasp part of the 1108-frame
+        # demonstration, but within it each frame is now equally likely. The
+        # pregrasp_mixture alternative put 80% of resets in [740, 830], making
+        # a pre-grasp frame 32x likelier than an approach frame and leaving the
+        # approach at 3-8% episode coverage: enough to learn the grasp from an
+        # RSI reset, not enough to reach it from frame 0 at deployment. The two
+        # fields below are read only by "pregrasp_mixture" and are kept so the
+        # skewed distribution can be restored without re-deriving its bounds.
+        reference_init_distribution = "uniform"
         rsi_early_probability = 0.20
         rsi_pregrasp_start_index = 740
         rsi_max_start_index = 830
