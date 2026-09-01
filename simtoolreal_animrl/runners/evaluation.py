@@ -121,6 +121,8 @@ class DeterministicEvaluator:
         hand_action_rate_reward_sum = torch.zeros_like(episode_steps)
         object_position_reward_sum = torch.zeros_like(episode_steps)
         object_orientation_reward_sum = torch.zeros_like(episode_steps)
+        fingertip_object_distance_reward_sum = torch.zeros_like(episode_steps)
+        fingertip_object_distance_sum = torch.zeros_like(episode_steps)
         object_position_error_sum = torch.zeros_like(episode_steps)
         object_orientation_error_sum = torch.zeros_like(episode_steps)
         fingertip_contact_reward_sum = torch.zeros_like(episode_steps)
@@ -132,6 +134,8 @@ class DeterministicEvaluator:
         rms_action_rate_sum = torch.zeros_like(episode_steps)
         rms_velocity_error_sum = torch.zeros_like(episode_steps)
         max_position_error = torch.zeros_like(episode_steps)
+        initial_object_com_height = self.env.cube_position[:, 2].clone()
+        peak_object_com_height = initial_object_com_height.clone()
         early = torch.zeros_like(active)
         timeout = torch.zeros_like(active)
         clipped_target_components = 0
@@ -184,6 +188,12 @@ class DeterministicEvaluator:
                 object_orientation_reward_sum += (
                     infos["object_orientation_reward"] * active_float
                 )
+                fingertip_object_distance_reward_sum += (
+                    infos["fingertip_object_distance_reward"] * active_float
+                )
+                fingertip_object_distance_sum += (
+                    infos["fingertip_object_distance_m"] * active_float
+                )
                 object_position_error_sum += (
                     infos["object_position_error_m"] * active_float
                 )
@@ -215,6 +225,14 @@ class DeterministicEvaluator:
                 max_position_error = torch.maximum(
                     max_position_error,
                     infos["max_abs_arm_position_error"] * active_float,
+                )
+                peak_object_com_height = torch.where(
+                    active,
+                    torch.maximum(
+                        peak_object_com_height,
+                        infos["object_com_height_m"],
+                    ),
+                    peak_object_com_height,
                 )
 
                 completed = dones & active
@@ -296,6 +314,12 @@ class DeterministicEvaluator:
             "mean_object_orientation_reward": float(
                 per_env_object_orientation_reward.mean()
             ),
+            "mean_fingertip_object_distance_reward": float(
+                (fingertip_object_distance_reward_sum / lengths).mean()
+            ),
+            "mean_fingertip_object_distance_m": float(
+                (fingertip_object_distance_sum / lengths).mean()
+            ),
             "mean_object_position_error_m": float(
                 (object_position_error_sum / lengths).mean()
             ),
@@ -317,6 +341,18 @@ class DeterministicEvaluator:
             ),
             "max_abs_hand_position_error": float(max_hand_position_error.max()),
             "max_abs_position_error": float(max_position_error.max()),
+            "mean_peak_object_com_height_m": float(
+                peak_object_com_height.mean()
+            ),
+            "max_peak_object_com_height_m": float(
+                peak_object_com_height.max()
+            ),
+            "mean_peak_object_com_lift_m": float(
+                (peak_object_com_height - initial_object_com_height).mean()
+            ),
+            "max_peak_object_com_lift_m": float(
+                (peak_object_com_height - initial_object_com_height).max()
+            ),
             "mean_episode_length": float(episode_steps.mean()),
             "early_termination_fraction": float(early.float().mean()),
             "timeout_fraction": float(timeout.float().mean()),

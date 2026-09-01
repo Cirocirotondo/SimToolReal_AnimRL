@@ -20,7 +20,7 @@ class SimToolRealCfg(BaseEnvCfg):
         # the rest focus on the pre-grasp window. Bounds are inclusive.
         reference_init_distribution = "pregrasp_mixture"
         rsi_early_probability = 0.20
-        rsi_pregrasp_start_index = 650
+        rsi_pregrasp_start_index = 740
         rsi_max_start_index = 830
 
     class asset:
@@ -54,7 +54,7 @@ class SimToolRealCfg(BaseEnvCfg):
 
     class table:
         size_m = [0.475, 0.4, 0.3]
-        surface_below_robot_base_m = 0.03
+        surface_below_robot_base_m = 0.035
         friction = 0.5
         restitution = 0.0
         color = [0.82, 0.56, 0.35]
@@ -121,7 +121,8 @@ class SimToolRealCfg(BaseEnvCfg):
         # Arm and hand keep separate Gaussian terms so neither dilutes the
         # other's gradient. The hand weights are 0.6x the arm's, which is what
         # the handmult_0.6 run is named after. Robot terms sum to 1.92 and the
-        # object pose terms add 1.0, for a maximum per-step reward of 2.92.
+        # object pose terms add 1.0. Proximity adds at most 0.2 from frame 740,
+        # for a maximum per-step reward of 3.12 while contact shaping is off.
         position_arm_weight = 0.8
         velocity_arm_weight = 0.2
         action_rate_arm_weight = 0.2
@@ -144,6 +145,13 @@ class SimToolRealCfg(BaseEnvCfg):
         object_orientation_weight = 0.2
         object_position_std_m = 0.05
         object_orientation_std_rad = 0.5
+
+        # Dense grasp shaping for thumb, index and middle fingertips. It uses
+        # exact distance to the oriented cuboid surface and is gated off until
+        # the reference reaches env.rsi_pregrasp_start_index.
+        fingertip_object_distance_weight = 0.2
+        fingertip_object_distance_std_m = 0.04
+        fingertip_object_distance_names = ["thumb", "index", "middle"]
 
     class termination:
         enabled = True

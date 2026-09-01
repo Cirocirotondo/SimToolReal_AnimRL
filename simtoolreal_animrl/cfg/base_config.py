@@ -130,7 +130,7 @@ class BaseTrainCfg(ABCConfig):
         # action target) so the guard only fires on a policy that is already
         # unrecoverable, rather than on transient early exploration.
         abort_on_divergence = True
-        abort_action_std = 20.0
+        abort_action_std = 15.0
         abort_action_target_clipped_fraction = 0.8
         # Consecutive iterations above a threshold before aborting. The metrics
         # average ~98k samples per iteration and are very smooth, so this is

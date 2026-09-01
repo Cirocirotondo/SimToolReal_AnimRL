@@ -19,7 +19,7 @@ class ConfigAndDemoTest(unittest.TestCase):
             env_cfg.env.reference_init_distribution, "pregrasp_mixture"
         )
         self.assertEqual(env_cfg.env.rsi_early_probability, 0.20)
-        self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 650)
+        self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 740)
         self.assertEqual(env_cfg.env.rsi_max_start_index, 830)
         self.assertEqual(
             env_cfg.control.action_parameterization, "animrl_residual"
@@ -39,12 +39,22 @@ class ConfigAndDemoTest(unittest.TestCase):
         # disabled.
         self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
         self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.2)
+        self.assertEqual(
+            env_cfg.rewards.fingertip_object_distance_weight, 0.2
+        )
+        self.assertEqual(
+            env_cfg.rewards.fingertip_object_distance_std_m, 0.04
+        )
+        self.assertEqual(
+            env_cfg.rewards.fingertip_object_distance_names,
+            ["thumb", "index", "middle"],
+        )
         self.assertFalse(env_cfg.contact.enabled)
         self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
         self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
         self.assertTrue(env_cfg.termination.object_position_enabled)
         self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.05)
-        self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.03)
+        self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.035)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)
         self.assertEqual(train_cfg.algorithm.learning_rate, 1.0e-4)

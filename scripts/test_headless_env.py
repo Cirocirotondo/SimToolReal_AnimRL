@@ -252,6 +252,24 @@ def assert_reward_contract(env):
     import torch
 
     metrics = env._compute_reward_and_errors()
+    if not bool(
+        torch.allclose(
+            metrics["object_com_height_m"],
+            env.cube_position[:, 2],
+            rtol=0.0,
+            atol=0.0,
+        )
+    ):
+        raise AssertionError("Cube COM height is not the cube root world z")
+    expected_lift = (
+        env.cube_position[:, 2] - env.episode_initial_object_com_height_m
+    )
+    if not bool(
+        torch.allclose(
+            metrics["object_com_lift_m"], expected_lift, rtol=0.0, atol=0.0
+        )
+    ):
+        raise AssertionError("Cube COM lift is not relative to the RSI reset height")
     if metrics["q_error"].shape != (env.num_envs, 6):
         raise AssertionError("Position reward is not restricted to the arm")
     if metrics["dq_error"].shape != (env.num_envs, 6):
@@ -264,6 +282,25 @@ def assert_reward_contract(env):
         raise AssertionError("Object position error has an unexpected shape")
     if metrics["object_orientation_error_rad"].shape != (env.num_envs,):
         raise AssertionError("Object orientation error has an unexpected shape")
+    if metrics["fingertip_object_distance_reward"].shape != (env.num_envs,):
+        raise AssertionError("Fingertip-distance reward has an unexpected shape")
+    proximity_active = env.reference_index >= env.rsi_pregrasp_start_index
+    if not bool(
+        (
+            (metrics["fingertip_object_distance_reward"] >= 0.0)
+            & (metrics["fingertip_object_distance_reward"] <= 1.0)
+            & (metrics["fingertip_object_distance_m"] >= 0.0)
+        ).all()
+    ):
+        raise AssertionError("Fingertip-distance diagnostics are outside their bounds")
+    if bool(
+        (metrics["fingertip_object_distance_reward"][~proximity_active] != 0.0).any()
+    ):
+        raise AssertionError("Fingertip-distance reward activated before pre-grasp")
+    if bool(proximity_active.any()) and bool(
+        (metrics["fingertip_object_distance_reward"][proximity_active] <= 0.0).any()
+    ):
+        raise AssertionError("Fingertip-distance reward stayed off during pre-grasp")
     if metrics["fingertip_contact_reward"].shape != (env.num_envs,):
         raise AssertionError("Fingertip-contact reward has an unexpected shape")
     expected_max_contacts = float(len(env.contact_fingertip_names))
@@ -297,6 +334,8 @@ def assert_reward_contract(env):
         + float(r.object_position_weight) * metrics["object_position_reward"]
         + float(r.object_orientation_weight)
         * metrics["object_orientation_reward"]
+        + float(r.fingertip_object_distance_weight)
+        * metrics["fingertip_object_distance_reward"]
         + float(env.contact_reward_per_finger)
         * metrics["fingertip_contact_reward"]
     )
@@ -357,6 +396,10 @@ def assert_ppo_step_contract(env, obs, critic_obs, rewards, dones, extras):
             "horizon_fraction",
             "reference_end_fraction",
             "completed_episodes",
+            "mean_peak_object_com_height_m",
+            "max_peak_object_com_height_m",
+            "mean_peak_object_com_lift_m",
+            "max_peak_object_com_lift_m",
         )
         for name in required_episode_keys:
             value = episode.get(name)
@@ -417,6 +460,7 @@ def run_ideal_episode(env, initial_indices):
             + float(r.action_rate_hand_weight)
             + float(r.object_position_weight)
             + float(r.object_orientation_weight)
+            + float(r.fingertip_object_distance_weight)
         )
         if bool((rewards < -1e-7).any()) or bool(
             (rewards > reward_upper_bound + 1e-6).any()
