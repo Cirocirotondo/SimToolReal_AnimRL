@@ -465,10 +465,14 @@ class MotionImitationEnv:
     def _configure_robot_contact_properties(self, asset) -> None:
         """Configure materials and external robot collision-filter bits.
 
-        Every UR5e body, including ``wrist_3_link``, is filtered against the
-        cube. With fixed joints collapsed, wrist_3 also owns the static DG5F
-        mount/palm shapes, so those are necessarily filtered with it. The
-        articulated ``rl_dg_*`` finger bodies remain able to contact the cube.
+        The UR5e arm up to ``wrist_2_link`` is filtered against the cube, while
+        the whole hand assembly can contact it. With fixed joints collapsed the
+        static DG5F mount/base/palm shapes belong to ``wrist_3_link``, so that
+        body is grouped with the articulated ``rl_dg_*`` fingers: filtering it
+        out would leave the palm unable to support a grasp. Its own wrist mesh
+        rides along, which is physically right and practically irrelevant --
+        that mesh sits ~0.099 m behind the flange while the palm is ~0.074 m in
+        front of it, so the cube reaches one and not the other.
         """
         body_names = tuple(self.gym.get_asset_rigid_body_names(asset))
         shape_ranges = self.gym.get_asset_rigid_body_shape_indices(asset)
@@ -497,7 +501,7 @@ class MotionImitationEnv:
         arm_body_names = []
         hand_body_names = []
         for body_name, shape_range in zip(body_names, shape_ranges):
-            is_hand = body_name.startswith("rl_dg_")
+            is_hand = body_name.startswith("rl_dg_") or body_name == "wrist_3_link"
             (hand_body_names if is_hand else arm_body_names).append(body_name)
             for shape_index in range(
                 shape_range.start, shape_range.start + shape_range.count
@@ -505,8 +509,9 @@ class MotionImitationEnv:
                 properties = shape_properties[shape_index]
                 properties.friction = float(self.cfg.asset.friction)
                 properties.restitution = float(self.cfg.asset.restitution)
-                # Every robot shape filters the table. UR5e shapes share the
-                # cube bit; articulated DG5F finger shapes do not.
+                # Every robot shape filters the table. Arm shapes share the
+                # cube bit; hand-assembly shapes (wrist 3 and the articulated
+                # DG5F fingers) do not.
                 properties.filter |= self.robot_table_collision_filter_bit
                 if not is_hand:
                     properties.filter |= self.arm_cube_collision_filter_bit
