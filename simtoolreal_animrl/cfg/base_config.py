@@ -70,6 +70,10 @@ class BaseEnvCfg(ABCConfig):
         enable_viewer = False
         camera_position = [-1.8,-2.0, 1.5] # [1.8, 2.0, 1.5]
         camera_lookat = [0.0, 0.6, 0.75]
+        training_camera_enabled = False
+        training_camera_env_index = 0
+        training_camera_width = 640
+        training_camera_height = 480
         # Second, collision-free actor per environment that replays the
         # demonstration kinematically as a side-by-side visual benchmark.
         # It doubles the simulated bodies, so it stays off for training.
@@ -110,7 +114,16 @@ class BaseTrainCfg(ABCConfig):
         max_iterations = 3000
         normalize_observation = True
         save_interval = 100
-        record_gif = True
+        # Opt-in: keeping this false preserves graphics_device_id=-1 and the
+        # existing no-graphics server path. A recording spans multiple PPO
+        # rollouts until it has collected duration * fps control frames.
+        record_video = False
+        record_video_interval = 500
+        record_video_duration_s = 10.0
+        record_video_fps = 60
+        # Retained only so config.json files written before MP4 recording was
+        # introduced still deserialize; these legacy fields are ignored.
+        record_gif = False
         record_gif_interval = 100
         record_iters = 10
         experiment_name = "simtoolreal"

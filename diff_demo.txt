@@ -1,0 +1,6 @@
+Diff demo file
+==============
+
+Line one stays the same.
+Line two will be changed.
+Line three stays the same.

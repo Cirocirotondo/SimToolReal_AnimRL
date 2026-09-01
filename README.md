@@ -59,31 +59,33 @@ condition while retaining the arm and hand early terminations.
 The 114D network input is checkpoint-incompatible with the earlier 79D policy.
 Those checkpoints must not be resumed for this object-training family.
 
-### Object-reward curriculum
+### Object-reward hyperparameter sweep
 
-`scripts/run_object_reward_curriculum.py` runs two sequential curricula with
-the contact reward disabled. For each chain it multiplies all current
-object-related reward weights (position, orientation, and fingertip proximity)
-by `0.1, 0.2, ..., 1.0`. The `warm` chain initializes its first actor and
-observation normalizers from the known-good no-object `model_7500.pt`, while
-starting a fresh critic and optimizer. The `scratch` chain starts with random
-networks. Every later stage fully resumes the final numeric checkpoint of the
-preceding stage. A failure or divergence stops that chain so a damaged policy
-cannot feed the next stage; the other chain is still attempted. The generated
-`curriculum.json` records commands, weights, checkpoints, and outcomes.
+`scripts/run_object_reward_sweep.py` runs independent experiments with the
+contact reward disabled. It multiplies all current object-related reward
+weights (position, orientation, and fingertip proximity) by
+`0.1, 0.2, ..., 1.0`. Every `warm` experiment starts directly from the same
+known-good no-object `model_7500.pt`; experiments never load checkpoints from
+other scales. With the default policy warm start, only the actor and observation
+normalizers are loaded, while the critic and optimizer start fresh. Every
+`scratch` experiment starts with new random networks. A failed or diverged run
+is recorded but does not stop or initialize any of the remaining experiments.
+The generated `sweep.json` records commands, weights, checkpoints, and outcomes.
 
-Run both chains, with 1000 PPO updates at each of the ten scales:
+Run both initialization variants, with 1000 PPO updates at each of the ten
+scales:
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_object_reward_curriculum.py
+/home/simone/.venv/bin/python scripts/run_object_reward_sweep.py
 ```
 
-Use `--dry-run` to inspect every command without starting Isaac Gym. The stage
-length, scale list, branches, environment count, seed, devices, and output root
-are command-line options of the curriculum launcher; run it with `--help` for
-the complete list. Pass `--warm-start-mode full` when the first warm stage must
-resume actor, critic, optimizer, normalizers, and counters from the source
-checkpoint rather than performing the default policy-only initialization.
+Use `--dry-run` to inspect every command without starting Isaac Gym. The run
+length, scale list, initialization variants, environment count, seed, devices,
+and output root are command-line options of the sweep launcher; run it with
+`--help` for the complete list. Pass `--warm-start-mode full` when every warm
+experiment must independently resume actor, critic, optimizer, normalizers,
+and counters from the source checkpoint rather than performing the default
+policy-only initialization.
 
 Episodes last up to 300 control steps. Automatic RSI uses a configurable
 mixture: 20% of resets sample the early approach (`0..739`) and 80% sample the
@@ -166,6 +168,12 @@ The environment follows AnimRL's five-value vectorized step contract:
 observations, privileged_observations, rewards, dones, infos = env.step(actions)
 ```
 
+External collision filtering keeps robot-table and UR5e-arm-to-cube contacts
+disabled, including `wrist_3_link`. Cube contacts remain enabled for the
+articulated DG5F finger bodies and for the table. Because fixed joints are
+collapsed, the static DG5F mount/palm collision shapes belong to wrist 3 and
+are filtered from the cube with it.
+
 `infos["time_outs"]` is true for the configured horizon and for the end of the
 reference motion, allowing PPO to bootstrap those transitions. It stays false
 for imitation early termination. When one or more environments finish,
@@ -246,9 +254,23 @@ AnimRL-compatible models. Follow a running experiment locally with:
 TensorBoard records reward components, actor/critic losses, policy standard
 deviation, action clipping, arm tracking errors, termination fractions, and
 throughput, plus fingertip contact count/fraction/force when enabled and
-periodic deterministic evaluation. W&B and video capture remain deliberately
-deferred. The data is visible here:
+periodic deterministic evaluation. The data is visible here:
 `http://localhost:6006`
+
+Training video is opt-in because an off-screen Isaac Gym camera still requires
+a graphics-capable device. Add `--record-video` to `train.py` or to the object
+reward sweep launcher to point a 640x480 camera at environment 0. Every 500 PPO
+iterations it records 600 consecutive control frames (10 seconds at 60 Hz),
+spanning 25 standard 24-step rollouts, into
+`videos/training_env_00_iteration_<n>.mp4`. This is the actual stochastic
+training environment: natural early resets may therefore appear in the video.
+TensorBoard's `Video/training_environment` text series records the saved path.
+
+Video is disabled by default. `--no-record-video` explicitly forces the
+original compute-only headless path with `graphics_device_id=-1`, so servers
+without display/graphics support do not initialize a graphics context.
+The optional encoder dependencies can be installed with
+`pip install -e '.[video]'`; they are imported only when recording starts.
 
 Periodic evaluation runs in a separate headless environment every 100 PPO
 updates by default. It evaluates the deterministic policy mean on both fixed

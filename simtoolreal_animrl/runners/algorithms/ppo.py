@@ -35,6 +35,45 @@ class PPO:
                 flush_secs=int(self.cfg.tensorboard_flush_secs),
             )
 
+        self.record_video = bool(getattr(self.cfg, "record_video", False))
+        self.record_video_interval = int(
+            getattr(self.cfg, "record_video_interval", 500)
+        )
+        self.record_video_duration_s = float(
+            getattr(self.cfg, "record_video_duration_s", 10.0)
+        )
+        self.record_video_fps = int(getattr(self.cfg, "record_video_fps", 60))
+        self._video_writer = None
+        self._video_path = None
+        self._video_start_iteration = None
+        self._video_frames_written = 0
+        if self.record_video:
+            if self.record_video_interval <= 0:
+                raise ValueError("runner.record_video_interval must be positive")
+            if self.record_video_duration_s <= 0.0:
+                raise ValueError("runner.record_video_duration_s must be positive")
+            if self.record_video_fps <= 0:
+                raise ValueError("runner.record_video_fps must be positive")
+            if not bool(getattr(self.env, "training_camera_enabled", False)):
+                raise ValueError(
+                    "Video recording requires viewer.training_camera_enabled"
+                )
+            simulation_fps = 1.0 / float(self.env.dt)
+            if not math.isclose(
+                simulation_fps,
+                float(self.record_video_fps),
+                rel_tol=0.0,
+                abs_tol=1.0e-6,
+            ):
+                raise ValueError(
+                    "Video fps {} does not match control frequency {:.6f}".format(
+                        self.record_video_fps, simulation_fps
+                    )
+                )
+        self._video_target_frames = int(
+            round(self.record_video_duration_s * self.record_video_fps)
+        )
+
         num_actor_obs = self.env.num_obs
         num_critic_obs = (
             self.env.num_privileged_obs
@@ -160,6 +199,7 @@ class PPO:
                     dones,
                     infos,
                 ) = self.env.step(actions)
+                self._capture_training_video_frame()
 
                 self.process_env_step(
                     actor_observations,
@@ -515,6 +555,7 @@ class PPO:
         end_iteration = start_iteration + num_iterations
         for iteration in range(start_iteration, end_iteration):
             iteration_start = time.perf_counter()
+            self._maybe_start_training_video(iteration, checkpoint_dir)
             collection_start = iteration_start
             rollout = self.collect_rollout()
             collection_time = time.perf_counter() - collection_start
@@ -695,6 +736,93 @@ class PPO:
                     value,
                     iteration,
                 )
+
+    def _maybe_start_training_video(self, iteration, checkpoint_dir):
+        if (
+            not self.record_video
+            or self._video_writer is not None
+            or checkpoint_dir is None
+            or int(iteration) <= 0
+            or int(iteration) % self.record_video_interval != 0
+        ):
+            return
+        try:
+            import imageio.v2 as imageio
+            import imageio_ffmpeg
+
+            imageio_ffmpeg.get_ffmpeg_exe()
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError(
+                "Training-video recording requires imageio and ffmpeg"
+            ) from error
+
+        video_dir = Path(checkpoint_dir) / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        self._video_start_iteration = int(iteration)
+        self._video_path = video_dir / (
+            "training_env_{:02d}_iteration_{:06d}.mp4".format(
+                int(self.env.training_camera_env_index), int(iteration)
+            )
+        )
+        self._video_writer = imageio.get_writer(
+            str(self._video_path),
+            format="FFMPEG",
+            mode="I",
+            fps=self.record_video_fps,
+            codec="libx264",
+            quality=8,
+            macro_block_size=None,
+        )
+        self._video_frames_written = 0
+        print(
+            "Recording training environment {} for {:.1f} s ({} frames) "
+            "to {}".format(
+                self.env.training_camera_env_index,
+                self.record_video_duration_s,
+                self._video_target_frames,
+                self._video_path,
+            )
+        )
+
+    def _capture_training_video_frame(self):
+        if self._video_writer is None:
+            return
+        frame = self.env.capture_training_camera_frame()
+        self._video_writer.append_data(frame)
+        self._video_frames_written += 1
+        if self._video_frames_written >= self._video_target_frames:
+            self._finish_training_video(partial=False)
+
+    def _finish_training_video(self, partial):
+        if self._video_writer is None:
+            return
+        writer = self._video_writer
+        self._video_writer = None
+        writer.close()
+        duration_s = self._video_frames_written / float(self.record_video_fps)
+        status = "partial" if partial else "complete"
+        print(
+            "Training video {}: {} ({:.2f} s, {} frames)".format(
+                status,
+                self._video_path,
+                duration_s,
+                self._video_frames_written,
+            )
+        )
+        if self.writer is not None and self._video_start_iteration is not None:
+            self.writer.add_text(
+                "Video/training_environment",
+                "[{}]({}) — {}, {:.2f} s".format(
+                    self._video_path.name,
+                    self._video_path,
+                    status,
+                    duration_s,
+                ),
+                self._video_start_iteration,
+            )
+        self._video_path = None
+        self._video_start_iteration = None
+        self._video_frames_written = 0
 
     def _divergence_reason(self, stats):
         """Name the divergence this iteration shows, or None if it is healthy.
@@ -921,6 +1049,7 @@ class PPO:
             self.critic_obs_normalizer.eval()
 
     def close(self):
+        self._finish_training_video(partial=True)
         if self.writer is not None:
             self.writer.flush()
             self.writer.close()

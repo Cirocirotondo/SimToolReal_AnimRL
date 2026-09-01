@@ -46,7 +46,7 @@ def main():
     args = parse_args()
     env_cfg = SimToolRealCfg()
     train_cfg = SimToolRealTrainCfg()
-    train_cfg.runner.record_gif = False
+    train_cfg.runner.record_video = False
     train_cfg.runner.wandb = False
 
     env = MotionImitationEnv(

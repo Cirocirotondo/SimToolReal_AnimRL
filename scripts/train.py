@@ -86,6 +86,23 @@ def parse_args():
         action="store_true",
         help="Disable the deterministic fixed/configured-RSI evaluation.",
     )
+    video_group = parser.add_mutually_exclusive_group()
+    video_group.add_argument(
+        "--record-video",
+        dest="record_video",
+        action="store_true",
+        default=None,
+        help=(
+            "Record the configured training environment every 500 PPO "
+            "iterations; requires an Isaac Gym graphics-capable device."
+        ),
+    )
+    video_group.add_argument(
+        "--no-record-video",
+        dest="record_video",
+        action="store_false",
+        help="Force the compute-only headless path with no graphics context.",
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument(
         "--no-final-eval",
@@ -276,6 +293,8 @@ def main():
         train_cfg.runner.run_name = args.run_name
     if args.no_periodic_eval:
         train_cfg.runner.evaluation_enabled = False
+    if args.record_video is not None:
+        train_cfg.runner.record_video = bool(args.record_video)
     if args.eval_interval is not None:
         if args.eval_interval <= 0:
             raise ValueError("--eval-interval must be positive")
@@ -290,6 +309,12 @@ def main():
     applied_overrides = apply_overrides(env_cfg, train_cfg, args.overrides)
     for path, value in applied_overrides.items():
         print("Override: {} = {!r}".format(path, value))
+    # Camera construction is an environment concern, while cadence and video
+    # encoding belong to the runner. Mirror the final (possibly overridden)
+    # runner switch before saving config.json and constructing the simulation.
+    env_cfg.viewer.training_camera_enabled = bool(
+        train_cfg.runner.record_video
+    )
 
     num_iterations = (
         int(args.iterations)

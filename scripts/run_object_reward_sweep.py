@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run sequential object-reward curricula from a good policy and from scratch."""
+"""Run independent object-reward hyperparameter experiments."""
 
 import argparse
 import json
@@ -29,40 +29,50 @@ def parse_args():
         "--checkpoint",
         type=Path,
         default=DEFAULT_CHECKPOINT,
-        help="Good no-object policy used to initialize the warm-start chain.",
+        help="Checkpoint used independently by every warm-start experiment.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
         default=None,
-        help="Fresh parent directory for every stage of both chains.",
+        help="Fresh parent directory for all independent experiments.",
     )
     parser.add_argument(
+        "--iterations-per-run",
         "--iterations-per-stage",
+        dest="iterations_per_run",
         type=int,
         default=1000,
-        help="PPO updates at each reward scale (default: 1000).",
+        help=(
+            "PPO updates in each independent experiment (default: 1000). "
+            "--iterations-per-stage is retained as a compatibility alias."
+        ),
     )
     parser.add_argument(
         "--scales",
         type=Decimal,
         nargs="+",
         default=DEFAULT_SCALES,
-        help="Ordered object-reward multipliers (default: 0.1 through 1.0).",
+        help="Object-reward multipliers to test (default: 0.1 through 1.0).",
     )
     parser.add_argument(
+        "--initializations",
         "--branches",
+        dest="initializations",
         choices=("warm", "scratch"),
         nargs="+",
         default=("warm", "scratch"),
-        help="Curriculum chains to execute, in the given order.",
+        help=(
+            "Independent initialization variants to test. --branches is "
+            "retained as a compatibility alias."
+        ),
     )
     parser.add_argument(
         "--warm-start-mode",
         choices=("policy", "full"),
         default="policy",
         help=(
-            "How the first warm stage loads --checkpoint: 'policy' keeps only "
+            "How every warm experiment loads --checkpoint: 'policy' keeps only "
             "the actor and normalizers; 'full' resumes actor, critic, optimizer, "
             "normalizers, and counters (default: policy)."
         ),
@@ -75,7 +85,21 @@ def parse_args():
     parser.add_argument(
         "--no-periodic-eval",
         action="store_true",
-        help="Disable periodic evaluation in every stage.",
+        help="Disable periodic evaluation in every experiment.",
+    )
+    video_group = parser.add_mutually_exclusive_group()
+    video_group.add_argument(
+        "--record-video",
+        dest="record_video",
+        action="store_true",
+        default=None,
+        help="Record one real training environment in every sweep run.",
+    )
+    video_group.add_argument(
+        "--no-record-video",
+        dest="record_video",
+        action="store_false",
+        help="Force every experiment to run without a graphics context.",
     )
     parser.add_argument(
         "--dry-run",
@@ -121,7 +145,7 @@ def build_command(args, run_dir, weights, checkpoint, initialize):
         "--log-dir",
         str(run_dir),
         "--iterations",
-        str(args.iterations_per_stage),
+        str(args.iterations_per_run),
         "--sim-device",
         args.sim_device,
         "--set",
@@ -149,107 +173,118 @@ def build_command(args, run_dir, weights, checkpoint, initialize):
         command.extend(["--save-interval", str(args.save_interval)])
     if args.no_periodic_eval:
         command.append("--no-periodic-eval")
+    if args.record_video is not None:
+        command.append(
+            "--record-video" if args.record_video else "--no-record-video"
+        )
     return command
 
 
-def run_branch(args, output_root, branch, scales, base_weights, manifest):
-    previous_checkpoint = (
-        args.checkpoint.expanduser().resolve() if branch == "warm" else None
+def run_initialization(
+    args, output_root, initialization, scales, base_weights, manifest
+):
+    source_checkpoint = (
+        args.checkpoint.expanduser().resolve()
+        if initialization == "warm"
+        else None
     )
-    branch_failed = False
-    for stage_number, scale in enumerate(scales, start=1):
+    all_succeeded = True
+    for run_number, scale in enumerate(scales, start=1):
         weights = {
             name: decimal_text(value * scale)
             for name, value in base_weights.items()
         }
-        run_dir = output_root / branch / "stage_{:02d}_scale_{}".format(
-            stage_number, scale_label(scale)
+        run_dir = output_root / initialization / "run_{:02d}_scale_{}".format(
+            run_number, scale_label(scale)
         )
         initialize = (
-            branch == "warm"
-            and stage_number == 1
+            initialization == "warm"
             and args.warm_start_mode == "policy"
         )
         command = build_command(
-            args, run_dir, weights, previous_checkpoint, initialize
+            args, run_dir, weights, source_checkpoint, initialize
         )
-        stage = {
-            "branch": branch,
-            "stage": stage_number,
+        experiment = {
+            "initialization": initialization,
+            "run": run_number,
             "scale": decimal_text(scale),
             "weights": weights,
-            "initialization": (
+            "checkpoint_loading": (
                 "policy_and_normalizers"
                 if initialize
-                else "full_resume" if previous_checkpoint else "random"
+                else "full_resume" if source_checkpoint else "random"
             ),
             "input_checkpoint": (
-                str(previous_checkpoint) if previous_checkpoint else None
+                str(source_checkpoint) if source_checkpoint else None
             ),
             "run_dir": str(run_dir),
             "command": command,
             "status": "planned" if args.dry_run else "running",
         }
-        manifest["stages"].append(stage)
+        manifest["experiments"].append(experiment)
 
-        print("\n[{} {}/{}] object reward x{}".format(
-            branch, stage_number, len(scales), scale
+        print("\n[{} {}/{}] independent object reward x{}".format(
+            initialization, run_number, len(scales), scale
         ))
         print(" ".join(command))
         if args.dry_run:
-            # Use the path that a real preceding stage would eventually emit
-            # only as a readable placeholder for subsequent dry-run commands.
-            previous_checkpoint = run_dir / "model_<final_iteration>.pt"
             continue
 
         run_dir.parent.mkdir(parents=True, exist_ok=True)
         if run_dir.exists():
-            stage["status"] = "failed"
-            stage["error"] = "run directory already exists"
-            branch_failed = True
-            write_manifest(output_root / "curriculum.json", manifest)
-            break
+            experiment["status"] = "failed"
+            experiment["error"] = "run directory already exists"
+            all_succeeded = False
+            write_manifest(output_root / "sweep.json", manifest)
+            continue
 
-        write_manifest(output_root / "curriculum.json", manifest)
+        write_manifest(output_root / "sweep.json", manifest)
         completed = subprocess.run(command)
         if completed.returncode != 0:
-            stage["status"] = "failed"
-            stage["returncode"] = completed.returncode
-            branch_failed = True
+            experiment["status"] = "failed"
+            experiment["returncode"] = completed.returncode
+            all_succeeded = False
         elif (run_dir / "diverged_model.pt").is_file():
-            stage["status"] = "diverged"
-            branch_failed = True
+            experiment["status"] = "diverged"
+            experiment["diverged_checkpoint"] = str(
+                (run_dir / "diverged_model.pt").resolve()
+            )
+            all_succeeded = False
         else:
             checkpoints = numeric_checkpoints(run_dir)
             if checkpoints:
-                previous_checkpoint = checkpoints[-1][1].resolve()
-                stage["status"] = "completed"
-                stage["output_checkpoint"] = str(previous_checkpoint)
+                output_checkpoint = checkpoints[-1][1].resolve()
+                experiment["status"] = "completed"
+                experiment["output_checkpoint"] = str(output_checkpoint)
             else:
-                stage["status"] = "failed"
-                stage["error"] = "training produced no numeric checkpoint"
-                branch_failed = True
-        write_manifest(output_root / "curriculum.json", manifest)
-        if branch_failed:
+                experiment["status"] = "failed"
+                experiment["error"] = "training produced no numeric checkpoint"
+                all_succeeded = False
+        write_manifest(output_root / "sweep.json", manifest)
+        if experiment["status"] != "completed":
             print(
-                "Stopping the {} chain: a failed/diverged stage must not feed "
-                "the next reward scale.".format(branch),
+                "The {} x{} experiment {}. Continuing the independent "
+                "sweep.".format(
+                    initialization, scale, experiment["status"]
+                ),
                 file=sys.stderr,
             )
-            break
-    return not branch_failed
+    return all_succeeded
 
 
 def main():
     args = parse_args()
-    if args.iterations_per_stage <= 0:
-        raise ValueError("--iterations-per-stage must be positive")
+    if args.iterations_per_run <= 0:
+        raise ValueError("--iterations-per-run must be positive")
     scales = tuple(args.scales)
     if not scales or any(scale <= 0 for scale in scales):
         raise ValueError("--scales must contain only positive values")
-    if any(current <= previous for previous, current in zip(scales, scales[1:])):
-        raise ValueError("--scales must be strictly increasing")
-    if "warm" in args.branches and not args.checkpoint.expanduser().is_file():
+    if len(set(scales)) != len(scales):
+        raise ValueError("--scales must not contain duplicates")
+    if (
+        "warm" in args.initializations
+        and not args.checkpoint.expanduser().is_file()
+    ):
         raise FileNotFoundError(args.checkpoint.expanduser())
 
     cfg = SimToolRealCfg()
@@ -266,16 +301,17 @@ def main():
         if args.output_root is not None
         else REPO_ROOT
         / "logs/simtoolreal"
-        / "{}_object_reward_curriculum".format(timestamp)
+        / "{}_object_reward_sweep".format(timestamp)
     )
     manifest = {
         "base_object_reward_weights": {
             name: decimal_text(value) for name, value in base_weights.items()
         },
         "contact_reward_enabled": False,
-        "iterations_per_stage": args.iterations_per_stage,
+        "iterations_per_run": args.iterations_per_run,
+        "independent_experiments": True,
         "output_root": str(output_root),
-        "stages": [],
+        "experiments": [],
     }
 
     print("Output root: {}".format(output_root))
@@ -288,16 +324,21 @@ def main():
                 )
             )
         output_root.mkdir(parents=True)
-        write_manifest(output_root / "curriculum.json", manifest)
+        write_manifest(output_root / "sweep.json", manifest)
 
     all_succeeded = True
-    for branch in args.branches:
-        succeeded = run_branch(
-            args, output_root, branch, scales, base_weights, manifest
+    for initialization in args.initializations:
+        succeeded = run_initialization(
+            args,
+            output_root,
+            initialization,
+            scales,
+            base_weights,
+            manifest,
         )
         all_succeeded = all_succeeded and succeeded
     if not args.dry_run:
-        write_manifest(output_root / "curriculum.json", manifest)
+        write_manifest(output_root / "sweep.json", manifest)
     if not all_succeeded:
         raise SystemExit(1)
 
