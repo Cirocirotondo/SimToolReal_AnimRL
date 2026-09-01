@@ -15,9 +15,7 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.env.episode_length, 300)
         self.assertEqual(env_cfg.env.num_observations, 114)
         self.assertEqual(env_cfg.env.num_actions, 26)
-        self.assertEqual(
-            env_cfg.env.reference_init_distribution, "pregrasp_mixture"
-        )
+        self.assertEqual(env_cfg.env.reference_init_distribution, "uniform")
         self.assertEqual(env_cfg.env.rsi_early_probability, 0.20)
         self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 740)
         self.assertEqual(env_cfg.env.rsi_max_start_index, 830)

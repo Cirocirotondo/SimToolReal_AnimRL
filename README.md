@@ -87,13 +87,17 @@ experiment must independently resume actor, critic, optimizer, normalizers,
 and counters from the source checkpoint rather than performing the default
 policy-only initialization.
 
-Episodes last up to 300 control steps. Automatic RSI uses a configurable
-mixture: 20% of resets sample the early approach (`0..739`) and 80% sample the
-pre-grasp window (`740..830`). No automatic training or periodic-evaluation
-reset starts after frame 830; successful policies can still reach the final
-frame 1107 by continuing the episode. The relevant parameters are
-`env.rsi_early_probability`, `env.rsi_pregrasp_start_index`, and
-`env.rsi_max_start_index`.
+Episodes last up to 300 control steps. Automatic RSI is uniform over
+`0..830`, so every reachable start frame is equally likely. No automatic
+training or periodic-evaluation reset starts after frame 830; successful
+policies can still reach the final frame 1107 by continuing the episode.
+Setting `env.reference_init_distribution` to `pregrasp_mixture` selects the
+skewed alternative instead, where `env.rsi_early_probability` of the resets
+sample the early approach (`0..739`) and the rest sample the pre-grasp window
+(`env.rsi_pregrasp_start_index..env.rsi_max_start_index`). That mixture
+concentrates 80% of resets on 91 of the 831 reachable frames, which trains the
+grasp from an RSI reset but leaves the approach too rarely visited to be
+chained from frame 0. Both distributions obey `env.rsi_max_start_index`.
 
 Cube lifting is diagnostic rather than rewarded. TensorBoard's `Episode/`
 group reports the mean and maximum of the per-episode peak cube centre-of-mass
