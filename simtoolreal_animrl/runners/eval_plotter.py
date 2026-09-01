@@ -29,6 +29,10 @@ REWARD_TERMS: Tuple[Tuple[str, Optional[str]], ...] = (
     ("hand_action_rate_reward", "action_rate_hand_weight"),
     ("object_position_reward", "object_position_weight"),
     ("object_orientation_reward", "object_orientation_weight"),
+    (
+        "fingertip_object_distance_reward",
+        "fingertip_object_distance_weight",
+    ),
     ("fingertip_contact_reward", None),
 )
 
@@ -44,8 +48,12 @@ SCALAR_INFO_KEYS: Tuple[str, ...] = (
     "max_abs_hand_position_error",
     "object_position_error_m",
     "object_orientation_error_rad",
+    "object_com_height_m",
+    "object_com_lift_m",
+    "fingertip_object_distance_m",
     "fingertip_contact_fraction",
     "mean_fingertip_contact_force_n",
+    "proximity_active",
 )
 
 
@@ -132,12 +140,20 @@ class EvaluationPlotter:
         self._weights: Dict[str, float] = {}
         self._position_threshold: Optional[float] = None
         self._hand_position_threshold: Optional[float] = None
+        self._reference_initial_object_com_height_m = 0.0
         self._action_scale = 1.0
         self._hand_action_scale = 1.0
         self._num_arm_dofs = 0
         self._num_hand_dofs = 0
         self._arm_names: Tuple[str, ...] = ()
         self._hand_names: Tuple[str, ...] = ()
+        self._fingertip_names: Tuple[str, ...] = ()
+        self._contact_fingertip_names: Tuple[str, ...] = ()
+        self._contact_enabled = False
+        self._contact_force_threshold_n = 0.0
+        self._proximity_fingertip_names: Tuple[str, ...] = ()
+        self._proximity_std_m = 0.0
+        self._proximity_weight = 0.0
         self._records: Dict[str, List[Any]] = {}
 
     def start_episode(self, slug: str, env) -> None:
@@ -161,6 +177,13 @@ class EvaluationPlotter:
             )
             for info_key, weight_attribute in REWARD_TERMS
         }
+        self._fingertip_names = tuple(env.FINGERTIP_NAMES)
+        self._contact_fingertip_names = tuple(env.contact_fingertip_names)
+        self._contact_enabled = bool(env.contact_enabled)
+        self._contact_force_threshold_n = float(env.contact_force_threshold_n)
+        self._proximity_fingertip_names = tuple(env.proximity_fingertip_names)
+        self._proximity_std_m = float(env.proximity_std_m)
+        self._proximity_weight = float(env.proximity_weight)
         enabled = bool(env.cfg.termination.enabled)
         self._position_threshold = (
             float(env.cfg.termination.arm_position_threshold_rad)
@@ -171,6 +194,12 @@ class EvaluationPlotter:
             float(env.cfg.termination.hand_position_threshold_rad)
             if enabled
             else None
+        )
+        initial_reference = env.reference.sample(
+            env.reference_index[self.env_idx].reshape(1)
+        )
+        self._reference_initial_object_com_height_m = _scalar(
+            env._cube_reference_root_states(initial_reference)[:, 2], 0
         )
         self._records.clear()
 
@@ -198,6 +227,20 @@ class EvaluationPlotter:
         for key in SCALAR_INFO_KEYS:
             self._append(key, _scalar(infos.get(key), env_idx))
         self._append("worst_joint_index", _scalar(infos.get("worst_joint_index"), env_idx))
+        fingertip_force = infos.get("fingertip_force_n")
+        self._append(
+            "fingertip_force_n",
+            _vector(fingertip_force, env_idx)
+            if fingertip_force is not None
+            else np.full(len(self._fingertip_names), np.nan),
+        )
+        proximity_distance = infos.get("fingertip_object_distance_per_finger_m")
+        self._append(
+            "fingertip_object_distance_per_finger_m",
+            _vector(proximity_distance, env_idx)
+            if proximity_distance is not None
+            else np.full(len(self._proximity_fingertip_names), np.nan),
+        )
 
         arm = self._num_arm_dofs
         action = _vector(actions, env_idx)
@@ -215,6 +258,11 @@ class EvaluationPlotter:
             [reference_index], dtype=torch.long, device=env.device
         )
         reference = env.reference.sample(indices)
+        reference_cube_root_state = env._cube_reference_root_states(reference)
+        self._append(
+            "reference_object_com_height_m",
+            _scalar(reference_cube_root_state[:, 2], 0),
+        )
         # The action that would have landed exactly on this reference sample.
         # step() advances reference_index before publishing it, so the index
         # recorded here is the one the action applied this step was aiming at,
@@ -298,6 +346,15 @@ class EvaluationPlotter:
             npz_path,
             **arrays,
             joint_names=np.asarray(self._arm_names + self._hand_names),
+            fingertip_names=np.asarray(self._fingertip_names),
+            contact_fingertip_names=np.asarray(self._contact_fingertip_names),
+            contact_force_threshold_n=np.asarray(
+                self._contact_force_threshold_n
+            ),
+            proximity_fingertip_names=np.asarray(
+                self._proximity_fingertip_names
+            ),
+            proximity_std_m=np.asarray(self._proximity_std_m),
             reward_weights=np.asarray(
                 [self._weights.get(key, 0.0) for key, _ in REWARD_TERMS]
             ),
@@ -315,6 +372,9 @@ class EvaluationPlotter:
         paths.update(self._save_overview(plt, episode_dir, arrays, reason))
         paths.update(self._save_reward_terms(plt, episode_dir, arrays))
         paths.update(self._save_tracking_errors(plt, episode_dir, arrays))
+        paths.update(self._save_object_height(plt, episode_dir, arrays))
+        paths.update(self._save_fingertip_forces(plt, episode_dir, arrays))
+        paths.update(self._save_fingertip_proximity(plt, episode_dir, arrays))
         paths.update(self._save_joint_tracking(plt, episode_dir, arrays, "arm"))
         paths.update(self._save_joint_tracking(plt, episode_dir, arrays, "hand"))
         paths.update(self._save_action_per_joint(plt, episode_dir, arrays, "arm"))
@@ -471,6 +531,262 @@ class EvaluationPlotter:
         fig.savefig(path, dpi=150)
         plt.close(fig)
         return {"tracking_errors_png": str(path)}
+
+    def _save_object_height(self, plt, episode_dir, data) -> Dict[str, str]:
+        """Plot cube COM height and lift without turning them into rewards."""
+        time_s = data["time_s"]
+        reference_lift = (
+            data["reference_object_com_height_m"]
+            - self._reference_initial_object_com_height_m
+        )
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        axes[0].plot(
+            time_s,
+            data["object_com_height_m"],
+            label="physical cube",
+            linewidth=1.7,
+        )
+        axes[0].plot(
+            time_s,
+            data["reference_object_com_height_m"],
+            label="demonstration",
+            linestyle="--",
+            linewidth=1.4,
+        )
+        _finish_axis(axes[0], "Cube COM world z [m]")
+
+        axes[1].plot(
+            time_s,
+            data["object_com_lift_m"],
+            label="physical cube",
+            linewidth=1.7,
+        )
+        axes[1].plot(
+            time_s,
+            reference_lift,
+            label="demonstration",
+            linestyle="--",
+            linewidth=1.4,
+        )
+        axes[1].axhline(0.0, color="0.5", linestyle=":", linewidth=0.8)
+        _finish_axis(axes[1], "Lift from episode start [m]")
+        axes[1].set_xlabel("Episode time [s]")
+        fig.suptitle(
+            "Cube centre-of-mass height — {} (peak {:.4f} m, lift {:.4f} m)".format(
+                self._slug,
+                np.nanmax(data["object_com_height_m"]),
+                np.nanmax(data["object_com_lift_m"]),
+            )
+        )
+        fig.tight_layout()
+        path = episode_dir / "object_com_height.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return {"object_com_height_png": str(path)}
+
+    def _save_fingertip_forces(self, plt, episode_dir, data) -> Dict[str, str]:
+        """Per-fingertip net contact force, which the averaged metric hides.
+
+        ``mean_fingertip_contact_force_n`` averages over the selected fingers,
+        including those touching nothing, so one finger pressing hard and three
+        pressing lightly look identical. These curves separate them.
+        """
+        forces = data.get("fingertip_force_n")
+        if forces is None or forces.ndim != 2 or forces.shape[1] == 0:
+            return {}
+        if not self._contact_enabled:
+            # Without contact reporting the tensor is never acquired and every
+            # value is a hard zero; a flat figure would read as "no contact".
+            return {}
+
+        time_s = data["time_s"]
+        names = self._fingertip_names
+        selected = set(self._contact_fingertip_names)
+        threshold = self._contact_force_threshold_n
+        colors = _joint_colors(forces.shape[1])
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        for index in range(forces.shape[1]):
+            name = names[index] if index < len(names) else str(index)
+            in_reward = name in selected
+            axes[0].plot(
+                time_s,
+                forces[:, index],
+                label="{}{}".format(name, "" if in_reward else " (not rewarded)"),
+                color=colors[index],
+                linewidth=1.6 if in_reward else 1.1,
+                linestyle="-" if in_reward else "--",
+                alpha=1.0 if in_reward else 0.65,
+            )
+        axes[0].axhline(
+            threshold,
+            color="0.4",
+            linestyle=":",
+            linewidth=1.0,
+            label="threshold {:g} N".format(threshold),
+        )
+        _finish_axis(axes[0], "Net contact force [N]")
+        # Headroom so the legend never sits on top of the tallest curve.
+        finite = forces[np.isfinite(forces)]
+        if finite.size:
+            axes[0].set_ylim(
+                min(0.0, float(finite.min())), float(finite.max()) * 1.35 + 0.1
+            )
+
+        # One filled band per rewarded finger: a raster reads far better than
+        # overlapping step lines when several fingers touch at once.
+        rewarded = [
+            (index, name)
+            for index, name in enumerate(names[: forces.shape[1]])
+            if name in selected
+        ]
+        for row, (index, name) in enumerate(rewarded):
+            contact = forces[:, index] > threshold
+            axes[1].fill_between(
+                time_s,
+                row,
+                row + 0.8,
+                where=contact,
+                color=colors[index],
+                alpha=0.85,
+                step="post",
+                linewidth=0,
+            )
+            axes[1].axhline(row, color="0.85", linewidth=0.8)
+        axes[1].set_yticks([row + 0.4 for row in range(len(rewarded))])
+        axes[1].set_yticklabels([name for _, name in rewarded])
+        axes[1].set_ylim(-0.1, max(len(rewarded), 1))
+        _finish_axis(axes[1], "Above threshold", legend=False)
+        axes[1].set_xlabel("Episode time [s]")
+
+        peak = np.nanmax(forces) if np.isfinite(forces).any() else float("nan")
+        fig.suptitle(
+            "Fingertip net contact force \u2014 {} (peak {:.3f} N, "
+            "rewarded fingers: {})".format(
+                self._slug, peak, ", ".join(self._contact_fingertip_names) or "none"
+            )
+        )
+        fig.tight_layout()
+        path = episode_dir / "fingertip_forces.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return {"fingertip_forces_png": str(path)}
+
+    def _save_fingertip_proximity(self, plt, episode_dir, data) -> Dict[str, str]:
+        """Per-finger surface distance behind the proximity reward.
+
+        The reward averages one Gaussian per selected finger, so the mean
+        distance cannot tell an evenly closing hand from a single finger
+        reaching the cube alone. These curves can.
+        """
+        distances = data.get("fingertip_object_distance_per_finger_m")
+        if distances is None or distances.ndim != 2 or distances.shape[1] == 0:
+            return {}
+        if not np.isfinite(distances).any():
+            return {}
+
+        time_s = data["time_s"]
+        names = self._proximity_fingertip_names
+        std_m = self._proximity_std_m
+        colors = _joint_colors(distances.shape[1])
+        active = data.get("proximity_active")
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+        # The term is gated off before the pre-grasp window; without this band
+        # the flat zero reward there reads as "far from the cube".
+        if active is not None and np.isfinite(active).any():
+            axes[0].fill_between(
+                time_s,
+                0.0,
+                1.0,
+                where=active <= 0.0,
+                transform=axes[0].get_xaxis_transform(),
+                color="0.85",
+                alpha=0.45,
+                linewidth=0,
+                label="reward gated off",
+            )
+
+        for index in range(distances.shape[1]):
+            name = names[index] if index < len(names) else str(index)
+            axes[0].plot(
+                time_s,
+                distances[:, index],
+                label=name,
+                color=colors[index],
+                linewidth=1.6,
+            )
+        axes[0].plot(
+            time_s,
+            data["fingertip_object_distance_m"],
+            label="mean (reward input)",
+            color="0.2",
+            linestyle="--",
+            linewidth=1.3,
+        )
+        for multiple in (1.0, 2.0):
+            axes[0].axhline(
+                multiple * std_m,
+                color="0.5",
+                linestyle=":",
+                linewidth=0.9,
+                label="{:g}\u03c3 = {:.3f} m".format(multiple, multiple * std_m),
+            )
+        axes[0].axhline(0.0, color="0.75", linewidth=0.8)
+        # The gated-off band spans the axes vertically, which would otherwise
+        # autoscale this panel to 1.0 and squash centimetre-scale distances.
+        finite = distances[np.isfinite(distances)]
+        upper = max(float(finite.max()) if finite.size else 0.0, 2.0 * std_m)
+        axes[0].set_ylim(-0.02 * upper, upper * 1.25)
+        _finish_axis(axes[0], "Surface distance to cube [m]")
+
+        # Distance zero means touching the cuboid surface; the Gaussian is the
+        # exact term the reward uses, so plotting both makes the shaping legible.
+        per_finger_reward = np.exp(
+            -np.square(distances) / (2.0 * max(std_m, 1e-12) ** 2)
+        )
+        for index in range(distances.shape[1]):
+            name = names[index] if index < len(names) else str(index)
+            axes[1].plot(
+                time_s,
+                per_finger_reward[:, index],
+                label=name,
+                color=colors[index],
+                linewidth=1.3,
+                alpha=0.8,
+            )
+        axes[1].plot(
+            time_s,
+            data["fingertip_object_distance_reward"],
+            label="term (gated)",
+            color="0.2",
+            linewidth=1.8,
+        )
+        axes[1].plot(
+            time_s,
+            data["weighted_fingertip_object_distance_reward"],
+            label="weighted (w={:g})".format(self._proximity_weight),
+            color="0.2",
+            linestyle="--",
+            linewidth=1.3,
+        )
+        axes[1].set_ylim(-0.02, 1.05)
+        _finish_axis(axes[1], "Proximity reward")
+        axes[1].set_xlabel("Episode time [s]")
+
+        closest = np.nanmin(distances) if np.isfinite(distances).any() else np.nan
+        fig.suptitle(
+            "Fingertip-to-cube proximity \u2014 {} (closest {:.4f} m, "
+            "\u03c3 {:.3f} m, fingers: {})".format(
+                self._slug, closest, std_m, ", ".join(names) or "none"
+            )
+        )
+        fig.tight_layout()
+        path = episode_dir / "fingertip_proximity.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return {"fingertip_proximity_png": str(path)}
 
     def _save_joint_tracking(self, plt, episode_dir, data, group) -> Dict[str, str]:
         """One tracking figure per joint block; 26 joints in one is unreadable."""

@@ -85,6 +85,8 @@ def main():
             "mean_rms_hand_position_error",
             "mean_object_position_reward",
             "mean_object_orientation_reward",
+            "mean_fingertip_object_distance_reward",
+            "mean_fingertip_object_distance_m",
             "mean_object_position_error_m",
             "mean_object_orientation_error_rad",
             "mean_fingertip_contact_reward",
@@ -100,6 +102,15 @@ def main():
         }
         if not required_rollout_metrics.issubset(rollout):
             raise AssertionError("PPO rollout diagnostics are incomplete")
+        if rollout["episode_count"] > 0:
+            required_peak_metrics = {
+                "episode_mean_peak_object_com_height_m",
+                "episode_max_peak_object_com_height_m",
+                "episode_mean_peak_object_com_lift_m",
+                "episode_max_peak_object_com_lift_m",
+            }
+            if not required_peak_metrics.issubset(rollout):
+                raise AssertionError("PPO cube-lift episode diagnostics are incomplete")
         if not 0.0 <= rollout["action_target_clipped_fraction"] <= 1.0:
             raise AssertionError("Target clipping fraction is outside [0, 1]")
         if ppo.storage.step != train_cfg.runner.num_steps_per_env:

@@ -107,6 +107,7 @@ class PPO:
         early_termination_count = 0
         episode_count = 0
         episode_sums = {}
+        episode_maxima = {}
         position_reward_sum = 0.0
         velocity_reward_sum = 0.0
         action_rate_reward_sum = 0.0
@@ -115,6 +116,8 @@ class PPO:
         hand_action_rate_reward_sum = 0.0
         object_position_reward_sum = 0.0
         object_orientation_reward_sum = 0.0
+        fingertip_object_distance_reward_sum = 0.0
+        fingertip_object_distance_sum = 0.0
         object_position_error_sum = 0.0
         object_orientation_error_sum = 0.0
         fingertip_contact_reward_sum = 0.0
@@ -198,6 +201,12 @@ class PPO:
                 object_orientation_reward_sum += float(
                     infos["object_orientation_reward"].mean()
                 )
+                fingertip_object_distance_reward_sum += float(
+                    infos["fingertip_object_distance_reward"].mean()
+                )
+                fingertip_object_distance_sum += float(
+                    infos["fingertip_object_distance_m"].mean()
+                )
                 object_position_error_sum += float(
                     infos["object_position_error_m"].mean()
                 )
@@ -238,9 +247,15 @@ class PPO:
                     for name, value in episode.items():
                         if name == "completed_episodes":
                             continue
-                        episode_sums[name] = episode_sums.get(name, 0.0) + (
-                            float(value) * completed
-                        )
+                        if name.startswith("max_"):
+                            episode_maxima[name] = max(
+                                episode_maxima.get(name, -math.inf),
+                                float(value),
+                            )
+                        else:
+                            episode_sums[name] = episode_sums.get(name, 0.0) + (
+                                float(value) * completed
+                            )
 
             # This deliberately follows AnimRL's existing rollout convention:
             # the critic observation retained by the final transition supplies
@@ -267,6 +282,12 @@ class PPO:
             ),
             "mean_object_orientation_reward": (
                 object_orientation_reward_sum / rollout_steps
+            ),
+            "mean_fingertip_object_distance_reward": (
+                fingertip_object_distance_reward_sum / rollout_steps
+            ),
+            "mean_fingertip_object_distance_m": (
+                fingertip_object_distance_sum / rollout_steps
             ),
             "mean_object_position_error_m": (
                 object_position_error_sum / rollout_steps
@@ -308,6 +329,8 @@ class PPO:
         if episode_count > 0:
             for name, total in episode_sums.items():
                 result["episode_{}".format(name)] = total / episode_count
+            for name, maximum in episode_maxima.items():
+                result["episode_{}".format(name)] = maximum
         return result
 
     def process_env_step(
@@ -612,6 +635,9 @@ class PPO:
             "Reward/hand_action_rate": "mean_hand_action_rate_reward",
             "Reward/object_position": "mean_object_position_reward",
             "Reward/object_orientation": "mean_object_orientation_reward",
+            "Reward/fingertip_object_distance": (
+                "mean_fingertip_object_distance_reward"
+            ),
             "Reward/fingertip_contact": "mean_fingertip_contact_reward",
             "Contact/fingertip_fraction": "mean_fingertip_contact_fraction",
             "Contact/mean_fingertip_force_n": (
@@ -622,6 +648,9 @@ class PPO:
             ),
             "Tracking/object_orientation_error_rad": (
                 "mean_object_orientation_error_rad"
+            ),
+            "Tracking/fingertip_object_distance_m": (
+                "mean_fingertip_object_distance_m"
             ),
             "Tracking/rms_hand_position_error": "mean_rms_hand_position_error",
             "Tracking/rms_arm_position_error": "mean_rms_position_error",
@@ -800,24 +829,13 @@ class PPO:
         torch.save(save_dict, str(path))
 
     def load(self, path, load_optimizer=False, load_normalizers=True):
-        try:
-            loaded = torch.load(
-                str(path), map_location=self.device, weights_only=False
-            )
-        except TypeError:
-            # PyTorch versions predating ``weights_only`` remain supported.
-            loaded = torch.load(str(path), map_location=self.device)
+        """Resume all learned networks and, optionally, training state."""
+        loaded = self._read_checkpoint(path)
         self.policy.load_state_dict(loaded["policy_dict"])
         self.value.load_state_dict(loaded["value_dict"])
         if load_optimizer:
             self.optimizer.load_state_dict(loaded["optimizer_state_dict"])
-        if load_normalizers and self.normalize_observation:
-            self.actor_obs_normalizer.load_state_dict(
-                loaded["actor_obs_normalizer"]
-            )
-            self.critic_obs_normalizer.load_state_dict(
-                loaded["critic_obs_normalizer"]
-            )
+        self._load_normalizers(loaded, load_normalizers)
         infos = loaded["infos"]
         if isinstance(infos, dict):
             self.total_timesteps = int(infos.get("total_timesteps", 0))
@@ -828,14 +846,52 @@ class PPO:
             self.best_evaluation_iteration = int(
                 infos.get("best_evaluation_iteration", -1)
             )
-            if load_normalizers and self.normalize_observation:
-                self.actor_obs_normalizer.count = int(
-                    infos.get("actor_normalizer_count", 0)
-                )
-                self.critic_obs_normalizer.count = int(
-                    infos.get("critic_normalizer_count", 0)
-                )
+            self._load_normalizer_counts(infos, load_normalizers)
         return infos
+
+    def initialize_policy(self, path, load_normalizers=True):
+        """Warm-start only the actor side of a checkpoint.
+
+        The value network and optimizer are intentionally left freshly
+        initialized. This is useful when the policy is retained but the reward
+        function has changed, making the checkpoint's value targets and Adam
+        moments stale. Training/evaluation counters also remain at their new-run
+        defaults.
+        """
+        loaded = self._read_checkpoint(path)
+        self.policy.load_state_dict(loaded["policy_dict"])
+        self._load_normalizers(loaded, load_normalizers)
+        infos = loaded.get("infos")
+        if isinstance(infos, dict):
+            self._load_normalizer_counts(infos, load_normalizers)
+        return infos
+
+    def _read_checkpoint(self, path):
+        try:
+            return torch.load(
+                str(path), map_location=self.device, weights_only=False
+            )
+        except TypeError:
+            # PyTorch versions predating ``weights_only`` remain supported.
+            return torch.load(str(path), map_location=self.device)
+
+    def _load_normalizers(self, loaded, load_normalizers):
+        if load_normalizers and self.normalize_observation:
+            self.actor_obs_normalizer.load_state_dict(
+                loaded["actor_obs_normalizer"]
+            )
+            self.critic_obs_normalizer.load_state_dict(
+                loaded["critic_obs_normalizer"]
+            )
+
+    def _load_normalizer_counts(self, infos, load_normalizers):
+        if load_normalizers and self.normalize_observation:
+            self.actor_obs_normalizer.count = int(
+                infos.get("actor_normalizer_count", 0)
+            )
+            self.critic_obs_normalizer.count = int(
+                infos.get("critic_normalizer_count", 0)
+            )
 
     def get_inference_policy(self, device=None):
         self.eval_mode()

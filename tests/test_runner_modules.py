@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -9,7 +11,11 @@ from simtoolreal_animrl.cfg import (
     config_to_dict,
     update_config_from_dict,
 )
-from simtoolreal_animrl.envs.contact import fingertip_contact_diagnostics
+from simtoolreal_animrl.envs.contact import (
+    fingertip_contact_diagnostics,
+    fingertip_force_norms,
+)
+from simtoolreal_animrl.envs.proximity import fingertip_cuboid_proximity
 from simtoolreal_animrl.envs.rsi import resolve_rsi_settings, sample_rsi_indices
 from simtoolreal_animrl.runners.modules import (
     EmpiricalNormalization,
@@ -174,6 +180,70 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertEqual(storage.actions.shape, (24, 8, 6))
         self.assertEqual(storage.values.shape, (24, 8, 1))
 
+    @staticmethod
+    def _checkpoint_runner():
+        """Build the checkpoint-relevant part of PPO without an Isaac env."""
+        runner = PPO.__new__(PPO)
+        runner.device = torch.device("cpu")
+        runner.policy = Policy(3, 2, [4], "elu", -0.4)
+        runner.value = Value(3, [4], "elu")
+        runner.optimizer = torch.optim.Adam(
+            list(runner.policy.parameters()) + list(runner.value.parameters()),
+            lr=1.0e-4,
+        )
+        runner.normalize_observation = True
+        runner.actor_obs_normalizer = EmpiricalNormalization(3)
+        runner.critic_obs_normalizer = EmpiricalNormalization(3)
+        runner.total_timesteps = 0
+        runner.total_time_s = 0.0
+        runner.best_evaluation_score = -float("inf")
+        runner.best_evaluation_iteration = -1
+        return runner
+
+    def test_policy_initialization_leaves_critic_and_optimizer_fresh(self):
+        source = self._checkpoint_runner()
+        with torch.no_grad():
+            for parameter in source.policy.parameters():
+                parameter.fill_(0.25)
+            for parameter in source.value.parameters():
+                parameter.fill_(0.75)
+        source.actor_obs_normalizer(torch.randn(7, 3))
+        source.critic_obs_normalizer(torch.randn(7, 3))
+        # Populate Adam's state so accidentally loading it is observable.
+        source.optimizer.zero_grad()
+        sum(parameter.sum() for parameter in source.policy.parameters()).backward()
+        source.optimizer.step()
+        infos = {
+            "total_timesteps": 12345,
+            "total_time_s": 67.0,
+            "best_evaluation_score": 0.9,
+            "best_evaluation_iteration": 42,
+            "actor_normalizer_count": source.actor_obs_normalizer.count,
+            "critic_normalizer_count": source.critic_obs_normalizer.count,
+        }
+
+        target = self._checkpoint_runner()
+        untouched_value = {
+            name: tensor.clone() for name, tensor in target.value.state_dict().items()
+        }
+        with TemporaryDirectory() as temporary_directory:
+            checkpoint = Path(temporary_directory) / "source.pt"
+            source.save(checkpoint, infos=infos)
+            returned_infos = target.initialize_policy(checkpoint)
+
+        self.assertEqual(returned_infos, infos)
+        for name, tensor in source.policy.state_dict().items():
+            self.assertTrue(torch.equal(target.policy.state_dict()[name], tensor))
+        for name, tensor in untouched_value.items():
+            self.assertTrue(torch.equal(target.value.state_dict()[name], tensor))
+        self.assertEqual(target.optimizer.state, {})
+        self.assertEqual(target.total_timesteps, 0)
+        self.assertEqual(target.best_evaluation_iteration, -1)
+        self.assertEqual(
+            target.actor_obs_normalizer.count,
+            source.actor_obs_normalizer.count,
+        )
+
     def test_training_config_matches_animrl_cartwheel(self):
         train = self.train_cfg
         self.assertEqual(train.runner.num_steps_per_env, 24)
@@ -205,7 +275,7 @@ class RunnerModulesTest(unittest.TestCase):
 
     def test_pregrasp_rsi_mixture_respects_ranges_and_probability(self):
         settings = resolve_rsi_settings(self.env_cfg.env, 1107)
-        self.assertEqual(settings, ("pregrasp_mixture", 830, 650, 0.20))
+        self.assertEqual(settings, ("pregrasp_mixture", 830, 740, 0.20))
         generator = torch.Generator(device="cpu")
         generator.manual_seed(123)
         indices = sample_rsi_indices(
@@ -213,9 +283,9 @@ class RunnerModulesTest(unittest.TestCase):
         )
         self.assertGreaterEqual(int(indices.min()), 0)
         self.assertLessEqual(int(indices.max()), 830)
-        early_fraction = float((indices < 650).float().mean())
+        early_fraction = float((indices < 740).float().mean())
         self.assertAlmostEqual(early_fraction, 0.20, delta=0.01)
-        self.assertTrue(bool((indices[indices >= 650] <= 830).all()))
+        self.assertTrue(bool((indices[indices >= 740] <= 830).all()))
 
     def test_evaluation_cohorts_are_repeatable(self):
         class Reference:
@@ -227,7 +297,7 @@ class RunnerModulesTest(unittest.TestCase):
             reference = Reference()
             rsi_distribution = "pregrasp_mixture"
             rsi_max_start_index = 830
-            rsi_pregrasp_start_index = 650
+            rsi_pregrasp_start_index = 740
             rsi_early_probability = 0.20
 
         first = DeterministicEvaluator(Env(), 100, 123, [0.0, 0.5, 1.0])
@@ -252,7 +322,7 @@ class RunnerModulesTest(unittest.TestCase):
             reference = Reference()
             rsi_distribution = "pregrasp_mixture"
             rsi_max_start_index = 830
-            rsi_pregrasp_start_index = 650
+            rsi_pregrasp_start_index = 740
             rsi_early_probability = 0.20
 
         evaluator = DeterministicEvaluator(Env(), 500, 123, [0.0, 0.5])
@@ -290,8 +360,12 @@ class RunnerModulesTest(unittest.TestCase):
             # so a mis-weighted mixture would not go unnoticed.
             "object_position_reward": ones.clone(),
             "object_orientation_reward": torch.zeros(num_envs),
+            "fingertip_object_distance_reward": torch.zeros(num_envs),
+            "fingertip_object_distance_m": torch.zeros(num_envs),
             "object_position_error_m": torch.zeros(num_envs),
             "object_orientation_error_rad": torch.zeros(num_envs),
+            "object_com_height_m": 0.55 * ones,
+            "object_com_lift_m": torch.zeros(num_envs),
             "fingertip_contact_reward": torch.zeros(num_envs),
             "fingertip_contact_fraction": torch.zeros(num_envs),
             "mean_fingertip_contact_force_n": torch.zeros(num_envs),
@@ -323,11 +397,14 @@ class RunnerModulesTest(unittest.TestCase):
             action_target_clip = 100.0
             rsi_distribution = "pregrasp_mixture"
             rsi_max_start_index = 830
-            rsi_pregrasp_start_index = 650
+            rsi_pregrasp_start_index = 740
             rsi_early_probability = 0.20
 
             def __init__(self, cfg):
                 self.cfg = cfg
+                self.cube_position = torch.tensor(
+                    [[0.0, 0.0, 0.55]] * self.num_envs
+                )
 
             def reset_idx(self, env_ids, indices):
                 pass
@@ -364,6 +441,10 @@ class RunnerModulesTest(unittest.TestCase):
     def test_object_pose_score_uses_configured_weights(self):
         stats = self._score_with_object_weights(0.8, 0.2)
         self.assertAlmostEqual(stats["mean_object_pose_score"], 0.8, places=6)
+        self.assertAlmostEqual(
+            stats["mean_peak_object_com_height_m"], 0.55, places=6
+        )
+        self.assertAlmostEqual(stats["max_peak_object_com_lift_m"], 0.0, places=6)
         # 0.5 * (0.5 * (0.6 + 0.4) + 0.8), with no early terminations.
         self.assertAlmostEqual(stats["position_score"], 0.65, places=6)
 
@@ -402,6 +483,91 @@ class RunnerModulesTest(unittest.TestCase):
             restored.contact.fingertip_names,
             snapshot["contact"]["fingertip_names"],
         )
+
+    def test_fingertip_cuboid_proximity_is_surface_based_and_phase_gated(self):
+        half_extents = torch.tensor([0.075, 0.025, 0.025])
+        # Along +z these points are respectively on the surface, 4 cm away and
+        # 8 cm away. Duplicate them across two environments to isolate gating.
+        points = torch.tensor(
+            [
+                [[0.0, 0.0, 0.025], [0.0, 0.0, 0.065], [0.0, 0.0, 0.105]],
+                [[0.0, 0.0, 0.025], [0.0, 0.0, 0.065], [0.0, 0.0, 0.105]],
+            ]
+        )
+        reward, mean_distance, per_finger = fingertip_cuboid_proximity(
+            points,
+            half_extents,
+            std_m=0.04,
+            active=torch.tensor([False, True]),
+        )
+        self.assertEqual(float(reward[0]), 0.0)
+        expected = torch.exp(
+            -torch.tensor([0.0, 0.04, 0.08]).square() / (2.0 * 0.04**2)
+        ).mean()
+        self.assertTrue(torch.allclose(reward[1], expected))
+        self.assertTrue(
+            torch.allclose(mean_distance, torch.full((2,), 0.04))
+        )
+        # The per-finger distances are what the mean above averages away.
+        self.assertEqual(per_finger.shape, (2, 3))
+        self.assertTrue(
+            torch.allclose(
+                per_finger, torch.tensor([[0.0, 0.04, 0.08]]).expand(2, 3)
+            )
+        )
+        self.assertTrue(
+            torch.allclose(per_finger.mean(dim=1), mean_distance)
+        )
+
+    def test_proximity_mean_hides_an_uneven_hand(self):
+        """Two very different hands share one mean distance."""
+        half_extents = torch.tensor([0.075, 0.025, 0.025])
+        points = torch.tensor(
+            [
+                # Even: every finger 4 cm off the surface.
+                [[0.0, 0.0, 0.065], [0.0, 0.0, 0.065], [0.0, 0.0, 0.065]],
+                # Uneven: two fingers touching, one 12 cm away. Same mean.
+                [[0.0, 0.0, 0.025], [0.0, 0.0, 0.025], [0.0, 0.0, 0.145]],
+            ]
+        )
+        _, mean_distance, per_finger = fingertip_cuboid_proximity(
+            points,
+            half_extents,
+            std_m=0.04,
+            active=torch.tensor([True, True]),
+        )
+        self.assertTrue(
+            torch.allclose(mean_distance, torch.full((2,), 0.04), atol=1e-6)
+        )
+        self.assertFalse(torch.allclose(per_finger[0], per_finger[1]))
+
+    def test_fingertip_force_norms_keep_each_finger_separate(self):
+        """The averaged metric hides which finger carries the load."""
+        forces = torch.zeros(2, 5, 3)
+        forces[0, 0, 0] = 3.0   # thumb pushes alone
+        forces[1, 0, 0] = 1.0   # all three push equally
+        forces[1, 2, 0] = 1.0
+        forces[1, 4, 0] = 1.0
+        selected = torch.tensor([0, 2, 4])
+
+        per_finger = fingertip_force_norms(forces, selected)
+        self.assertEqual(per_finger.shape, (2, 3))
+        self.assertTrue(
+            torch.allclose(
+                per_finger,
+                torch.tensor([[3.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),
+            )
+        )
+        # Both environments average to 1.0 N, which is exactly why the
+        # per-finger series is worth plotting.
+        _, _, mean_force = fingertip_contact_diagnostics(forces, selected, 0.5)
+        self.assertTrue(torch.allclose(mean_force, torch.tensor([1.0, 1.0])))
+
+    def test_fingertip_force_norms_use_the_vector_magnitude(self):
+        forces = torch.zeros(1, 5, 3)
+        forces[0, 1] = torch.tensor([3.0, 4.0, 0.0])
+        per_finger = fingertip_force_norms(forces, torch.tensor([1]))
+        self.assertTrue(torch.allclose(per_finger, torch.tensor([[5.0]])))
 
     def test_fingertip_contact_diagnostics_count_each_selected_finger(self):
         forces = torch.zeros(2, 5, 3)

@@ -45,7 +45,11 @@ first pose of the demonstration, with separate arm and hand residual scales.
 
 The Gaussian joint imitation terms cover arm and hand separately. The object
 is tracked at every reference sample with Gaussian center-position and
-orientation rewards; object velocity is observed but is not rewarded. Early
+orientation rewards; object velocity is observed but is not rewarded. From
+`env.rsi_pregrasp_start_index` onward, a dense Gaussian term rewards smaller
+surface distances from thumb, index and middle fingertips to the oriented
+cuboid. Its weight, width and selected fingers are configured by
+`rewards.fingertip_object_distance_*`. Early
 termination is based on arm and hand joint drift and on the cube center staying
 within `termination.object_position_threshold_m` of its reference target. All
 three conditions use the configured consecutive-step grace period. Set
@@ -55,13 +59,106 @@ condition while retaining the arm and hand early terminations.
 The 114D network input is checkpoint-incompatible with the earlier 79D policy.
 Those checkpoints must not be resumed for this object-training family.
 
+### Object-reward curriculum
+
+`scripts/run_object_reward_curriculum.py` runs two sequential curricula with
+the contact reward disabled. For each chain it multiplies all current
+object-related reward weights (position, orientation, and fingertip proximity)
+by `0.1, 0.2, ..., 1.0`. The `warm` chain initializes its first actor and
+observation normalizers from the known-good no-object `model_7500.pt`, while
+starting a fresh critic and optimizer. The `scratch` chain starts with random
+networks. Every later stage fully resumes the final numeric checkpoint of the
+preceding stage. A failure or divergence stops that chain so a damaged policy
+cannot feed the next stage; the other chain is still attempted. The generated
+`curriculum.json` records commands, weights, checkpoints, and outcomes.
+
+Run both chains, with 1000 PPO updates at each of the ten scales:
+
+```bash
+/home/simone/.venv/bin/python scripts/run_object_reward_curriculum.py
+```
+
+Use `--dry-run` to inspect every command without starting Isaac Gym. The stage
+length, scale list, branches, environment count, seed, devices, and output root
+are command-line options of the curriculum launcher; run it with `--help` for
+the complete list. Pass `--warm-start-mode full` when the first warm stage must
+resume actor, critic, optimizer, normalizers, and counters from the source
+checkpoint rather than performing the default policy-only initialization.
+
 Episodes last up to 300 control steps. Automatic RSI uses a configurable
-mixture: 20% of resets sample the early approach (`0..649`) and 80% sample the
-pre-grasp window (`650..830`). No automatic training or periodic-evaluation
+mixture: 20% of resets sample the early approach (`0..739`) and 80% sample the
+pre-grasp window (`740..830`). No automatic training or periodic-evaluation
 reset starts after frame 830; successful policies can still reach the final
 frame 1107 by continuing the episode. The relevant parameters are
 `env.rsi_early_probability`, `env.rsi_pregrasp_start_index`, and
 `env.rsi_max_start_index`.
+
+Cube lifting is diagnostic rather than rewarded. TensorBoard's `Episode/`
+group reports the mean and maximum of the per-episode peak cube centre-of-mass
+height, plus the corresponding lift relative to each episode's RSI reset
+height. Periodic deterministic evaluation exposes the same peak metrics under
+`Evaluation/`. The standalone evaluator stores the raw height/lift time series
+in `evaluation_log.npz` and writes `object_com_height.png`, comparing the
+physical cube with the demonstrated cube trajectory.
+
+### Fingertip-to-cube proximity
+
+`scripts/evaluate.py` writes `fingertip_proximity.png`, the term the proximity
+reward actually consumes. The upper panel shows the point-to-box surface
+distance of every finger in `rewards.fingertip_object_distance_names`, with the
+mean, the 1sigma and 2sigma lines of
+`rewards.fingertip_object_distance_std_m`, and a grey band over the steps where
+the term is gated off before `env.rsi_pregrasp_start_index`. The lower panel
+shows each finger's Gaussian next to the gated term and its weighted
+contribution.
+
+The reward averages one Gaussian per selected finger, so its scalar cannot
+distinguish a hand closing evenly from one finger reaching the cube while the
+others trail. The per-finger curves can. Distance zero means touching the
+cuboid surface, not the centre. The raw `(steps, F)` array is stored in
+`evaluation_log.npz` as `fingertip_object_distance_per_finger_m`, with
+`proximity_fingertip_names` and `proximity_std_m`.
+
+Unlike the contact figure below, this one needs no PhysX contact reporting: it
+is pure geometry and is always produced.
+
+### Fingertip contact forces
+
+`scripts/evaluate.py` writes `fingertip_forces.png`: the net contact force of
+every fingertip over the episode, with the `contact.force_threshold_n` line and
+a raster of which rewarded fingers are above it. Fingers outside
+`contact.fingertip_names` are drawn dashed and labelled "not rewarded". The raw
+`(steps, 5)` array is saved in `evaluation_log.npz` as `fingertip_force_n`,
+alongside `fingertip_names` and `contact_force_threshold_n`.
+
+This separates what `Contact/mean_fingertip_force_n` averages away: that scalar
+divides by every selected finger, those touching nothing included, so one
+finger pressing at 3 N reads the same as three pressing at 1 N.
+
+Isaac Gym reports one net force vector per rigid body, so each curve aggregates
+every contact on that fingertip — cube and table alike. It is not a per-pair
+fingertip-to-cube force.
+
+The figure needs PhysX contact reporting, which is a construction-time
+decision. When a run was trained with `contact.enabled=false` the tensor is
+never acquired and the figure is skipped rather than drawn flat at zero. To
+inspect the forces anyway:
+
+```bash
+/home/simone/.venv/bin/python scripts/evaluate.py \
+  --checkpoint logs/simtoolreal/<run>/model_<n>.pt \
+  --contact-forces
+```
+
+That flag enables reporting and sets `contact.reward_per_finger` to zero, so
+the measured return stays comparable with training.
+
+The principal TensorBoard series are
+`Episode/mean_peak_object_com_height_m`,
+`Episode/max_peak_object_com_height_m`,
+`Episode/mean_peak_object_com_lift_m`, and
+`Episode/max_peak_object_com_lift_m`. Evaluation series have the same suffixes,
+prefixed by `Evaluation/fixed_` or `Evaluation/uniform_`.
 
 The environment follows AnimRL's five-value vectorized step contract:
 

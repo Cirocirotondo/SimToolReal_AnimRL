@@ -109,6 +109,16 @@ def parse_args():
         help="Skip the per-episode diagnostic figures.",
     )
     parser.add_argument(
+        "--contact-forces",
+        action="store_true",
+        help=(
+            "Force PhysX contact reporting on for this evaluation so the "
+            "per-fingertip force figure is produced even when the run was "
+            "trained with contact.enabled=false. The contact reward is "
+            "zeroed, so the measured return is unaffected."
+        ),
+    )
+    parser.add_argument(
         "--plot-dir",
         type=Path,
         default=None,
@@ -187,6 +197,12 @@ def main():
     # sample, so the tracking threshold must not cut the episode short. The
     # threshold is still reported: see max_abs_position_error below.
     env_cfg.termination.enabled = False
+    if args.contact_forces:
+        # Acquiring the contact tensor is a construction-time decision, but the
+        # reward must not change: with reward_per_finger at zero the contact
+        # term contributes nothing and the return stays comparable to training.
+        env_cfg.contact.enabled = True
+        env_cfg.contact.reward_per_finger = 0.0
     if int(env_cfg.env.num_observations) != 114:
         raise ValueError("This evaluator requires the 114D observation contract")
     if int(env_cfg.env.num_actions) != 26:
@@ -246,6 +262,8 @@ def main():
         timeout_count = 0
         peak_position_error = 0.0
         peak_hand_position_error = 0.0
+        peak_object_com_height = -float("inf")
+        peak_object_com_lift = -float("inf")
         episode_weight = 0
         episode_totals = {}
         trajectory = {
@@ -255,6 +273,8 @@ def main():
             "dones": [],
             "reference_indices": [],
             "max_abs_position_errors": [],
+            "object_com_heights_m": [],
+            "object_com_lifts_m": [],
         }
         plotter = EvaluationPlotter(plot_dir) if args.plots else None
         plot_paths = {}
@@ -311,6 +331,14 @@ def main():
                     peak_hand_position_error,
                     scalar(infos["max_abs_hand_position_error"].max()),
                 )
+                peak_object_com_height = max(
+                    peak_object_com_height,
+                    scalar(infos["object_com_height_m"].max()),
+                )
+                peak_object_com_lift = max(
+                    peak_object_com_lift,
+                    scalar(infos["object_com_lift_m"].max()),
+                )
 
                 trajectory["observations"].append(
                     observations[0].detach().cpu().tolist()
@@ -325,6 +353,12 @@ def main():
                 )
                 trajectory["max_abs_position_errors"].append(
                     float(infos["max_abs_position_error"][0])
+                )
+                trajectory["object_com_heights_m"].append(
+                    float(infos["object_com_height_m"][0])
+                )
+                trajectory["object_com_lifts_m"].append(
+                    float(infos["object_com_lift_m"][0])
                 )
                 if plotter is not None:
                     plotter.record(
@@ -393,6 +427,8 @@ def main():
             "timeout_count": timeout_count,
             "peak_position_error": peak_position_error,
             "peak_hand_position_error": peak_hand_position_error,
+            "peak_object_com_height_m": peak_object_com_height,
+            "peak_object_com_lift_m": peak_object_com_lift,
             "termination_threshold": float(
                 env_cfg.termination.arm_position_threshold_rad
             ),
@@ -428,6 +464,8 @@ def main():
             result["hand_termination_threshold"],
             ", EXCEEDED" if result["exceeded_hand_termination_threshold"] else "",
         ))
+        print("  peak cube COM z    : {:.6f} m".format(peak_object_com_height))
+        print("  peak cube COM lift : {:.6f} m".format(peak_object_com_lift))
         if episode_metrics:
             print("  mean return        : {:.6f}".format(
                 episode_metrics["return"]

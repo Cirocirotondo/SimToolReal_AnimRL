@@ -54,11 +54,22 @@ def parse_args():
         default=None,
         help="Use an exact run directory instead of generating one.",
     )
-    parser.add_argument(
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
         "--resume",
         type=Path,
         default=None,
         help="Resume optimizer, networks, normalizers, and counters.",
+    )
+    checkpoint_group.add_argument(
+        "--initialize-from",
+        type=Path,
+        default=None,
+        help=(
+            "Initialize the actor policy and observation normalizers from a "
+            "checkpoint, while starting with a fresh critic, optimizer, "
+            "iteration counter, and best-evaluation score."
+        ),
     )
     parser.add_argument(
         "--start-iteration",
@@ -315,6 +326,17 @@ def main():
             checkpoint_infos = runner.load(
                 resume_path,
                 load_optimizer=True,
+                load_normalizers=True,
+            )
+        elif args.initialize_from is not None:
+            initialization_path = args.initialize_from.expanduser().resolve()
+            print(
+                "Initializing policy and normalizers from: {}".format(
+                    initialization_path
+                )
+            )
+            runner.initialize_policy(
+                initialization_path,
                 load_normalizers=True,
             )
         start_iteration = resolve_start_iteration(args, checkpoint_infos)

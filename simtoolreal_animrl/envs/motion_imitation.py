@@ -21,8 +21,12 @@ from simtoolreal_animrl.envs.controller import (
     configure_pd_properties,
     validate_joint_order,
 )
-from simtoolreal_animrl.envs.contact import fingertip_contact_diagnostics
+from simtoolreal_animrl.envs.contact import (
+    fingertip_contact_diagnostics,
+    fingertip_force_norms,
+)
 from simtoolreal_animrl.envs.demonstration import JointDemonstration60Hz
+from simtoolreal_animrl.envs.proximity import fingertip_cuboid_proximity
 from simtoolreal_animrl.envs.rsi import resolve_rsi_settings, sample_rsi_indices
 
 
@@ -94,6 +98,7 @@ class MotionImitationEnv:
     """AnimRL-compatible environment API without an RL algorithm dependency."""
 
     JOINT_NAMES = JOINT_NAMES
+    FINGERTIP_NAMES = tuple(FINGERTIP_BODY_NAMES_BY_SEMANTIC_NAME)
 
     def __init__(
         self,
@@ -171,6 +176,43 @@ class MotionImitationEnv:
                 "Unknown contact fingertip names: {}".format(
                     sorted(unknown_contact_fingers)
                 )
+            )
+        self.proximity_fingertip_names = tuple(
+            str(name).strip().lower()
+            for name in self.cfg.rewards.fingertip_object_distance_names
+        )
+        self.proximity_std_m = float(
+            self.cfg.rewards.fingertip_object_distance_std_m
+        )
+        self.proximity_weight = float(
+            self.cfg.rewards.fingertip_object_distance_weight
+        )
+        if not self.proximity_fingertip_names:
+            raise ValueError(
+                "rewards.fingertip_object_distance_names must not be empty"
+            )
+        if len(set(self.proximity_fingertip_names)) != len(
+            self.proximity_fingertip_names
+        ):
+            raise ValueError(
+                "rewards.fingertip_object_distance_names must not contain duplicates"
+            )
+        unknown_proximity_fingers = set(
+            self.proximity_fingertip_names
+        ).difference(FINGERTIP_BODY_NAMES_BY_SEMANTIC_NAME)
+        if unknown_proximity_fingers:
+            raise ValueError(
+                "Unknown proximity fingertip names: {}".format(
+                    sorted(unknown_proximity_fingers)
+                )
+            )
+        if not math.isfinite(self.proximity_std_m) or self.proximity_std_m <= 0.0:
+            raise ValueError(
+                "rewards.fingertip_object_distance_std_m must be finite and positive"
+            )
+        if not math.isfinite(self.proximity_weight) or self.proximity_weight < 0.0:
+            raise ValueError(
+                "rewards.fingertip_object_distance_weight must be finite and non-negative"
             )
         if not math.isclose(
             self.dt,
@@ -693,6 +735,16 @@ class MotionImitationEnv:
             dtype=torch.long,
             device=self.device,
         )
+        self.proximity_fingertip_indices = torch.as_tensor(
+            [
+                FINGERTIP_BODY_NAMES.index(
+                    FINGERTIP_BODY_NAMES_BY_SEMANTIC_NAME[name]
+                )
+                for name in self.proximity_fingertip_names
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
 
     def _paint_ghost(self, env, ghost) -> None:
         color = gymapi.Vec3(
@@ -804,6 +856,9 @@ class MotionImitationEnv:
         self.robot_base_position = torch.tensor(
             self.cfg.init_state.pos, dtype=torch.float32, device=self.device
         )
+        self.object_half_extents = torch.tensor(
+            self.cfg.object.size_m, dtype=torch.float32, device=self.device
+        ) / 2.0
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
@@ -832,6 +887,15 @@ class MotionImitationEnv:
         self.arm_violation = torch.zeros_like(self.reset_buf)
         self.hand_violation = torch.zeros_like(self.reset_buf)
         self.object_violation = torch.zeros_like(self.reset_buf)
+        # A primitive box actor is rooted at its centre of mass. Keep the
+        # initial and running peak world-z per episode outside episode_sums:
+        # these are extrema, not quantities that should be time-averaged.
+        self.episode_initial_object_com_height_m = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.episode_peak_object_com_height_m = torch.zeros_like(
+            self.episode_initial_object_com_height_m
+        )
         self.actions = torch.zeros(
             (self.num_envs, self.num_actions), dtype=torch.float32, device=self.device
         )
@@ -851,6 +915,8 @@ class MotionImitationEnv:
                 "hand_action_rate_reward",
                 "object_position_reward",
                 "object_orientation_reward",
+                "fingertip_object_distance_reward",
+                "fingertip_object_distance_m",
                 "rms_position_error",
                 "rms_velocity_error",
                 "rms_action_rate",
@@ -902,6 +968,15 @@ class MotionImitationEnv:
     @property
     def robot_root_state(self) -> torch.Tensor:
         return self.root_state_all[self.actor_indices.long()]
+
+    def _fingertip_positions_world(self) -> torch.Tensor:
+        fingertip_states = self.rigid_body_state[:, self.fingertip_body_indices]
+        fingertip_orientations = _normalize_canonical_quaternion(
+            fingertip_states[..., 3:7]
+        )
+        return fingertip_states[..., 0:3] + _quat_rotate(
+            fingertip_orientations, self.fingertip_offsets
+        )
 
     def _task_space_observation_components(self) -> Tuple[torch.Tensor, ...]:
         """Return the seven object/task-space blocks appended to the old 79D.
@@ -956,13 +1031,7 @@ class MotionImitationEnv:
             )
         )
 
-        fingertip_states = self.rigid_body_state[:, self.fingertip_body_indices]
-        fingertip_orientations = _normalize_canonical_quaternion(
-            fingertip_states[..., 3:7]
-        )
-        fingertip_positions_world = fingertip_states[..., 0:3] + _quat_rotate(
-            fingertip_orientations, self.fingertip_offsets
-        )
+        fingertip_positions_world = self._fingertip_positions_world()
         cube_center_fingertips_palm = _quat_rotate_inverse(
             palm_orientation_world.unsqueeze(1).expand(-1, 5, -1),
             self.cube_position.unsqueeze(1) - fingertip_positions_world,
@@ -1169,6 +1238,9 @@ class MotionImitationEnv:
             actor_ids = torch.cat((actor_ids, self.ghost_actor_indices[env_ids]))
         self._upload_dof_state(actor_ids)
         self._reset_cube_from_reference(env_ids, sample)
+        reset_object_height = self.cube_position[env_ids, 2]
+        self.episode_initial_object_com_height_m[env_ids] = reset_object_height
+        self.episode_peak_object_com_height_m[env_ids] = reset_object_height
         self.gym.set_dof_position_target_tensor(
             self.sim, gymtorch.unwrap_tensor(self.position_targets_all)
         )
@@ -1275,6 +1347,10 @@ class MotionImitationEnv:
         object_position_error_m = torch.linalg.vector_norm(
             object_position_error, dim=1
         )
+        object_com_height_m = self.cube_position[:, 2]
+        object_com_lift_m = (
+            object_com_height_m - self.episode_initial_object_com_height_m
+        )
         # q and -q represent the same rotation, hence abs(dot). The resulting
         # angle is the shortest geodesic rotation between the two orientations.
         actual_cube_orientation = _normalize_canonical_quaternion(
@@ -1315,6 +1391,29 @@ class MotionImitationEnv:
             object_orientation_error_rad.square(),
             rewards_cfg.object_orientation_std_rad,
         )
+        selected_fingertips_world = self._fingertip_positions_world()[
+            :, self.proximity_fingertip_indices
+        ]
+        cube_orientation_expanded = actual_cube_orientation.unsqueeze(1).expand(
+            -1, selected_fingertips_world.shape[1], -1
+        )
+        selected_fingertips_cube = _quat_rotate_inverse(
+            cube_orientation_expanded,
+            selected_fingertips_world - self.cube_position.unsqueeze(1),
+        )
+        proximity_active = (
+            self.reference_index >= self.rsi_pregrasp_start_index
+        )
+        (
+            fingertip_object_distance_reward,
+            fingertip_object_distance_m,
+            fingertip_object_distance_per_finger_m,
+        ) = fingertip_cuboid_proximity(
+            selected_fingertips_cube,
+            self.object_half_extents,
+            self.proximity_std_m,
+            proximity_active,
+        )
         if self.contact_enabled:
             (
                 fingertip_contact_reward,
@@ -1325,10 +1424,19 @@ class MotionImitationEnv:
                 self.contact_fingertip_body_indices,
                 self.contact_force_threshold_n,
             )
+            # Every fingertip, not only the reward's selection: the mean above
+            # hides which finger carries the load, and a diagnostic plot needs
+            # the ring and pinky too.
+            fingertip_force_n = fingertip_force_norms(
+                self.net_contact_forces, self.fingertip_body_indices
+            )
         else:
             fingertip_contact_reward = torch.zeros_like(position_reward)
             fingertip_contact_fraction = torch.zeros_like(position_reward)
             mean_fingertip_contact_force_n = torch.zeros_like(position_reward)
+            fingertip_force_n = position_reward.new_zeros(
+                (self.num_envs, len(FINGERTIP_BODY_NAMES))
+            )
         self.rew_buf.copy_(
             float(rewards_cfg.position_arm_weight) * position_reward
             + float(rewards_cfg.velocity_arm_weight) * velocity_reward
@@ -1341,6 +1449,7 @@ class MotionImitationEnv:
             * object_position_reward
             + float(rewards_cfg.object_orientation_weight)
             * object_orientation_reward
+            + self.proximity_weight * fingertip_object_distance_reward
             + self.contact_reward_per_finger * fingertip_contact_reward
         )
         return {
@@ -1361,12 +1470,27 @@ class MotionImitationEnv:
             "hand_velocity_reward": hand_velocity_reward,
             "hand_action_rate_reward": hand_action_rate_reward,
             "object_position_error_m": object_position_error_m,
+            "object_com_height_m": object_com_height_m,
+            "object_com_lift_m": object_com_lift_m,
             "object_orientation_error_rad": object_orientation_error_rad,
             "object_position_reward": object_position_reward,
             "object_orientation_reward": object_orientation_reward,
+            "fingertip_object_distance_reward": (
+                fingertip_object_distance_reward
+            ),
+            "fingertip_object_distance_m": fingertip_object_distance_m,
+            "fingertip_object_distance_per_finger_m": (
+                fingertip_object_distance_per_finger_m
+            ),
+            # The Gaussian is gated off before the pre-grasp window, so a zero
+            # reward there means "not yet active", not "far from the cube".
+            "proximity_active": proximity_active.to(
+                dtype=fingertip_object_distance_m.dtype
+            ),
             "fingertip_contact_reward": fingertip_contact_reward,
             "fingertip_contact_fraction": fingertip_contact_fraction,
             "mean_fingertip_contact_force_n": mean_fingertip_contact_force_n,
+            "fingertip_force_n": fingertip_force_n,
         }
 
     def threshold_violation(self, q_error: torch.Tensor) -> torch.Tensor:
@@ -1449,6 +1573,12 @@ class MotionImitationEnv:
     def _accumulate_episode_metrics(
         self, metrics: Dict[str, torch.Tensor]
     ) -> None:
+        self.episode_peak_object_com_height_m.copy_(
+            torch.maximum(
+                self.episode_peak_object_com_height_m,
+                metrics["object_com_height_m"],
+            )
+        )
         self.episode_sums["reward"] += self.rew_buf
         self.episode_sums["position_reward"] += metrics["position_reward"]
         self.episode_sums["velocity_reward"] += metrics["velocity_reward"]
@@ -1463,6 +1593,12 @@ class MotionImitationEnv:
         ]
         self.episode_sums["object_orientation_reward"] += metrics[
             "object_orientation_reward"
+        ]
+        self.episode_sums["fingertip_object_distance_reward"] += metrics[
+            "fingertip_object_distance_reward"
+        ]
+        self.episode_sums["fingertip_object_distance_m"] += metrics[
+            "fingertip_object_distance_m"
         ]
         self.episode_sums["object_position_error_m"] += metrics[
             "object_position_error_m"
@@ -1525,6 +1661,24 @@ class MotionImitationEnv:
             "horizon_fraction": horizon_timeout[done].float().mean(),
             "reference_end_fraction": reference_end[done].float().mean(),
             "completed_episodes": done.sum().to(dtype=torch.float32),
+            "mean_peak_object_com_height_m": (
+                self.episode_peak_object_com_height_m[done].mean()
+            ),
+            "max_peak_object_com_height_m": (
+                self.episode_peak_object_com_height_m[done].max()
+            ),
+            "mean_peak_object_com_lift_m": (
+                (
+                    self.episode_peak_object_com_height_m
+                    - self.episode_initial_object_com_height_m
+                )[done].mean()
+            ),
+            "max_peak_object_com_lift_m": (
+                (
+                    self.episode_peak_object_com_height_m
+                    - self.episode_initial_object_com_height_m
+                )[done].max()
+            ),
         }
         for name, values in self.episode_sums.items():
             summary["mean_{}".format(name)] = (values[done] / lengths).mean()
@@ -1623,7 +1777,17 @@ class MotionImitationEnv:
             "hand_action_rate_reward": metrics["hand_action_rate_reward"],
             "object_position_reward": metrics["object_position_reward"],
             "object_orientation_reward": metrics["object_orientation_reward"],
+            "fingertip_object_distance_reward": metrics[
+                "fingertip_object_distance_reward"
+            ],
+            "fingertip_object_distance_m": metrics[
+                "fingertip_object_distance_m"
+            ],
             "object_position_error_m": metrics["object_position_error_m"],
+            # Clone pre-reset COM diagnostics so the terminating sample is not
+            # replaced by the next episode's RSI pose.
+            "object_com_height_m": metrics["object_com_height_m"].clone(),
+            "object_com_lift_m": metrics["object_com_lift_m"].clone(),
             "object_orientation_error_rad": metrics[
                 "object_orientation_error_rad"
             ],
@@ -1634,6 +1798,11 @@ class MotionImitationEnv:
             "mean_fingertip_contact_force_n": metrics[
                 "mean_fingertip_contact_force_n"
             ],
+            "fingertip_force_n": metrics["fingertip_force_n"],
+            "fingertip_object_distance_per_finger_m": metrics[
+                "fingertip_object_distance_per_finger_m"
+            ],
+            "proximity_active": metrics["proximity_active"],
         }
         rewards = self.rew_buf.clone()
         dones = done.clone()
