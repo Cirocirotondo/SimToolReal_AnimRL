@@ -168,11 +168,14 @@ The environment follows AnimRL's five-value vectorized step contract:
 observations, privileged_observations, rewards, dones, infos = env.step(actions)
 ```
 
-External collision filtering keeps robot-table and UR5e-arm-to-cube contacts
-disabled, including `wrist_3_link`. Cube contacts remain enabled for the
-articulated DG5F finger bodies and for the table. Because fixed joints are
-collapsed, the static DG5F mount/palm collision shapes belong to wrist 3 and
-are filtered from the cube with it.
+External collision filtering keeps robot-table contacts disabled everywhere,
+and UR5e-arm-to-cube contacts disabled up to `wrist_2_link`. Cube contacts
+remain enabled for the whole hand assembly and for the table. Because fixed
+joints are collapsed, the static DG5F mount/base/palm collision shapes belong
+to `wrist_3_link`, so that body is grouped with the articulated `rl_dg_*`
+fingers rather than with the arm: otherwise the palm could not support a grasp.
+Wrist 3 therefore also contacts the cube through its own mesh, which sits about
+0.099 m behind the flange while the palm sits about 0.074 m in front of it.
 
 `infos["time_outs"]` is true for the configured horizon and for the end of the
 reference motion, allowing PPO to bootstrap those transitions. It stays false
