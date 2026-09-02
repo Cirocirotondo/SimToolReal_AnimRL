@@ -76,6 +76,25 @@ starting Isaac Gym. `--robustness-seeds`, `--object-scales`, `--object-seed`,
 `--iterations`, `--num-envs`, video/evaluation switches, and repeated
 `--set PATH=VALUE` overrides are also available.
 
+### No-object entropy sweep
+
+`scripts/run_no_object_entropy_sweep.py` launches five independent scratch
+replicas of the no-object-reward robustness training. Every run uses seed `42`
+and 12000 PPO updates; the only varied setting is `entropy_coef`, tested at
+`0.005, 0.002, 0.001, 0.0005, 0.0`. The already-tested divergent
+`entropy_coef=0.01` case is intentionally omitted. Cube position, cube
+orientation, fingertip proximity, and contact rewards are all explicitly
+disabled.
+
+```bash
+/home/simone/.venv/bin/python scripts/run_no_object_entropy_sweep.py
+```
+
+Runs are stored below a timestamped `*_no_object_entropy_sweep_seed_42`
+directory and summarized in `entropy_sweep.json`. A failed or diverged run does
+not stop the remaining independent experiments. Use `--dry-run` to inspect all
+five commands without starting Isaac Gym.
+
 ### Pre-grasp proximity training
 
 `scripts/run_pregrasp_proximity.py` launches one independent scratch training
@@ -95,6 +114,18 @@ the stable seed from the preceding robustness experiment. Use `--dry-run` to
 inspect the exact command; the iteration count, seed, reward weights,
 evaluation/video options, number of environments, and output directory are
 configurable.
+
+`scripts/run_pregrasp_entropy_sweep.py` repeats that exact scratch experiment
+five times with seed `43`, changing only `entropy_coef` across `0.005, 0.002,
+0.001, 0.0005, 0.0`. The already-tested `0.01` run is omitted. Every run is
+independent, and a failure or divergence does not stop the remaining values:
+
+```bash
+/home/simone/.venv/bin/python scripts/run_pregrasp_entropy_sweep.py
+```
+
+The timestamped output directory contains one subdirectory per coefficient and
+an `entropy_sweep.json` manifest. Use `--dry-run` to inspect the commands.
 
 ### Object-reward hyperparameter sweep
 
