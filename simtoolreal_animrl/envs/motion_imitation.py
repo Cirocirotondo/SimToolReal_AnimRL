@@ -771,7 +771,7 @@ class MotionImitationEnv:
         )
 
     def _resolve_observation_body_indices(self) -> None:
-        """Resolve the surviving rigid bodies used by the 114D observation."""
+        """Resolve the surviving rigid bodies used by the 108D observation."""
         env = self.envs[0]
         actor = self.robot_handles[0]
 
@@ -1091,18 +1091,15 @@ class MotionImitationEnv:
         )
 
     def _task_space_observation_components(self) -> Tuple[torch.Tensor, ...]:
-        """Return the seven object/task-space blocks appended to the old 79D.
+        """Return the five task-space blocks appended to the old 79D.
 
-        All cube-relative vectors are expressed in the palm frame.  Palm pose
-        is expressed in the robot actor-base frame.  Relative linear velocity
-        includes the rotating-frame transport term, so it is the derivative of
-        the palm-frame cube displacement rather than only a velocity difference.
+        Palm pose is expressed in the robot actor-base frame. Fingertip
+        positions and cube pose are expressed relative to the palm frame. Cube
+        and palm velocities are deliberately absent from this 108D experiment.
         """
         wrist = self.rigid_body_state[:, self.wrist_body_index]
         wrist_position = wrist[:, 0:3]
         wrist_orientation = _normalize_canonical_quaternion(wrist[:, 3:7])
-        wrist_linear_velocity = wrist[:, 7:10]
-        wrist_angular_velocity = wrist[:, 10:13]
 
         palm_offset_world = _quat_rotate(
             wrist_orientation, self.palm_position_in_wrist
@@ -1113,11 +1110,6 @@ class MotionImitationEnv:
                 wrist_orientation, self.palm_orientation_in_wrist
             )
         )
-        palm_linear_velocity_world = wrist_linear_velocity + torch.cross(
-            wrist_angular_velocity, palm_offset_world, dim=-1
-        )
-        palm_angular_velocity_world = wrist_angular_velocity
-
         robot_root = self.robot_root_state
         robot_position_world = robot_root[:, 0:3]
         robot_orientation_world = _normalize_canonical_quaternion(
@@ -1144,31 +1136,16 @@ class MotionImitationEnv:
         )
 
         fingertip_positions_world = self._fingertip_positions_world()
-        cube_center_fingertips_palm = _quat_rotate_inverse(
+        fingertip_positions_palm = _quat_rotate_inverse(
             palm_orientation_world.unsqueeze(1).expand(-1, 5, -1),
-            self.cube_position.unsqueeze(1) - fingertip_positions_world,
+            fingertip_positions_world - palm_position_world.unsqueeze(1),
         ).reshape(self.num_envs, 15)
-
-        cube_linear_velocity_palm = _quat_rotate_inverse(
-            palm_orientation_world,
-            self.cube_linear_velocity
-            - palm_linear_velocity_world
-            - torch.cross(
-                palm_angular_velocity_world, cube_displacement_world, dim=-1
-            ),
-        )
-        cube_angular_velocity_palm = _quat_rotate_inverse(
-            palm_orientation_world,
-            self.cube_angular_velocity - palm_angular_velocity_world,
-        )
         return (
             palm_position_robot,
             palm_orientation_robot,
-            cube_center_palm,
+            fingertip_positions_palm,
             cube_orientation_palm,
-            cube_center_fingertips_palm,
-            cube_linear_velocity_palm,
-            cube_angular_velocity_palm,
+            cube_center_palm,
         )
 
     @property
@@ -1268,6 +1245,18 @@ class MotionImitationEnv:
     def positions_to_actions(self, positions: torch.Tensor) -> torch.Tensor:
         """Invert the AnimRL residual mapping for ideal reference playback."""
         return (positions - self.default_positions) / self.action_scales
+
+    def demonstration_action_delta(
+        self, reference_velocity: torch.Tensor
+    ) -> torch.Tensor:
+        """Convert ``dq_ref * dt`` from joint space to residual-action space.
+
+        Policy actions are dimensionless residuals with
+        ``q_target = q_default + action_scale * action``. Consequently a
+        demonstrated joint displacement must be divided by each joint's action
+        scale before it can be compared with ``a_t - a_{t-1}``.
+        """
+        return reference_velocity * self.dt / self.action_scales
 
     def next_reference_action(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the ideal 26-joint action and the complete next pose."""
@@ -1437,9 +1426,11 @@ class MotionImitationEnv:
         arm_dq_error = self.arm_dq - reference_arm_dq
         hand_q_error = self.hand_q - reference_hand_q
         hand_dq_error = self.hand_dq - reference_hand_dq
-        action_rate = self.actions - self.previous_actions
-        arm_action_rate = action_rate[:, : len(ARM_JOINT_NAMES)]
-        hand_action_rate = action_rate[:, len(ARM_JOINT_NAMES):]
+        action_delta = self.actions - self.previous_actions
+        reference_action_delta = self.demonstration_action_delta(reference.dq)
+        action_delta_error = action_delta - reference_action_delta
+        arm_action_delta_error = action_delta_error[:, : len(ARM_JOINT_NAMES)]
+        hand_action_delta_error = action_delta_error[:, len(ARM_JOINT_NAMES):]
 
         # Arm and hand keep separate Gaussians: averaging one MSE over all 26
         # joints would let the 20 hand joints outvote the 6 arm joints in a
@@ -1447,10 +1438,10 @@ class MotionImitationEnv:
         rewards_cfg = self.cfg.rewards
         position_mse = arm_q_error.square().mean(dim=1)
         velocity_mse = arm_dq_error.square().mean(dim=1)
-        action_rate_mse = arm_action_rate.square().mean(dim=1)
+        action_rate_mse = arm_action_delta_error.square().mean(dim=1)
         hand_position_mse = hand_q_error.square().mean(dim=1)
         hand_velocity_mse = hand_dq_error.square().mean(dim=1)
-        hand_action_rate_mse = hand_action_rate.square().mean(dim=1)
+        hand_action_rate_mse = hand_action_delta_error.square().mean(dim=1)
 
         reference_cube_root_state = self._cube_reference_root_states(reference)
         object_position_error = (
@@ -1575,6 +1566,8 @@ class MotionImitationEnv:
             "hand_position_mse": hand_position_mse,
             "hand_velocity_mse": hand_velocity_mse,
             "hand_action_rate_mse": hand_action_rate_mse,
+            "reference_action_delta": reference_action_delta,
+            "action_delta_error": action_delta_error,
             "position_reward": position_reward,
             "velocity_reward": velocity_reward,
             "action_rate_reward": action_rate_reward,

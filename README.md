@@ -35,29 +35,66 @@ configured early/pre-grasp RSI mixture, executes ideal AnimRL residual actions, 
 tracking, reward, early termination, object physics, collision filtering, and
 the Cartwheel-style reference-end timeout.
 
-The policy observation has 114 values. The first 79 are 26 normalized joint
+The policy observation has 108 values. The first 79 are 26 normalized joint
 positions, 26 previously applied physical joint targets, 26 joint velocities,
-and phase. They are followed by palm pose in the robot-base frame (7), cube
-pose relative to the palm (7), cube-center vectors from the five fingertips in
-the palm frame (15), and cube linear/angular velocity relative to the palm (6).
+and phase. They are followed by palm pose in the robot-base frame (7), the five
+fingertip positions relative to the palm center in the palm frame (15), cube
+orientation relative to the palm (4), and cube center relative to the palm (3).
 The 26 actions use AnimRL's unbounded residual parameterization around the
 first pose of the demonstration, with separate arm and hand residual scales.
 
-The Gaussian joint imitation terms cover arm and hand separately. The object
-is tracked at every reference sample with Gaussian center-position and
-orientation rewards; object velocity is observed but is not rewarded. From
-`env.rsi_pregrasp_start_index` onward, a dense Gaussian term rewards smaller
-surface distances from thumb, index and middle fingertips to the oriented
-cuboid. Its weight, width and selected fingers are configured by
-`rewards.fingertip_object_distance_*`. Early
-termination is based on arm and hand joint drift and on the cube center staying
-within `termination.object_position_threshold_m` of its reference target. All
-three conditions use the configured consecutive-step grace period. Set
-`termination.object_position_enabled=false` to disable only the cube-distance
-condition while retaining the arm and hand early terminations.
+The Gaussian reward weights and widths and the arm/hand early terminations match
+the `2026-08-28_173516_no_object_reward/model_7500.pt` run. The action-delta
+terms differ intentionally: they track the demonstrated displacement using
+`(a_t-a_{t-1}) - dq_demo*dt/action_scale`, instead of rewarding zero action
+change. Cube-pose, fingertip-proximity and contact rewards are disabled, as is
+cube-distance early termination. The cube remains part of the observation.
 
-The 114D network input is checkpoint-incompatible with the earlier 79D policy.
-Those checkpoints must not be resumed for this object-training family.
+The 108D network input is checkpoint-incompatible with both the earlier 79D
+policy and the 114D `model_7500.pt`; this experiment must start from scratch.
+
+### Robustness and object-reward experiments
+
+`scripts/run_robustness_object_reward.py` launches seven independent scratch
+trainings of the current 108D experiment, with 12000 PPO updates each. The first
+group runs the no-object-reward baseline with seeds `42, 43, 44`. The second
+group uses seed `42` for all four runs and multiplies the cube-position and
+cube-orientation reward weights by `1.0, 0.8, 0.6, 0.4`. Keeping one seed fixed
+in the second group isolates the reward-scale comparison. Fingertip proximity
+and contact rewards remain disabled in both groups.
+
+Runs are stored below one timestamped `*_robustness_object_reward` directory
+and summarized in `experiment_sweep.json`. A failed or diverged run is recorded
+but does not stop the remaining experiments.
+
+```bash
+/home/simone/.venv/bin/python scripts/run_robustness_object_reward.py
+```
+
+Use `--dry-run` to inspect the seven generated `train.py` commands without
+starting Isaac Gym. `--robustness-seeds`, `--object-scales`, `--object-seed`,
+`--iterations`, `--num-envs`, video/evaluation switches, and repeated
+`--set PATH=VALUE` overrides are also available.
+
+### Pre-grasp proximity training
+
+`scripts/run_pregrasp_proximity.py` launches one independent scratch training
+whose RSI starts are uniformly restricted to the pre-grasp frames `740..830`.
+It uses the current 108D observation and demonstration-aware action-delta
+reward, restores the parent `object` branch's cube-position (`0.8`),
+cube-orientation (`0.2`), and thumb/index/middle proximity (`0.2`) reward
+weights, and keeps contact shaping off. Cube-distance early termination is
+enabled at the configured `0.05 m` threshold with a five-step grace period.
+
+```bash
+/home/simone/.venv/bin/python scripts/run_pregrasp_proximity.py
+```
+
+The default run has 12000 PPO updates, 200-step episodes, and uses seed `43`,
+the stable seed from the preceding robustness experiment. Use `--dry-run` to
+inspect the exact command; the iteration count, seed, reward weights,
+evaluation/video options, number of environments, and output directory are
+configurable.
 
 ### Object-reward hyperparameter sweep
 
@@ -308,7 +345,7 @@ from reference sample zero with one headless environment:
 ```
 
 The evaluator automatically loads `config.json` from the checkpoint directory,
-validates the 114D/26D environment contract, and writes
+validates the 108D/26D environment contract, and writes
 `eval_model_3000.json`. To display the same rollout in Isaac Gym:
 
 ```bash

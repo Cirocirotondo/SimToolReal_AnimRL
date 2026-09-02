@@ -6,28 +6,22 @@ from .base_config import BaseEnvCfg, BaseTrainCfg
 class SimToolRealCfg(BaseEnvCfg):
     class env(BaseEnvCfg.env):
         num_envs = 4096
-        episode_length = 300
+        # Match the 2026-08-28 no_object_reward reference run.
+        episode_length = 100
         num_actions = 26
-        # Existing 79D proprioception, followed by: palm pose in the robot-base
-        # frame (3+4), cube pose relative to palm (3+4), cube center relative
-        # to five fingertips in the palm frame (15), and cube linear/angular
-        # velocity relative to the palm (3+3).
-        num_observations = 114
+        # Existing 79D proprioception, followed by palm pose in the robot-base
+        # frame (3+4), five fingertip positions relative to the palm (15), and
+        # cube orientation/center relative to the palm (4+3).
+        num_observations = 108
         num_privileged_obs = None
         reference_state_initialization = True
-        # Uniform over every start the cube can survive. The 830 ceiling still
-        # keeps resets out of the unstable post-grasp part of the 1108-frame
-        # demonstration, but within it each frame is now equally likely. The
-        # pregrasp_mixture alternative put 80% of resets in [740, 830], making
-        # a pre-grasp frame 32x likelier than an approach frame and leaving the
-        # approach at 3-8% episode coverage: enough to learn the grasp from an
-        # RSI reset, not enough to reach it from frame 0 at deployment. The two
-        # fields below are read only by "pregrasp_mixture" and are kept so the
-        # skewed distribution can be restored without re-deriving its bounds.
+        # The reference run sampled uniformly from every valid start frame.
+        # The demonstration has indices 0..1107 and 1107 is reserved for the
+        # reference-end timeout, hence the inclusive maximum start is 1106.
         reference_init_distribution = "uniform"
         rsi_early_probability = 0.20
         rsi_pregrasp_start_index = 740
-        rsi_max_start_index = 830
+        rsi_max_start_index = 1106
 
     class asset:
         file = "assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf"
@@ -124,17 +118,16 @@ class SimToolRealCfg(BaseEnvCfg):
         reward_per_finger = 0.05
 
     class rewards:
-        # Arm and hand keep separate Gaussian terms so neither dilutes the
-        # other's gradient. The hand weights are 0.6x the arm's, which is what
-        # the handmult_0.6 run is named after. Robot terms sum to 1.92 and the
-        # object pose terms add 1.0. Proximity adds at most 0.2 from frame 740,
-        # for a maximum per-step reward of 3.12 while contact shaping is off.
+        # Same weights and Gaussian widths as no_object_reward. Arm and hand
+        # terms sum to a maximum per-step reward of 1.92.
         position_arm_weight = 0.8
         velocity_arm_weight = 0.2
         action_rate_arm_weight = 0.2
         position_arm_std_rad = 0.223607
         velocity_arm_std_rad_per_s = 1.0
-        # Action-rate regularization on a_t - a_{t-1}, per block.
+        # Demonstration-aware action-delta tracking, per block. The error is
+        # (a_t - a_{t-1}) - dq_demo * dt / action_scale because policy actions
+        # are dimensionless residuals rather than joint angles.
         action_rate_arm_std = 5
 
         position_hand_weight = 0.48
@@ -144,18 +137,15 @@ class SimToolRealCfg(BaseEnvCfg):
         velocity_hand_std_rad_per_s = 1.0
         action_rate_hand_std = 5
 
-        # Full object-pose imitation. Position is the Euclidean center error in
-        # metres; orientation is the sign-invariant quaternion geodesic angle
-        # in radians. Cube velocity is deliberately not rewarded.
-        object_position_weight = 0.8
-        object_orientation_weight = 0.2
+        # The cube remains observable but its pose is not rewarded.
+        object_position_weight = 0.0
+        object_orientation_weight = 0.0
         object_position_std_m = 0.05
         object_orientation_std_rad = 0.5
 
-        # Dense grasp shaping for thumb, index and middle fingertips. It uses
-        # exact distance to the oriented cuboid surface and is gated off until
-        # the reference reaches env.rsi_pregrasp_start_index.
-        fingertip_object_distance_weight = 0.2
+        # Introduced after the reference run; retained for compatibility but
+        # disabled so it cannot change this experiment's reward.
+        fingertip_object_distance_weight = 0.0
         fingertip_object_distance_std_m = 0.04
         fingertip_object_distance_names = ["thumb", "index", "middle"]
 
@@ -163,7 +153,7 @@ class SimToolRealCfg(BaseEnvCfg):
         enabled = True
         arm_position_threshold_rad = 0.35
         hand_position_threshold_rad = 1.35
-        object_position_enabled = True
+        object_position_enabled = False
         # End an episode when the physical cube remains farther than this
         # Euclidean center distance from the demonstrated cube target.
         object_position_threshold_m = 0.05
@@ -175,5 +165,5 @@ class SimToolRealTrainCfg(BaseTrainCfg):
 
     class runner(BaseTrainCfg.runner):
         experiment_name = "simtoolreal"
-        run_name = "handmult_0.6"
+        run_name = "no_object_reward_obs108"
         max_iterations = 6000

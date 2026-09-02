@@ -515,14 +515,18 @@ class EvaluationPlotter:
         _finish_axis(axes[1], "Velocity error [rad/s]")
 
         axes[2].plot(
-            time_s, data["rms_action_rate"], label="arm RMS |a_t - a_(t-1)|",
+            time_s,
+            data["rms_action_rate"],
+            label="arm RMS |delta(a) - delta(a_demo)|",
             linewidth=1.3,
         )
         axes[2].plot(
-            time_s, data["rms_hand_action_rate"], label="hand RMS |a_t - a_(t-1)|",
+            time_s,
+            data["rms_hand_action_rate"],
+            label="hand RMS |delta(a) - delta(a_demo)|",
             linewidth=1.3,
         )
-        _finish_axis(axes[2], "Action rate")
+        _finish_axis(axes[2], "Action-delta tracking error")
         axes[2].set_xlabel("Episode time [s]")
 
         fig.suptitle("Tracking errors — {}".format(self._slug))
