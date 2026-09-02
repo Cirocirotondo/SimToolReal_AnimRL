@@ -537,7 +537,7 @@ def run_worker(args):
     )
     runner = None
     try:
-        expected_obs = 114
+        expected_obs = 108
         if env.num_obs != expected_obs:
             raise ValueError(
                 "Observation layout changed: {} != {}. The noise slices in this "

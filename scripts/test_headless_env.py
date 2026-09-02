@@ -228,8 +228,8 @@ def assert_observation_contract(env):
     import torch
 
     obs = env.get_observations()
-    if obs.shape != (env.num_envs, 114):
-        raise AssertionError("Expected 114D observations, got {}".format(obs.shape))
+    if obs.shape != (env.num_envs, 108):
+        raise AssertionError("Expected 108D observations, got {}".format(obs.shape))
 
     expected_phase = (
         env.reference_index.float() / float(env.reference.last_index)
@@ -246,16 +246,36 @@ def assert_observation_contract(env):
         dim=1,
     )
     if not bool(torch.allclose(obs, expected, rtol=0.0, atol=1e-6)):
-        raise AssertionError("The 114D observation blocks are inconsistent")
+        raise AssertionError("The 108D observation blocks are inconsistent")
 
     if not bool(((obs[:, :6] >= -1.0) & (obs[:, :6] <= 1.0)).all()):
         raise AssertionError("Normalized arm positions escaped [-1, 1]")
 
-    block_widths = (3, 4, 3, 4, 15, 3, 3)
+    block_widths = (3, 4, 15, 4, 3)
     if tuple(component.shape[1] for component in task_space) != block_widths:
         raise AssertionError("Task-space observation block widths are incorrect")
+    fingertip_positions_palm = task_space[2].reshape(env.num_envs, 5, 3)
+    cube_center_palm = task_space[4].unsqueeze(1)
+    observed_tip_cube_distances = torch.linalg.vector_norm(
+        fingertip_positions_palm - cube_center_palm, dim=2
+    )
+    expected_tip_cube_distances = torch.linalg.vector_norm(
+        env._fingertip_positions_world() - env.cube_position.unsqueeze(1),
+        dim=2,
+    )
+    if not bool(
+        torch.allclose(
+            observed_tip_cube_distances,
+            expected_tip_cube_distances,
+            rtol=0.0,
+            atol=1e-6,
+        )
+    ):
+        raise AssertionError(
+            "Fingertip observations are not palm-relative positions"
+        )
     palm_quaternion = obs[:, 82:86]
-    cube_quaternion = obs[:, 89:93]
+    cube_quaternion = obs[:, 101:105]
     for name, quaternion in (
         ("palm", palm_quaternion),
         ("cube relative to palm", cube_quaternion),
@@ -273,7 +293,7 @@ def assert_observation_contract(env):
             raise AssertionError("{} quaternion sign is not canonical".format(name))
 
     if not bool(torch.isfinite(obs).all()):
-        raise AssertionError("The 114D observation contains NaN or infinity")
+        raise AssertionError("The 108D observation contains NaN or infinity")
 
 
 def assert_reward_contract(env):
@@ -305,7 +325,9 @@ def assert_reward_contract(env):
     if metrics["hand_q_error"].shape != (env.num_envs, 20):
         raise AssertionError("Hand diagnostics have an unexpected shape")
     if metrics["action_rate_reward"].shape != (env.num_envs,):
-        raise AssertionError("Action-rate regularization has an unexpected shape")
+        raise AssertionError(
+            "Action-delta tracking reward has an unexpected shape"
+        )
     if metrics["object_position_error_m"].shape != (env.num_envs,):
         raise AssertionError("Object position error has an unexpected shape")
     if metrics["object_orientation_error_rad"].shape != (env.num_envs,):
@@ -369,6 +391,56 @@ def assert_reward_contract(env):
     )
     if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-7)):
         raise AssertionError("Reward does not match the configured weights")
+
+
+def assert_demonstration_action_delta_reward(env):
+    import torch
+
+    original_actions = env.actions.clone()
+    original_previous_actions = env.previous_actions.clone()
+    reference = env.reference.sample(env.reference_index)
+    expected_delta = reference.dq * env.dt / env.action_scales
+    if not bool(
+        torch.allclose(
+            env.demonstration_action_delta(reference.dq),
+            expected_delta,
+            rtol=0.0,
+            atol=1e-8,
+        )
+    ):
+        raise AssertionError("Demonstration velocity was mapped incorrectly")
+
+    env.actions.copy_(env.previous_actions + expected_delta)
+    matched = env._compute_reward_and_errors()
+    if not bool(
+        torch.allclose(
+            matched["action_delta_error"],
+            torch.zeros_like(matched["action_delta_error"]),
+            rtol=0.0,
+            # a_{t-1} can be O(10) in residual space; adding then subtracting
+            # the small demonstrated delta loses a few float32 ulps.
+            atol=1e-6,
+        )
+    ):
+        raise AssertionError(
+            "The demonstrated action delta does not maximize regularization"
+        )
+
+    env.actions.copy_(env.previous_actions)
+    static = env._compute_reward_and_errors()
+    if not bool(
+        torch.allclose(
+            static["action_delta_error"],
+            -expected_delta,
+            rtol=0.0,
+            atol=1e-8,
+        )
+    ):
+        raise AssertionError("A zero action delta has the wrong tracking error")
+
+    env.actions.copy_(original_actions)
+    env.previous_actions.copy_(original_previous_actions)
+    env._compute_reward_and_errors()
 
 
 def assert_ppo_step_contract(env, obs, critic_obs, rewards, dones, extras):
@@ -674,7 +746,10 @@ def assert_early_termination_logic(env):
     ):
         raise AssertionError("Hand-only violation was not attributed to the hand")
 
-    # The cube alone must also end the episode after the same grace period.
+    # The optional cube condition must work when enabled, even though this
+    # no-object-reward experiment keeps it disabled by default.
+    original_object_enabled = env.cfg.termination.object_position_enabled
+    env.cfg.termination.object_position_enabled = True
     env.arm_violation_steps.zero_()
     env.hand_violation_steps.zero_()
     env.object_violation_steps.zero_()
@@ -700,7 +775,6 @@ def assert_early_termination_logic(env):
 
     # The object condition can be disabled without switching off the arm and
     # hand early-termination machinery.
-    original_object_enabled = env.cfg.termination.object_position_enabled
     env.cfg.termination.object_position_enabled = False
     env.arm_violation_steps.zero_()
     env.hand_violation_steps.zero_()
@@ -828,6 +902,7 @@ def main():
         env.gym.refresh_actor_root_state_tensor(env.sim)
         assert_observation_contract(env)
         assert_reward_contract(env)
+        assert_demonstration_action_delta_reward(env)
         assert_correct_pd_gains(env)
         # Exact joint targets do not guarantee that the dynamic cube remains
         # grasped, so exercise the complete horizon without the object-distance
@@ -885,9 +960,10 @@ def main():
         print("  cube/table physics        : verified")
         print("  collision filtering       : verified")
         print("  vectorized object RSI      : verified")
-        print("  114D observation contract : verified")
+        print("  108D observation contract : verified")
         print("  policy-driven hand        : verified")
-        print("  robot+object reward       : verified")
+        print("  no-object reward contract : verified")
+        print("  demo action-delta reward  : verified")
         print("  PPO step/info contract     : verified")
         print("  horizon/reference timeout : verified")
         print("  early termination/no boot.: verified")

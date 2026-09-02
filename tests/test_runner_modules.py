@@ -285,22 +285,23 @@ class RunnerModulesTest(unittest.TestCase):
         how to reach it from frame 0.
         """
         settings = resolve_rsi_settings(self.env_cfg.env, 1107)
-        self.assertEqual(settings, ("uniform", 830, 740, 0.20))
+        self.assertEqual(settings, ("uniform", 1106, 740, 0.20))
         generator = torch.Generator(device="cpu")
         generator.manual_seed(123)
         indices = sample_rsi_indices(
             100000, torch.device("cpu"), *settings, generator=generator
         )
         self.assertGreaterEqual(int(indices.min()), 0)
-        self.assertLessEqual(int(indices.max()), 830)
-        # 91 of the 831 reachable frames lie in the old pre-grasp window.
+        self.assertLessEqual(int(indices.max()), 1106)
+        # 367 of the 1107 valid starts lie at or beyond frame 740.
         pregrasp_fraction = float((indices >= 740).float().mean())
-        self.assertAlmostEqual(pregrasp_fraction, 91.0 / 831.0, delta=0.01)
+        self.assertAlmostEqual(pregrasp_fraction, 367.0 / 1107.0, delta=0.01)
 
     def test_pregrasp_rsi_mixture_respects_ranges_and_probability(self):
         """The skewed sampler stays correct even though it is no longer default."""
         env_cfg = SimToolRealCfg()
         env_cfg.env.reference_init_distribution = "pregrasp_mixture"
+        env_cfg.env.rsi_max_start_index = 830
         settings = resolve_rsi_settings(env_cfg.env, 1107)
         self.assertEqual(settings, ("pregrasp_mixture", 830, 740, 0.20))
         generator = torch.Generator(device="cpu")

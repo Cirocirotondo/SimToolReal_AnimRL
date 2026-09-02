@@ -163,6 +163,7 @@ class PPO:
         fingertip_contact_fraction_sum = 0.0
         fingertip_contact_force_sum = 0.0
         rms_hand_position_error_sum = 0.0
+        rms_hand_action_rate_sum = 0.0
         rms_position_error_sum = 0.0
         rms_velocity_error_sum = 0.0
         rms_action_rate_sum = 0.0
@@ -234,6 +235,9 @@ class PPO:
                 )
                 hand_action_rate_reward_sum += float(
                     infos["hand_action_rate_reward"].mean()
+                )
+                rms_hand_action_rate_sum += float(
+                    infos["rms_hand_action_rate"].mean()
                 )
                 object_position_reward_sum += float(
                     infos["object_position_reward"].mean()
@@ -346,6 +350,9 @@ class PPO:
             ),
             "mean_rms_hand_position_error": (
                 rms_hand_position_error_sum / rollout_steps
+            ),
+            "mean_rms_hand_action_rate": (
+                rms_hand_action_rate_sum / rollout_steps
             ),
             "mean_rms_position_error": rms_position_error_sum / rollout_steps,
             "mean_rms_velocity_error": rms_velocity_error_sum / rollout_steps,
@@ -670,10 +677,12 @@ class PPO:
             "Train/mean_step_reward": "mean_reward",
             "Reward/position": "mean_position_reward",
             "Reward/velocity": "mean_velocity_reward",
-            "Reward/action_rate": "mean_action_rate_reward",
+            "Reward/action_delta_tracking": "mean_action_rate_reward",
             "Reward/hand_position": "mean_hand_position_reward",
             "Reward/hand_velocity": "mean_hand_velocity_reward",
-            "Reward/hand_action_rate": "mean_hand_action_rate_reward",
+            "Reward/hand_action_delta_tracking": (
+                "mean_hand_action_rate_reward"
+            ),
             "Reward/object_position": "mean_object_position_reward",
             "Reward/object_orientation": "mean_object_orientation_reward",
             "Reward/fingertip_object_distance": (
@@ -697,7 +706,10 @@ class PPO:
             "Tracking/rms_arm_position_error": "mean_rms_position_error",
             "Tracking/rms_arm_velocity_error": "mean_rms_velocity_error",
             "Tracking/max_abs_arm_position_error": "max_abs_position_error",
-            "Policy/rms_action_rate": "mean_rms_action_rate",
+            "Policy/rms_action_delta_error": "mean_rms_action_rate",
+            "Policy/rms_hand_action_delta_error": (
+                "mean_rms_hand_action_rate"
+            ),
             "Policy/mean_action_std": "mean_action_std",
             "Policy/action_target_clipped_fraction": (
                 "action_target_clipped_fraction"

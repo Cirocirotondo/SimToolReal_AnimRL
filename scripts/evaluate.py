@@ -203,8 +203,8 @@ def main():
         # term contributes nothing and the return stays comparable to training.
         env_cfg.contact.enabled = True
         env_cfg.contact.reward_per_finger = 0.0
-    if int(env_cfg.env.num_observations) != 114:
-        raise ValueError("This evaluator requires the 114D observation contract")
+    if int(env_cfg.env.num_observations) != 108:
+        raise ValueError("This evaluator requires the 108D observation contract")
     if int(env_cfg.env.num_actions) != 26:
         raise ValueError("This evaluator requires 26 AnimRL residual actions")
 

@@ -12,13 +12,13 @@ class ConfigAndDemoTest(unittest.TestCase):
         env_cfg = SimToolRealCfg()
         train_cfg = SimToolRealTrainCfg()
         self.assertEqual(env_cfg.env.num_envs, 4096)
-        self.assertEqual(env_cfg.env.episode_length, 300)
-        self.assertEqual(env_cfg.env.num_observations, 114)
+        self.assertEqual(env_cfg.env.episode_length, 100)
+        self.assertEqual(env_cfg.env.num_observations, 108)
         self.assertEqual(env_cfg.env.num_actions, 26)
         self.assertEqual(env_cfg.env.reference_init_distribution, "uniform")
         self.assertEqual(env_cfg.env.rsi_early_probability, 0.20)
         self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 740)
-        self.assertEqual(env_cfg.env.rsi_max_start_index, 830)
+        self.assertEqual(env_cfg.env.rsi_max_start_index, 1106)
         self.assertEqual(
             env_cfg.control.action_parameterization, "animrl_residual"
         )
@@ -32,13 +32,28 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.object.mass_kg, 0.2)
         self.assertEqual(env_cfg.object.friction, 0.5)
         self.assertEqual(env_cfg.object.restitution, 0.0)
-        # Fine-tuning from the no-object checkpoint reintroduces full cube-pose
-        # tracking while the independently configurable contact reward stays
-        # disabled.
-        self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
-        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.2)
+        # Same weights, widths and terminations as model_7500; the environment
+        # separately tests the new demonstration-aware action-delta error.
+        expected_robot_rewards = {
+            "position_arm_weight": 0.8,
+            "velocity_arm_weight": 0.2,
+            "action_rate_arm_weight": 0.2,
+            "position_arm_std_rad": 0.223607,
+            "velocity_arm_std_rad_per_s": 1.0,
+            "action_rate_arm_std": 5,
+            "position_hand_weight": 0.48,
+            "velocity_hand_weight": 0.12,
+            "action_rate_hand_weight": 0.12,
+            "position_hand_std_rad": 0.223607,
+            "velocity_hand_std_rad_per_s": 1.0,
+            "action_rate_hand_std": 5,
+        }
+        for name, expected in expected_robot_rewards.items():
+            self.assertEqual(getattr(env_cfg.rewards, name), expected)
+        self.assertEqual(env_cfg.rewards.object_position_weight, 0.0)
+        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.0)
         self.assertEqual(
-            env_cfg.rewards.fingertip_object_distance_weight, 0.2
+            env_cfg.rewards.fingertip_object_distance_weight, 0.0
         )
         self.assertEqual(
             env_cfg.rewards.fingertip_object_distance_std_m, 0.04
@@ -50,8 +65,12 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertFalse(env_cfg.contact.enabled)
         self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
         self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
-        self.assertTrue(env_cfg.termination.object_position_enabled)
+        self.assertFalse(env_cfg.termination.object_position_enabled)
         self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.05)
+        self.assertTrue(env_cfg.termination.enabled)
+        self.assertEqual(env_cfg.termination.arm_position_threshold_rad, 0.35)
+        self.assertEqual(env_cfg.termination.hand_position_threshold_rad, 1.35)
+        self.assertEqual(env_cfg.termination.grace_steps, 5)
         self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.035)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)
