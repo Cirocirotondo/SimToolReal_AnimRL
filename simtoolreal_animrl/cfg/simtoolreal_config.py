@@ -165,5 +165,5 @@ class SimToolRealTrainCfg(BaseTrainCfg):
 
     class runner(BaseTrainCfg.runner):
         experiment_name = "simtoolreal"
-        run_name = "new_demo_lr5em5_ec1em3_lenenv200_numenv4096"
+        run_name = "new_demo_lr5em5_ec1em3_lenenv360_numenv4096"
         max_iterations = 9000
