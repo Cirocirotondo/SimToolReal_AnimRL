@@ -1,6 +1,7 @@
 """Probability distributions retained from AnimRL's policy implementation."""
 
 from abc import ABC, abstractmethod
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -58,9 +59,15 @@ def sum_independent_dims(tensor: torch.Tensor) -> torch.Tensor:
 class DiagGaussianDistribution(Distribution):
     """Unsquashed diagonal Gaussian used by the original AnimRL PPO."""
 
-    def __init__(self, action_dim: int):
+    def __init__(self, action_dim: int, max_action_std: Optional[float] = None):
         super().__init__()
         self.action_dim = action_dim
+        if max_action_std is not None and max_action_std <= 0.0:
+            raise ValueError("max_action_std must be positive or None")
+        self.max_action_std = max_action_std
+        self.max_log_std = (
+            math.log(max_action_std) if max_action_std is not None else None
+        )
         self.mean_actions = None
         self.log_std = None
 
@@ -74,7 +81,10 @@ class DiagGaussianDistribution(Distribution):
     def proba_distribution(
         self, mean_actions: torch.Tensor, log_std: torch.Tensor
     ):
-        action_std = torch.ones_like(mean_actions) * log_std.exp()
+        effective_log_std = log_std
+        if self.max_log_std is not None:
+            effective_log_std = torch.clamp(log_std, max=self.max_log_std)
+        action_std = torch.ones_like(mean_actions) * effective_log_std.exp()
         self.distribution = Normal(mean_actions, action_std)
         return self
 

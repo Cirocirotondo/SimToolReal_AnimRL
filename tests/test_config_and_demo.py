@@ -12,7 +12,7 @@ class ConfigAndDemoTest(unittest.TestCase):
         env_cfg = SimToolRealCfg()
         train_cfg = SimToolRealTrainCfg()
         self.assertEqual(env_cfg.env.num_envs, 4096)
-        self.assertEqual(env_cfg.env.episode_length, 100)
+        self.assertEqual(env_cfg.env.episode_length, 360)
         self.assertEqual(env_cfg.env.num_observations, 108)
         self.assertEqual(env_cfg.env.num_actions, 26)
         self.assertEqual(env_cfg.env.reference_init_distribution, "uniform")
@@ -50,10 +50,10 @@ class ConfigAndDemoTest(unittest.TestCase):
         }
         for name, expected in expected_robot_rewards.items():
             self.assertEqual(getattr(env_cfg.rewards, name), expected)
-        self.assertEqual(env_cfg.rewards.object_position_weight, 0.0)
-        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.0)
+        self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
+        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.2)
         self.assertEqual(
-            env_cfg.rewards.fingertip_object_distance_weight, 0.0
+            env_cfg.rewards.fingertip_object_distance_weight, 0.2
         )
         self.assertEqual(
             env_cfg.rewards.fingertip_object_distance_std_m, 0.04
@@ -65,8 +65,8 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertFalse(env_cfg.contact.enabled)
         self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
         self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
-        self.assertFalse(env_cfg.termination.object_position_enabled)
-        self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.05)
+        self.assertTrue(env_cfg.termination.object_position_enabled)
+        self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.07)
         self.assertTrue(env_cfg.termination.enabled)
         self.assertEqual(env_cfg.termination.arm_position_threshold_rad, 0.35)
         self.assertEqual(env_cfg.termination.hand_position_threshold_rad, 1.35)
@@ -74,7 +74,9 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.035)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)
-        self.assertEqual(train_cfg.algorithm.learning_rate, 1.0e-4)
+        self.assertEqual(train_cfg.algorithm.learning_rate, 0.5e-4)
+        self.assertEqual(train_cfg.algorithm.entropy_coef, 0.001)
+        self.assertEqual(train_cfg.policy.max_action_std, 3.0)
         self.assertEqual(train_cfg.algorithm.schedule, "fixed")
 
     def test_processed_demonstration_contract(self):

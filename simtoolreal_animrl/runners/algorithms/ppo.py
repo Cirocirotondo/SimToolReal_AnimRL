@@ -86,6 +86,7 @@ class PPO:
             hidden_dims=self.policy_cfg.actor_hidden_dims,
             activation=self.policy_cfg.activation,
             log_std_init=self.policy_cfg.log_std_init,
+            max_action_std=self.policy_cfg.max_action_std,
             device=self.device,
         ).to(self.device)
         self.value = Value(
@@ -509,6 +510,7 @@ class PPO:
                 self.alg_cfg.max_grad_norm,
             )
             self.optimizer.step()
+            self.policy.project_action_std()
 
             mean_value_loss += float(value_loss.item())
             mean_surrogate_loss += float(surrogate_loss.item())

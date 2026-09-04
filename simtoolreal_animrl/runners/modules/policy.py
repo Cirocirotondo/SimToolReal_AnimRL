@@ -1,5 +1,8 @@
 """AnimRL-compatible Gaussian MLP policy."""
 
+import math
+
+import torch
 import torch.nn as nn
 
 from simtoolreal_animrl.runners.utils.distributions import (
@@ -32,6 +35,7 @@ class Policy(nn.Module):
         hidden_dims=None,
         activation="elu",
         log_std_init=0.0,
+        max_action_std=None,
         device="cpu",
         **kwargs
     ):
@@ -52,7 +56,11 @@ class Policy(nn.Module):
             layers.append(get_activation(activation))
         self.policy_latent_net = nn.Sequential(*layers)
 
-        self.distribution = DiagGaussianDistribution(action_dim=num_actions)
+        self.max_action_std = max_action_std
+        self.distribution = DiagGaussianDistribution(
+            action_dim=num_actions,
+            max_action_std=max_action_std,
+        )
         self.action_mean_net, self.log_std = self.distribution.proba_distribution_net(
             latent_dim=hidden_dims[-1], log_std_init=log_std_init
         )
@@ -76,6 +84,13 @@ class Policy(nn.Module):
     @property
     def entropy(self):
         return self.distribution.entropy()
+
+    def project_action_std(self):
+        """Project the learned log standard deviation onto its configured cap."""
+        if self.max_action_std is None:
+            return
+        with torch.no_grad():
+            self.log_std.clamp_(max=math.log(self.max_action_std))
 
     def act_and_log_prob(self, observations):
         mean = self.action_mean_net(self.policy_latent_net(observations))

@@ -7,7 +7,7 @@ class SimToolRealCfg(BaseEnvCfg):
     class env(BaseEnvCfg.env):
         num_envs = 4096
         # Match the 2026-08-28 no_object_reward reference run.
-        episode_length = 100
+        episode_length = 360
         num_actions = 26
         # Existing 79D proprioception, followed by palm pose in the robot-base
         # frame (3+4), five fingertip positions relative to the palm (15), and
@@ -19,8 +19,8 @@ class SimToolRealCfg(BaseEnvCfg):
         # The demonstration has indices 0..1107 and 1107 is reserved for the
         # reference-end timeout, hence the inclusive maximum start is 1106.
         reference_init_distribution = "uniform"
-        rsi_early_probability = 0.20
-        rsi_pregrasp_start_index = 740
+        rsi_early_probability = 0.20 # used only when reference_init_distribution = "pregrasp_mixture"
+        rsi_pregrasp_start_index = 740 # proximity reward starts from this demonstration index
         rsi_max_start_index = 1106
 
     class asset:
@@ -85,7 +85,7 @@ class SimToolRealCfg(BaseEnvCfg):
         ]
 
     class motion:
-        file = "demonstrations/demo_20260727_152551_335339_60hz_cube.npz"
+        file = "demonstrations/demo_20260727_152551_335339_60hz_cube_collision_resolved_stable_grasp.npz"
         frequency_hz = 60.0
 
     class control:
@@ -137,15 +137,15 @@ class SimToolRealCfg(BaseEnvCfg):
         velocity_hand_std_rad_per_s = 1.0
         action_rate_hand_std = 5
 
-        # The cube remains observable but its pose is not rewarded.
-        object_position_weight = 0.0
-        object_orientation_weight = 0.0
+        # Cube position tracking rewards
+        object_scale = 1
+        object_position_weight = 0.8 * object_scale
+        object_orientation_weight = 0.2 * object_scale
         object_position_std_m = 0.05
         object_orientation_std_rad = 0.5
 
-        # Introduced after the reference run; retained for compatibility but
-        # disabled so it cannot change this experiment's reward.
-        fingertip_object_distance_weight = 0.0
+        # Fingertip-object distance rewards
+        fingertip_object_distance_weight = 0.2 * object_scale
         fingertip_object_distance_std_m = 0.04
         fingertip_object_distance_names = ["thumb", "index", "middle"]
 
@@ -153,10 +153,10 @@ class SimToolRealCfg(BaseEnvCfg):
         enabled = True
         arm_position_threshold_rad = 0.35
         hand_position_threshold_rad = 1.35
-        object_position_enabled = False
         # End an episode when the physical cube remains farther than this
         # Euclidean center distance from the demonstrated cube target.
-        object_position_threshold_m = 0.05
+        object_position_enabled = True
+        object_position_threshold_m = 0.07
         grace_steps = 5
 
 
@@ -165,5 +165,5 @@ class SimToolRealTrainCfg(BaseTrainCfg):
 
     class runner(BaseTrainCfg.runner):
         experiment_name = "simtoolreal"
-        run_name = "no_object_reward_obs108"
-        max_iterations = 6000
+        run_name = "new_demo_lr5em5_ec1em3_lenenv200_numenv4096"
+        max_iterations = 9000
