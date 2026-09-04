@@ -51,7 +51,7 @@ class BaseEnvCfg(ABCConfig):
     class env:
         # Values from AnimRL WalkCfg/CartwheelCfg.
         num_envs = 4096
-        episode_length = 100
+        episode_length = 360
         env_spacing = 2.0
 
         num_observations = None
@@ -89,6 +89,9 @@ class BaseTrainCfg(ABCConfig):
 
     class policy:
         log_std_init = 0.0
+        # Keep exploration bounded. The learned parameter is log(sigma), while
+        # this setting is expressed directly in action-standard-deviation units.
+        max_action_std = 3.0
         actor_hidden_dims = [512, 256]
         critic_hidden_dims = [512, 256]
         activation = "elu"
@@ -97,11 +100,11 @@ class BaseTrainCfg(ABCConfig):
         value_loss_coef = 0.5
         use_clipped_value_loss = True
         clip_param = 0.2
-        entropy_coef = 0.01
+        entropy_coef = 0.001
         surrogate_coef = 1.0
         num_learning_epochs = 5
         num_mini_batches = 4
-        learning_rate = 1.0e-4
+        learning_rate = 0.5e-4
         schedule = "fixed"
         gamma = 0.99
         lam = 0.95

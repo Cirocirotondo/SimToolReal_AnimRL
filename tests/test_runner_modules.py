@@ -1,4 +1,5 @@
 import unittest
+import math
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -167,6 +168,28 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertEqual(log_prob.shape, (8,))
         self.assertEqual(value(observations).shape, (8, 1))
 
+    def test_policy_caps_and_projects_action_standard_deviation(self):
+        policy = Policy(
+            num_obs=4,
+            num_actions=2,
+            hidden_dims=[8, 8],
+            max_action_std=0.5,
+        )
+        with torch.no_grad():
+            policy.log_std.fill_(math.log(2.0))
+
+        policy.act_and_log_prob(torch.zeros(3, 4))
+        self.assertTrue(torch.allclose(policy.action_std, torch.full((3, 2), 0.5)))
+
+        policy.project_action_std()
+        self.assertTrue(
+            torch.all(policy.log_std <= math.log(0.5) + 1.0e-7)
+        )
+
+    def test_policy_rejects_non_positive_action_std_cap(self):
+        with self.assertRaises(ValueError):
+            Policy(num_obs=4, num_actions=2, max_action_std=0.0)
+
     def test_normalizer_and_rollout_shapes(self):
         normalizer = EmpiricalNormalization(19)
         normalized = normalizer(torch.randn(16, 19))
@@ -249,7 +272,9 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertEqual(train.runner.num_steps_per_env, 24)
         self.assertEqual(train.algorithm.num_learning_epochs, 5)
         self.assertEqual(train.algorithm.num_mini_batches, 4)
-        self.assertEqual(train.algorithm.learning_rate, 1.0e-4)
+        self.assertEqual(train.algorithm.learning_rate, 0.5e-4)
+        self.assertEqual(train.algorithm.entropy_coef, 0.001)
+        self.assertEqual(train.policy.max_action_std, 3.0)
         self.assertEqual(train.algorithm.schedule, "fixed")
         self.assertTrue(train.runner.tensorboard)
         self.assertFalse(train.runner.record_video)
@@ -267,13 +292,13 @@ class RunnerModulesTest(unittest.TestCase):
         self.assertEqual(train.policy.critic_hidden_dims, [512, 256])
 
         snapshot = config_to_dict(train)
-        self.assertEqual(snapshot["algorithm"]["learning_rate"], 1.0e-4)
+        self.assertEqual(snapshot["algorithm"]["learning_rate"], 0.5e-4)
         self.assertEqual(snapshot["runner"]["num_steps_per_env"], 24)
 
         restored = SimToolRealTrainCfg()
         restored.algorithm.learning_rate = 9.9
         update_config_from_dict(restored, snapshot)
-        self.assertEqual(restored.algorithm.learning_rate, 1.0e-4)
+        self.assertEqual(restored.algorithm.learning_rate, 0.5e-4)
         with self.assertRaises(KeyError):
             update_config_from_dict(restored, {"unknown": 1})
 
