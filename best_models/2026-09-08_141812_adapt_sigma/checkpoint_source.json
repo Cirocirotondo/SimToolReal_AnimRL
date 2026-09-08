@@ -1,0 +1,7 @@
+{
+  "copied_at": "2026-09-08T14:18:12+02:00",
+  "parent_best_evaluation_score": 0.8811526596546173,
+  "parent_checkpoint": "/home/simone/simtoolreal_animrl/logs/simtoolreal/2026-09-08_102001_asym_ladder/best_deployment_model.pt",
+  "parent_iteration": 3500,
+  "parent_run": "2026-09-08_102001_asym_ladder"
+}
