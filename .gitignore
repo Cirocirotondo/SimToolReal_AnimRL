@@ -17,3 +17,7 @@ best_models/**/events.out.tfevents.*
 best_models/**/metrics.jsonl
 best_models/**/eval_model_*.json
 best_models/**/videos/
+# Intermediate checkpoints: a run saves one every 100 iterations, ~4.5 MB each.
+# Only the selected policy belongs here (best_deployment_model.pt, or the
+# model_<N>.pt named in that folder's README).
+best_models/**/model_*.pt

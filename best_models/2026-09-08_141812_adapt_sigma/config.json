@@ -1,0 +1,379 @@
+{
+  "env_cfg": {
+    "asset": {
+      "angular_damping": 0.01,
+      "collapse_fixed_joints": true,
+      "disable_gravity": true,
+      "file": "assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf",
+      "fingertip_friction": 1.5,
+      "fix_base_link": true,
+      "flip_visual_attachments": true,
+      "friction": 0.5,
+      "linear_damping": 0.01,
+      "restitution": 0.0,
+      "self_collision": false,
+      "thickness": 0.001,
+      "use_physx_armature": true
+    },
+    "contact": {
+      "collection": 1,
+      "critic_observes_fingertip_forces": true,
+      "enabled": true,
+      "fingertip_names": [
+        "thumb",
+        "index",
+        "middle"
+      ],
+      "force_threshold_n": 0.5,
+      "observation_clip": 5.0,
+      "observation_force_scale_n": 10.0,
+      "observe_fingertip_forces": false,
+      "reward_enabled": false,
+      "reward_per_finger": 0.05
+    },
+    "control": {
+      "action_parameterization": "animrl_residual",
+      "arm_damping_scale": 1.0,
+      "arm_stiffness_scale": 1.0,
+      "clip_joint_target": 100.0,
+      "control_type": "P",
+      "decimation": 1,
+      "hand_damping_scale": 1.0,
+      "hand_stiffness_scale": 0.5,
+      "scale_hand_joint_target": 0.15,
+      "scale_joint_target": 0.25
+    },
+    "env": {
+      "debug": false,
+      "env_spacing": 2.0,
+      "episode_length": 360,
+      "num_actions": 26,
+      "num_envs": 256,
+      "num_observations": 108,
+      "num_privileged_obs": null,
+      "play": false,
+      "reference_init_distribution": "pregrasp_mixture",
+      "reference_state_initialization": true,
+      "rsi_early_probability": 0.2,
+      "rsi_max_start_index": 830,
+      "rsi_pregrasp_start_index": 740
+    },
+    "init_state": {
+      "default_arm_joint_angles": [
+        -1.570790548,
+        -1.0499914063,
+        1.9499972045,
+        -0.900007947,
+        1.5709867791,
+        -2.6179869035
+      ],
+      "default_hand_joint_angles": [
+        0.382322095,
+        -0.1954499712,
+        0.0374738305,
+        0.0331612558,
+        -0.1989675347,
+        0.0575958653,
+        0.0,
+        0.2456188158,
+        0.1364082419,
+        0.3909537524,
+        0.0191986218,
+        0.0575942737,
+        0.2129301687,
+        0.3926990817,
+        0.041887902,
+        0.0314159265,
+        0.2112131611,
+        0.3211405824,
+        0.3385938749,
+        0.0261799388
+      ],
+      "pos": [
+        0.0,
+        0.6,
+        0.55
+      ],
+      "rot": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "motion": {
+      "file": "demonstrations/demo_20260727_152551_335339_60hz_cube_collision_resolved_stable_grasp.npz",
+      "frequency_hz": 60.0
+    },
+    "object": {
+      "color": [
+        0.78,
+        0.78,
+        0.82
+      ],
+      "friction": 0.5,
+      "inertia_kg_m2": [
+        8.333e-05,
+        0.00041667,
+        0.00041667
+      ],
+      "mass_kg": 0.2,
+      "restitution": 0.0,
+      "size_m": [
+        0.15,
+        0.05,
+        0.05
+      ]
+    },
+    "object_assist": {
+      "active_from_reference_index": 0,
+      "enabled": false,
+      "end_iteration": 6000,
+      "final_scale": 0.0,
+      "gate_object_reward": true,
+      "gravity_compensation": true,
+      "initial_scale": 1.0,
+      "max_force_n": 30.0,
+      "max_torque_nm": 0.2,
+      "orientation_damping_nms_per_rad": 0.006,
+      "orientation_stiffness_nm_per_rad": 0.06,
+      "position_damping_ns_per_m": 12.0,
+      "position_stiffness_n_per_m": 120.0,
+      "schedule": "linear",
+      "start_iteration": 0,
+      "torque_enabled": true
+    },
+    "rewards": {
+      "action_rate_arm_std": 2.0,
+      "action_rate_arm_weight": 0.2,
+      "action_rate_hand_std": 2.0,
+      "action_rate_hand_weight": 0.12,
+      "adaptive_sigma_action_rate_arm_floor": 0.0076,
+      "adaptive_sigma_action_rate_hand_floor": 0.0076,
+      "adaptive_sigma_decay": 0.999,
+      "adaptive_sigma_enabled": true,
+      "adaptive_sigma_position_arm_floor": 0.0061,
+      "adaptive_sigma_position_hand_floor": 0.0103,
+      "adaptive_sigma_target_reward": 0.6,
+      "fingertip_object_distance_names": [
+        "thumb",
+        "index",
+        "middle"
+      ],
+      "fingertip_object_distance_std_m": 0.04,
+      "fingertip_object_distance_weight": 0.2,
+      "object_orientation_std_rad": 0.5,
+      "object_orientation_weight": 0.2,
+      "object_position_std_m": 0.05,
+      "object_position_weight": 0.8,
+      "object_scale": 1,
+      "position_arm_std_rad": 0.1,
+      "position_arm_weight": 0.8,
+      "position_hand_std_rad": 0.15,
+      "position_hand_weight": 0.48,
+      "velocity_arm_std_rad_per_s": 1.0,
+      "velocity_arm_weight": 0.2,
+      "velocity_hand_std_rad_per_s": 1.0,
+      "velocity_hand_weight": 0.12
+    },
+    "seed": 42,
+    "sim": {
+      "dt": 0.016666666666666666,
+      "gravity": [
+        0.0,
+        0.0,
+        -9.81
+      ],
+      "physx": {
+        "bounce_threshold_velocity": 0.2,
+        "contact_collection": 0,
+        "contact_offset": 0.002,
+        "default_buffer_size_multiplier": 25.0,
+        "max_depenetration_velocity": 2.0,
+        "max_gpu_contact_pairs": 16777216,
+        "num_position_iterations": 8,
+        "num_threads": 6,
+        "num_velocity_iterations": 0,
+        "rest_offset": 0.0,
+        "solver_type": 1,
+        "use_gpu": true
+      },
+      "substeps": 2,
+      "use_gpu_pipeline": true
+    },
+    "table": {
+      "color": [
+        0.82,
+        0.56,
+        0.35
+      ],
+      "friction": 0.5,
+      "restitution": 0.0,
+      "size_m": [
+        0.475,
+        0.4,
+        0.3
+      ],
+      "surface_below_robot_base_m": 0.035
+    },
+    "termination": {
+      "arm_position_threshold_rad": 0.35,
+      "enabled": true,
+      "grace_steps": 5,
+      "hand_position_threshold_rad": 1.35,
+      "object_position_enabled": true,
+      "object_position_threshold_m": 0.07
+    },
+    "terrain": {
+      "dynamic_friction": 1.0,
+      "restitution": 0.0,
+      "static_friction": 1.0
+    },
+    "viewer": {
+      "camera_lookat": [
+        0.0,
+        0.6,
+        0.75
+      ],
+      "camera_position": [
+        -1.8,
+        -2.0,
+        1.5
+      ],
+      "enable_viewer": false,
+      "reference_ghost": false,
+      "reference_ghost_color": [
+        0.15,
+        0.85,
+        0.25
+      ],
+      "reference_ghost_offset": [
+        0.8,
+        0.0,
+        0.0
+      ],
+      "training_camera_enabled": true,
+      "training_camera_env_index": 0,
+      "training_camera_fov_deg": 90.0,
+      "training_camera_height": 480,
+      "training_camera_width": 640
+    }
+  },
+  "lineage": {
+    "checkpoint_name": "best_deployment_model.pt",
+    "copied": true,
+    "copied_at": "2026-09-08T14:18:12+02:00",
+    "parent_best_evaluation_score": 0.8811526596546173,
+    "parent_checkpoint": "/home/simone/simtoolreal_animrl/logs/simtoolreal/2026-09-08_102001_asym_ladder/best_deployment_model.pt",
+    "parent_iteration": 3500,
+    "parent_run": "2026-09-08_102001_asym_ladder",
+    "resume_checkpoint": "logs/simtoolreal/2026-09-08_141812_adapt_sigma/best_deployment_model.pt"
+  },
+  "observation_dim": 108,
+  "runtime": {
+    "asymmetric_critic": true,
+    "contact_observations": false,
+    "eval_interval": null,
+    "eval_num_envs": null,
+    "eval_seed": null,
+    "final_eval": true,
+    "final_eval_rsi_index": 0,
+    "iterations": 5000,
+    "log_dir": null,
+    "log_interval": 1,
+    "log_root": "/home/simone/simtoolreal_animrl/logs",
+    "no_periodic_eval": false,
+    "num_envs": 256,
+    "object_assist": false,
+    "object_assist_end_iteration": null,
+    "object_assist_start_iteration": null,
+    "overrides": [
+      "env.reference_init_distribution=pregrasp_mixture",
+      "env.rsi_pregrasp_start_index=740",
+      "env.rsi_max_start_index=830",
+      "rewards.fingertip_object_distance_weight=0.2",
+      "env.rsi_early_probability=0.2",
+      "sim.physx.max_gpu_contact_pairs=16777216",
+      "contact.enabled=true",
+      "control.hand_stiffness_scale=0.5",
+      "rewards.adaptive_sigma_enabled=true",
+      "rewards.position_arm_std_rad=0.10",
+      "rewards.position_hand_std_rad=0.15",
+      "rewards.action_rate_arm_std=2.0",
+      "rewards.action_rate_hand_std=2.0"
+    ],
+    "record_video": true,
+    "resume": "logs/simtoolreal/2026-09-08_141812_adapt_sigma/best_deployment_model.pt",
+    "run_name": "adapt_sigma",
+    "save_interval": null,
+    "seed": null,
+    "sim_device": "cuda:0",
+    "start_iteration": 0,
+    "viewer": false
+  },
+  "train_cfg": {
+    "algorithm": {
+      "bootstrap": true,
+      "clip_param": 0.2,
+      "desired_kl": 0.01,
+      "entropy_coef": 0.001,
+      "gamma": 0.99,
+      "lam": 0.95,
+      "learning_rate": 5e-05,
+      "max_grad_norm": 1.0,
+      "num_learning_epochs": 5,
+      "num_mini_batches": 4,
+      "schedule": "fixed",
+      "surrogate_coef": 1.0,
+      "use_clipped_value_loss": true,
+      "value_loss_coef": 0.5
+    },
+    "algorithm_name": "PPO",
+    "policy": {
+      "activation": "elu",
+      "actor_hidden_dims": [
+        512,
+        256
+      ],
+      "critic_hidden_dims": [
+        512,
+        256
+      ],
+      "log_std_init": 0.0,
+      "max_action_std": 3.0
+    },
+    "runner": {
+      "abort_action_std": 15.0,
+      "abort_action_target_clipped_fraction": 0.8,
+      "abort_on_divergence": true,
+      "abort_patience": 3,
+      "evaluation_enabled": true,
+      "evaluation_fixed_phases": [
+        0.0,
+        0.25,
+        0.5,
+        0.75
+      ],
+      "evaluation_interval": 500,
+      "evaluation_num_envs": 64,
+      "evaluation_seed": 123,
+      "experiment_name": "simtoolreal",
+      "max_iterations": 9000,
+      "normalize_observation": true,
+      "num_steps_per_env": 24,
+      "record_gif": false,
+      "record_gif_interval": 100,
+      "record_iters": 10,
+      "record_video": true,
+      "record_video_duration_s": 10.0,
+      "record_video_fps": 60,
+      "record_video_interval": 500,
+      "run_name": "adapt_sigma",
+      "save_interval": 100,
+      "tensorboard": true,
+      "tensorboard_flush_secs": 10,
+      "wandb": false,
+      "wandb_group": "default"
+    }
+  }
+}
