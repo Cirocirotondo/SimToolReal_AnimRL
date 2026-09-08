@@ -67,16 +67,6 @@ def parse_args():
             "retained as a compatibility alias."
         ),
     )
-    parser.add_argument(
-        "--warm-start-mode",
-        choices=("policy", "full"),
-        default="policy",
-        help=(
-            "How every warm experiment loads --checkpoint: 'policy' keeps only "
-            "the actor and normalizers; 'full' resumes actor, critic, optimizer, "
-            "normalizers, and counters (default: policy)."
-        ),
-    )
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--sim-device", default="cuda:0")
     parser.add_argument("--num-envs", type=int, default=None)
@@ -135,7 +125,7 @@ def write_manifest(path, manifest):
     )
 
 
-def build_command(args, run_dir, weights, checkpoint, initialize):
+def build_command(args, run_dir, weights, checkpoint):
     # Preserve a virtualenv symlink: Path.resolve() would turn, for example,
     # ``.venv/bin/python`` into the system interpreter and lose the environment.
     python = args.python.expanduser().absolute()
@@ -162,9 +152,7 @@ def build_command(args, run_dir, weights, checkpoint, initialize):
         ),
     ]
     if checkpoint is not None:
-        command.extend(
-            ["--initialize-from" if initialize else "--resume", str(checkpoint)]
-        )
+        command.extend(["--resume", str(checkpoint)])
     if args.num_envs is not None:
         command.extend(["--num-envs", str(args.num_envs)])
     if args.seed is not None:
@@ -197,22 +185,14 @@ def run_initialization(
         run_dir = output_root / initialization / "run_{:02d}_scale_{}".format(
             run_number, scale_label(scale)
         )
-        initialize = (
-            initialization == "warm"
-            and args.warm_start_mode == "policy"
-        )
-        command = build_command(
-            args, run_dir, weights, source_checkpoint, initialize
-        )
+        command = build_command(args, run_dir, weights, source_checkpoint)
         experiment = {
             "initialization": initialization,
             "run": run_number,
             "scale": decimal_text(scale),
             "weights": weights,
             "checkpoint_loading": (
-                "policy_and_normalizers"
-                if initialize
-                else "full_resume" if source_checkpoint else "random"
+                "full_resume" if source_checkpoint else "random"
             ),
             "input_checkpoint": (
                 str(source_checkpoint) if source_checkpoint else None

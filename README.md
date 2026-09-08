@@ -13,6 +13,9 @@ Object tracking, configurable object-distance termination, pre-grasp RSI and
 optional fingertip-contact shaping are implemented and covered by software
 tests. The grasp-training experiments run so far still do not learn a reliable
 grasp, so this training strategy remains experimental and needs further tuning.
+The annealed object assist described below adds an optional grasp curriculum:
+an external PD wrench carries the cube along the demonstration and decays to
+zero, leaving the policy to take the load over.
 
 ## Headless environment test
 
@@ -195,6 +198,75 @@ cuboid surface, not the centre. The raw `(steps, F)` array is stored in
 
 Unlike the contact figure below, this one needs no PhysX contact reporting: it
 is pure geometry and is always produced.
+
+### Annealed object assist
+
+Grasping is the part of the task the policy fails at, so `object_assist`
+offers it a crutch: an external wrench applied at the cube's centre of mass
+that drives the cube toward the pose the demonstration prescribes for the
+current reference index. It is a PD controller plus gravity compensation,
+
+```
+F = s * clamp( kp*(p_ref - p) + kd*(v_ref - v) - m*g )
+T = s * clamp( kr*rotvec(q_ref * q^-1) + dr*(w_ref - w) )
+```
+
+where `s` is the annealing scale. `s` starts at `initial_scale`, decays
+linearly to `final_scale` between `start_iteration` and `end_iteration`, and
+stays there, so a run that trains past the window is exactly the unassisted
+problem again. The policy therefore learns the *residual* force the hand has to
+supply, and has to supply more of it at every iteration.
+
+The wrench is computed from the pre-physics cube state against the same
+reference sample the joint position targets chase, and is re-queued before
+every substep of the decimation loop. It is applied to the cube only: nothing
+touches the robot, the reward, the observation, or the termination.
+
+The feature is **off by default**, so every existing experiment launcher keeps
+reproducing its original physics. Enable it from `train.py`:
+
+```bash
+/home/simone/.venv/bin/python scripts/train.py \
+  --object-assist \
+  --object-assist-start-iteration 0 \
+  --object-assist-end-iteration 6000
+```
+
+Every other field is reachable through `--set object_assist.<field>=<value>`:
+`schedule` (`linear` or `constant`), `initial_scale`, `final_scale`,
+`position_stiffness_n_per_m`, `position_damping_ns_per_m`,
+`orientation_stiffness_nm_per_rad`, `orientation_damping_nms_per_rad`,
+`torque_enabled`, `gravity_compensation`, `max_force_n`, `max_torque_nm`, and
+`active_from_reference_index`, which gates the wrench off before a chosen
+demonstration index. The default gains are sized on the 0.2 kg cuboid and its
+smallest principal inertia, giving a slightly overdamped response at roughly
+24 rad/s, well inside the 60 Hz rate at which the wrench is held constant.
+Both wrench components saturate direction-preservingly, so a large transient
+pose error cannot launch the cube.
+
+Training logs the curriculum under `ObjectAssist/scale`, and the wrench the
+cube actually receives under `ObjectAssist/force_n` and
+`ObjectAssist/torque_nm`, with the per-episode means under `Episode/`. The
+force is never zero while `s > 0`: gravity compensation alone is `m*g`, 1.96 N.
+
+Evaluation always runs unassisted. The periodic evaluator, the final
+evaluation, and `scripts/evaluate.py` construct their environment with the
+assist disabled, so `best_model.pt` is never selected on a score the crutch
+helped produce. Pass `--object-assist-scale` to either evaluation script to
+replay a policy under a specific scale instead.
+
+`scripts/test_object_assist_env.py` checks the mechanism in Isaac Gym without
+PPO. It freezes the robot at its RSI pose while the demonstration walks away,
+so only the assist can keep the cube on the demonstrated trajectory:
+
+```bash
+/home/simone/.venv/bin/python scripts/test_object_assist_env.py
+```
+
+At scale 1 the cube ends 0.03 m from its target after 90 held steps, against
+0.24 m at scale 0, where no wrench is applied at all. The schedule, the wrench
+maths, the saturation and the configuration validation are covered by
+`tests/test_object_assist.py`, which needs no simulator.
 
 ### Fingertip contact forces
 
@@ -387,6 +459,30 @@ validates the 108D/26D environment contract, and writes
 
 Use `--sampled-rsi --seed <N>` to evaluate with the training RSI distribution,
 or `--rsi-index <sample>` for a fixed reproducible initial state.
+
+### Recording the evaluation
+
+`--record-video` writes the same rollout to an MP4 from an off-screen camera,
+with the green reference robot standing beside the policy robot exactly as the
+viewer shows it. It needs a graphics-capable device but no viewer, so it runs
+over SSH:
+
+```bash
+/home/simone/.venv/bin/python scripts/evaluate.py \
+  --checkpoint logs/simtoolreal/<run>/best_model.pt \
+  --record-video
+```
+
+The clip lands in `eval_videos/` beside the checkpoint, one frame per control
+step at 60 fps, so the whole 1107-sample demonstration plays back in real time
+as 18.4 s. `--video-size W H`, `--video-fps` and `--video-path` override the
+defaults, and `--no-ghost` drops the reference robot. The camera aims at the
+midpoint between the two robots and steps back far enough to frame both; with
+the ghost off it tightens around the policy robot alone.
+
+Every training that recorded training video also records this replay
+automatically: `train.py` passes `--record-video` to the final evaluation it
+runs once the run finishes.
 
 ## Isaac Gym demonstration viewer
 

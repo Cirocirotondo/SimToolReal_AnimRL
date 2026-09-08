@@ -19,6 +19,11 @@ from simtoolreal_animrl.cfg import (
     config_to_dict,
 )
 from simtoolreal_animrl.envs.motion_imitation import MotionImitationEnv
+
+# contact.py imports torch, which isaacgym insists on being imported after it,
+# so this cannot move above the line above.
+from simtoolreal_animrl.envs.contact import fingertip_force_observation_dim
+from simtoolreal_animrl.runners.lineage import resolve_lineage
 from simtoolreal_animrl.runners import (
     PPO,
     SubprocessDeterministicEvaluator,
@@ -54,22 +59,11 @@ def parse_args():
         default=None,
         help="Use an exact run directory instead of generating one.",
     )
-    checkpoint_group = parser.add_mutually_exclusive_group()
-    checkpoint_group.add_argument(
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
         help="Resume optimizer, networks, normalizers, and counters.",
-    )
-    checkpoint_group.add_argument(
-        "--initialize-from",
-        type=Path,
-        default=None,
-        help=(
-            "Initialize the actor policy and observation normalizers from a "
-            "checkpoint, while starting with a fresh critic, optimizer, "
-            "iteration counter, and best-evaluation score."
-        ),
     )
     parser.add_argument(
         "--start-iteration",
@@ -102,6 +96,65 @@ def parse_args():
         dest="record_video",
         action="store_false",
         help="Force the compute-only headless path with no graphics context.",
+    )
+    assist_group = parser.add_mutually_exclusive_group()
+    assist_group.add_argument(
+        "--object-assist",
+        dest="object_assist",
+        action="store_true",
+        default=None,
+        help=(
+            "Help the object toward its demonstrated pose with an external PD "
+            "wrench plus gravity compensation, annealed to zero over the "
+            "object_assist iteration window."
+        ),
+    )
+    assist_group.add_argument(
+        "--no-object-assist",
+        dest="object_assist",
+        action="store_false",
+        help="Train on the unassisted object (the configuration default).",
+    )
+    parser.add_argument(
+        "--object-assist-start-iteration",
+        type=int,
+        default=None,
+        help="Iteration at which the assist starts decaying (default: config).",
+    )
+    parser.add_argument(
+        "--object-assist-end-iteration",
+        type=int,
+        default=None,
+        help="Iteration at which the assist reaches zero (default: config).",
+    )
+    contact_obs_group = parser.add_mutually_exclusive_group()
+    contact_obs_group.add_argument(
+        "--contact-observations",
+        dest="contact_observations",
+        action="store_true",
+        default=None,
+        help=(
+            "Feed the policy one contact-force vector per selected fingertip, "
+            "in the palm frame. Turns on contact reporting as well, and widens "
+            "the observation vector, so a checkpoint from a run without it "
+            "cannot be resumed into a run with it."
+        ),
+    )
+    contact_obs_group.add_argument(
+        "--no-contact-observations",
+        dest="contact_observations",
+        action="store_false",
+        help="Train on the blind observation vector (the configuration default).",
+    )
+    parser.add_argument(
+        "--asymmetric-critic",
+        action="store_true",
+        help=(
+            "Asymmetric actor-critic: the actor keeps its observation vector "
+            "while the critic additionally reads the fingertip contact forces. "
+            "The critic is discarded at deployment, so this costs the deployed "
+            "policy nothing. Turns on contact reporting as well."
+        ),
     )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument(
@@ -226,11 +279,13 @@ def resolve_final_checkpoint(run_dir):
     return max(saved)[1] if saved else None
 
 
-def run_final_evaluation(run_dir, args):
+def run_final_evaluation(run_dir, args, record_video=False):
     """Evaluate the finished policy in a fresh process and write its plots.
 
     A separate process is required because Isaac Gym allows one simulation per
     process, and it runs only after the training simulation has been released.
+    A run that recorded training video also records the evaluation, which is
+    the replay that shows the green reference robot beside the policy robot.
     """
     checkpoint = resolve_final_checkpoint(run_dir)
     if checkpoint is None:
@@ -252,6 +307,8 @@ def run_final_evaluation(run_dir, args):
         "--print-every",
         "0",
     ]
+    if record_video:
+        command.append("--record-video")
     print("\nFinal evaluation of {} (headless, with plots)".format(checkpoint.name))
     completed = subprocess.run(command)
     if completed.returncode != 0:
@@ -263,7 +320,7 @@ def run_final_evaluation(run_dir, args):
         )
 
 
-def save_configuration(run_dir, env_cfg, train_cfg, args):
+def save_configuration(run_dir, env_cfg, train_cfg, args, lineage=None):
     config_path = run_dir / "config.json"
     if config_path.exists():
         return
@@ -274,6 +331,17 @@ def save_configuration(run_dir, env_cfg, train_cfg, args):
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
         },
+        # env.num_observations is the base width; optional blocks widen what the
+        # policy is actually built with, so the total is recorded separately
+        # rather than left to be re-derived from the flags.
+        "observation_dim": (
+            int(env_cfg.env.num_observations)
+            + fingertip_force_observation_dim(env_cfg.contact)
+        ),
+        # Where the starting weights came from. runtime.resume alone is not
+        # enough: a warm start resumes from a copy inside this very run, so
+        # without this the parent run is unrecoverable.
+        "lineage": lineage,
     }
     with config_path.open("w", encoding="utf-8") as config_file:
         json.dump(snapshot, config_file, indent=2, sort_keys=True)
@@ -305,6 +373,25 @@ def main():
         train_cfg.runner.evaluation_num_envs = int(args.eval_num_envs)
     if args.eval_seed is not None:
         train_cfg.runner.evaluation_seed = int(args.eval_seed)
+    if args.object_assist is not None:
+        env_cfg.object_assist.enabled = bool(args.object_assist)
+    if args.object_assist_start_iteration is not None:
+        env_cfg.object_assist.start_iteration = int(
+            args.object_assist_start_iteration
+        )
+    if args.object_assist_end_iteration is not None:
+        env_cfg.object_assist.end_iteration = int(
+            args.object_assist_end_iteration
+        )
+    if args.contact_observations is not None:
+        env_cfg.contact.observe_fingertip_forces = bool(args.contact_observations)
+        # The observation reads the PhysX force tensor, which only exists when
+        # contact reporting is on, so the flag carries its prerequisite with it.
+        if args.contact_observations:
+            env_cfg.contact.enabled = True
+    if args.asymmetric_critic:
+        env_cfg.contact.critic_observes_fingertip_forces = True
+        env_cfg.contact.enabled = True
     # Applied last so an explicit --set always wins over the flags above.
     applied_overrides = apply_overrides(env_cfg, train_cfg, args.overrides)
     for path, value in applied_overrides.items():
@@ -331,7 +418,13 @@ def main():
 
     run_dir = resolve_run_directory(args, train_cfg)
     run_dir.mkdir(parents=True, exist_ok=True)
-    save_configuration(run_dir, env_cfg, train_cfg, args)
+    lineage = resolve_lineage(args.resume)
+    if lineage is not None:
+        print("Starting from: {} ({})".format(
+            lineage.get("parent_run", "unknown"),
+            "copied checkpoint" if lineage.get("copied") else "direct resume",
+        ))
+    save_configuration(run_dir, env_cfg, train_cfg, args, lineage)
     print("Run directory: {}".format(run_dir))
 
     env = MotionImitationEnv(
@@ -353,23 +446,24 @@ def main():
                 load_optimizer=True,
                 load_normalizers=True,
             )
-        elif args.initialize_from is not None:
-            initialization_path = args.initialize_from.expanduser().resolve()
-            print(
-                "Initializing policy and normalizers from: {}".format(
-                    initialization_path
-                )
-            )
-            runner.initialize_policy(
-                initialization_path,
-                load_normalizers=True,
-            )
         start_iteration = resolve_start_iteration(args, checkpoint_infos)
         print(
             "Training {} environments for {} PPO updates, starting at {}".format(
                 env.num_envs, num_iterations, start_iteration
             )
         )
+        if env.object_assist_enabled:
+            assist = env.object_assist_settings
+            print(
+                "Object assist: {} schedule, scale {} -> {} between "
+                "iterations {} and {}; evaluation always runs unassisted".format(
+                    assist.schedule,
+                    assist.initial_scale,
+                    assist.final_scale,
+                    assist.start_iteration,
+                    assist.end_iteration,
+                )
+            )
         evaluator = None
         if bool(train_cfg.runner.evaluation_enabled):
             evaluator = SubprocessDeterministicEvaluator(
@@ -409,7 +503,9 @@ def main():
     # Outside the try block: the training simulation has to be closed before a
     # second one can start, and an interrupted run should not be evaluated.
     if training_completed and args.final_eval:
-        run_final_evaluation(run_dir, args)
+        run_final_evaluation(
+            run_dir, args, record_video=bool(train_cfg.runner.record_video)
+        )
 
 
 if __name__ == "__main__":

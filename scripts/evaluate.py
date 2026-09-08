@@ -87,8 +87,37 @@ def parse_args():
         action="store_false",
         help=(
             "Hide the green reference robot shown beside the policy robot. "
-            "The ghost needs --viewer and is never built headless."
+            "It is built for --viewer and for --record-video."
         ),
+    )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        help=(
+            "Record the evaluation to an MP4 from an off-screen camera, with "
+            "the green reference robot beside the policy robot. Works "
+            "headless, but needs a graphics-capable device."
+        ),
+    )
+    parser.add_argument(
+        "--video-path",
+        type=Path,
+        default=None,
+        help="MP4 to write (default: eval_videos/ next to the checkpoint).",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=60,
+        help="Frames per second; 60 matches the demonstration in real time.",
+    )
+    parser.add_argument(
+        "--video-size",
+        type=int,
+        nargs=2,
+        default=[960, 720],
+        metavar=("WIDTH", "HEIGHT"),
+        help="Recorded frame size.",
     )
     parser.add_argument(
         "--print-every",
@@ -116,6 +145,16 @@ def parse_args():
             "per-fingertip force figure is produced even when the run was "
             "trained with contact.enabled=false. The contact reward is "
             "zeroed, so the measured return is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--object-assist-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Object-assist scale for this evaluation. The default of 0 "
+            "replays the policy on the unassisted task; pass the training "
+            "scale to see what the helper wrench was doing for it."
         ),
     )
     parser.add_argument(
@@ -150,6 +189,48 @@ def scalar(value):
     if isinstance(value, torch.Tensor):
         return float(value.detach().cpu())
     return float(value)
+
+
+class EvaluationVideo:
+    """Write one MP4 of the evaluation from the environment's own camera.
+
+    The camera is the same off-screen sensor training uses, so the recording
+    needs no viewer; with the reference ghost enabled the green demonstration
+    robot stands beside the policy robot exactly as it does on screen.
+    """
+
+    def __init__(self, path, fps):
+        import imageio.v2 as imageio
+        import imageio_ffmpeg
+
+        imageio_ffmpeg.get_ffmpeg_exe()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.fps = int(fps)
+        self.frames = 0
+        self._writer = imageio.get_writer(
+            str(path),
+            format="FFMPEG",
+            mode="I",
+            fps=self.fps,
+            codec="libx264",
+            quality=8,
+            macro_block_size=None,
+        )
+
+    def capture(self, env):
+        self._writer.append_data(env.capture_training_camera_frame())
+        self.frames += 1
+
+    def close(self):
+        if self._writer is None:
+            return
+        writer, self._writer = self._writer, None
+        writer.close()
+
+    @property
+    def duration_s(self):
+        return self.frames / float(self.fps)
 
 
 def termination_reason(infos, env_idx=0):
@@ -192,7 +273,26 @@ def main():
     env_cfg.viewer.enable_viewer = bool(args.viewer)
     env_cfg.viewer.camera_position = [-1.0, -1.0, 1.5]
     env_cfg.viewer.camera_lookat = [0.0, 0.6, 0.75]
-    env_cfg.viewer.reference_ghost = bool(args.viewer and args.ghost)
+    env_cfg.viewer.reference_ghost = bool(
+        args.ghost and (args.viewer or args.record_video)
+    )
+    if args.record_video:
+        env_cfg.viewer.training_camera_enabled = True
+        env_cfg.viewer.training_camera_env_index = 0
+        env_cfg.viewer.training_camera_width = int(args.video_size[0])
+        env_cfg.viewer.training_camera_height = int(args.video_size[1])
+        env_cfg.viewer.training_camera_fov_deg = 62.0
+        if env_cfg.viewer.reference_ghost:
+            # Frame both robots: the ghost stands one offset to the side, so
+            # the camera aims at the midpoint and steps back far enough for
+            # the pair to fit at this field of view.
+            offset = [float(v) for v in env_cfg.viewer.reference_ghost_offset]
+            middle = offset[0] / 2.0
+            env_cfg.viewer.camera_lookat = [middle, 0.62, 0.72]
+            env_cfg.viewer.camera_position = [middle - 1.75, -1.45, 1.70]
+        else:
+            env_cfg.viewer.camera_lookat = [0.0, 0.62, 0.72]
+            env_cfg.viewer.camera_position = [-1.30, -1.05, 1.55]
     # Playback always runs from the chosen RSI index to the final reference
     # sample, so the tracking threshold must not cut the episode short. The
     # threshold is still reported: see max_abs_position_error below.
@@ -203,6 +303,13 @@ def main():
         # term contributes nothing and the return stays comparable to training.
         env_cfg.contact.enabled = True
         env_cfg.contact.reward_per_finger = 0.0
+    # The training schedule is iteration-driven and this process runs no
+    # iterations, so the assist is pinned explicitly instead of inherited.
+    if float(args.object_assist_scale) <= 0.0:
+        env_cfg.object_assist.enabled = False
+    else:
+        env_cfg.object_assist.schedule = "constant"
+        env_cfg.object_assist.initial_scale = float(args.object_assist_scale)
     if int(env_cfg.env.num_observations) != 108:
         raise ValueError("This evaluator requires the 108D observation contract")
     if int(env_cfg.env.num_actions) != 26:
@@ -226,7 +333,31 @@ def main():
         headless=not args.viewer,
         num_envs_override=None,
     )
+    recorder = None
     try:
+        if args.record_video:
+            video_path = (
+                args.video_path.expanduser().resolve()
+                if args.video_path is not None
+                else checkpoint.parent
+                / "eval_videos"
+                / "eval_{}_rsi_{}.mp4".format(
+                    checkpoint.stem,
+                    "sampled" if args.sampled_rsi else args.rsi_index,
+                )
+            )
+            recorder = EvaluationVideo(video_path, args.video_fps)
+            print(
+                "Recording {}x{} at {} fps to {}{}".format(
+                    int(args.video_size[0]),
+                    int(args.video_size[1]),
+                    args.video_fps,
+                    video_path,
+                    " (with the reference ghost)"
+                    if env_cfg.viewer.reference_ghost
+                    else "",
+                )
+            )
         max_start = int(env.reference.last_index - 1)
         if not args.sampled_rsi and not 0 <= int(args.rsi_index) <= max_start:
             raise ValueError(
@@ -316,6 +447,8 @@ def main():
                     infos,
                 ) = env.step(actions)
                 total_steps += 1
+                if recorder is not None:
+                    recorder.capture(env)
                 total_reward += scalar(rewards.mean())
                 step_done_count = int(dones.sum())
                 done_count += step_done_count
@@ -446,6 +579,7 @@ def main():
             "episode_metrics": episode_metrics,
             "trajectory_env_0": trajectory,
             "plot_paths": plot_paths,
+            "video_path": str(recorder.path) if recorder is not None else None,
         }
         with output_path.open("w", encoding="utf-8") as output_file:
             json.dump(result, output_file, indent=2, sort_keys=True)
@@ -476,7 +610,15 @@ def main():
         print("  output             : {}".format(output_path))
         if plot_paths.get("episode_dir"):
             print("  plots              : {}".format(plot_paths["episode_dir"]))
+        if recorder is not None:
+            print("  video              : {} ({:.1f} s, {} frames)".format(
+                recorder.path, recorder.duration_s, recorder.frames
+            ))
     finally:
+        # Closed before the simulation so a run interrupted mid-episode still
+        # leaves a playable file behind.
+        if recorder is not None:
+            recorder.close()
         env.close()
 
 

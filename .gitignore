@@ -5,3 +5,15 @@ __pycache__/
 logs/
 wandb/
 *.egg-info/
+
+# best_models/ carries the policies chosen for the real robot. Keep the
+# checkpoint, its config, the evaluation replay and plots, and the evaluation
+# rows -- everything needed to use and judge a policy. Keep out the bulk that
+# git would hold forever: tensorboard event files, the full per-iteration
+# metrics (only the sparse evaluation rows matter, saved as evaluations.jsonl),
+# the raw per-step evaluation arrays whose readable form is the plots, and the
+# mid-rollout training clips.
+best_models/**/events.out.tfevents.*
+best_models/**/metrics.jsonl
+best_models/**/eval_model_*.json
+best_models/**/videos/

@@ -18,6 +18,7 @@ from simtoolreal_animrl.cfg import (
 )
 from simtoolreal_animrl.envs.motion_imitation import MotionImitationEnv
 from simtoolreal_animrl.runners import DeterministicEvaluator, PPO
+from simtoolreal_animrl.runners.evaluation import clamp_evaluation_physx
 
 
 def parse_args():
@@ -29,6 +30,16 @@ def parse_args():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--sim-device", default="cuda:0")
     parser.add_argument("--fixed-phases", type=float, nargs="+", required=True)
+    parser.add_argument(
+        "--object-assist-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Object-assist scale used while evaluating. The default of 0 "
+            "measures the unassisted policy, whatever the training schedule "
+            "currently applies."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -43,6 +54,16 @@ def main():
     env_cfg.seed = int(args.seed)
     env_cfg.env.num_envs = int(args.num_envs)
     env_cfg.env.play = True
+    # This process stands up a second PhysX context beside the live training
+    # one, so it takes only the contact-pair budget 64 environments can use.
+    clamp_evaluation_physx(env_cfg.sim.physx)
+    if float(args.object_assist_scale) <= 0.0:
+        # Not merely scaled to zero: a disabled assist also skips the
+        # per-rigid-body force buffers this process would never use.
+        env_cfg.object_assist.enabled = False
+    else:
+        env_cfg.object_assist.schedule = "constant"
+        env_cfg.object_assist.initial_scale = float(args.object_assist_scale)
 
     env = MotionImitationEnv(
         env_cfg,

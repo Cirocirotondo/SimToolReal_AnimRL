@@ -71,7 +71,6 @@ class RobustnessObjectRewardTest(unittest.TestCase):
             command = replica["command"]
             self.assertEqual(command[command.index("--iterations") + 1], "12000")
             self.assertNotIn("--resume", command)
-            self.assertNotIn("--initialize-from", command)
 
         expected_weights = [
             ("0", "0"),

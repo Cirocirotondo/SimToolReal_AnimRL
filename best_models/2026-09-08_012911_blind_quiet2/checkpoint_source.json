@@ -1,0 +1,7 @@
+{
+  "copied_at": "2026-09-08T01:29:11+02:00",
+  "parent_best_evaluation_score": 0.8473650813102722,
+  "parent_checkpoint": "/home/simone/simtoolreal_animrl/logs/simtoolreal/2026-09-08_000654_blind_soft/model_1000.pt",
+  "parent_iteration": 1000,
+  "parent_run": "2026-09-08_000654_blind_soft"
+}

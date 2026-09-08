@@ -68,7 +68,6 @@ class NoObjectEntropySweepTest(unittest.TestCase):
                 ),
             )
             self.assertNotIn("--resume", command)
-            self.assertNotIn("--initialize-from", command)
             self.assertEqual(run["initialization"], "random")
 
     def test_every_run_disables_all_object_rewards(self):
