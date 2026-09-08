@@ -21,11 +21,21 @@ from simtoolreal_animrl.envs.controller import (
     configure_pd_properties,
     validate_joint_order,
 )
+from simtoolreal_animrl.envs.adaptive_sigma import AdaptiveSigma
 from simtoolreal_animrl.envs.contact import (
     fingertip_contact_diagnostics,
     fingertip_force_norms,
+    fingertip_force_observation,
+    fingertip_force_observation_dim,
+    select_fingertip_forces,
 )
 from simtoolreal_animrl.envs.demonstration import JointDemonstration60Hz
+from simtoolreal_animrl.envs.object_assist import (
+    assist_scale_at,
+    object_assist_wrench,
+    object_reward_gate,
+    resolve_object_assist_settings,
+)
 from simtoolreal_animrl.envs.proximity import fingertip_cuboid_proximity
 from simtoolreal_animrl.envs.rsi import resolve_rsi_settings, sample_rsi_indices
 
@@ -177,6 +187,112 @@ class MotionImitationEnv:
                     sorted(unknown_contact_fingers)
                 )
             )
+        # Gated separately from contact.enabled: acquiring the force tensor for
+        # the observation must not switch a reward term on behind the caller.
+        self.contact_reward_enabled = bool(
+            getattr(self.cfg.contact, "reward_enabled", False)
+        )
+        if self.contact_reward_enabled and not self.contact_enabled:
+            raise ValueError(
+                "contact.reward_enabled needs contact.enabled, which is what "
+                "acquires the force tensor the shaping reads"
+            )
+        self.contact_observation_enabled = bool(
+            getattr(self.cfg.contact, "observe_fingertip_forces", False)
+        )
+        self.contact_shaping_weight = (
+            self.contact_reward_per_finger if self.contact_reward_enabled else 0.0
+        )
+        self.contact_observation_force_scale_n = float(
+            getattr(self.cfg.contact, "observation_force_scale_n", 10.0)
+        )
+        self.contact_observation_clip = float(
+            getattr(self.cfg.contact, "observation_clip", 5.0)
+        )
+        if self.contact_observation_enabled:
+            if not self.contact_enabled:
+                raise ValueError(
+                    "contact.observe_fingertip_forces needs contact.enabled: "
+                    "that is what turns on PhysX contact reporting and "
+                    "acquires the force tensor the observation reads"
+                )
+            if (
+                not math.isfinite(self.contact_observation_force_scale_n)
+                or self.contact_observation_force_scale_n <= 0.0
+            ):
+                raise ValueError(
+                    "contact.observation_force_scale_n must be finite and "
+                    "positive"
+                )
+            if (
+                not math.isfinite(self.contact_observation_clip)
+                or self.contact_observation_clip <= 0.0
+            ):
+                raise ValueError(
+                    "contact.observation_clip must be finite and positive"
+                )
+        # The fingertip-force block widens the observation vector, so
+        # env.num_observations stays the base width every existing run used and
+        # the policy is built from the total below.
+        rewards_cfg_init = self.cfg.rewards
+        self.adaptive_sigmas = {}
+        if bool(getattr(rewards_cfg_init, "adaptive_sigma_enabled", False)):
+            target = float(rewards_cfg_init.adaptive_sigma_target_reward)
+            decay = float(rewards_cfg_init.adaptive_sigma_decay)
+            for name, initial, floor in (
+                (
+                    "position_arm",
+                    rewards_cfg_init.position_arm_std_rad,
+                    rewards_cfg_init.adaptive_sigma_position_arm_floor,
+                ),
+                (
+                    "position_hand",
+                    rewards_cfg_init.position_hand_std_rad,
+                    rewards_cfg_init.adaptive_sigma_position_hand_floor,
+                ),
+                (
+                    "action_rate_arm",
+                    rewards_cfg_init.action_rate_arm_std,
+                    rewards_cfg_init.adaptive_sigma_action_rate_arm_floor,
+                ),
+                (
+                    "action_rate_hand",
+                    rewards_cfg_init.action_rate_hand_std,
+                    rewards_cfg_init.adaptive_sigma_action_rate_hand_floor,
+                ),
+            ):
+                self.adaptive_sigmas[name] = AdaptiveSigma(
+                    initial=initial,
+                    floor=floor,
+                    target_reward=target,
+                    decay=decay,
+                )
+        self.contact_observation_dim = fingertip_force_observation_dim(
+            self.cfg.contact
+        )
+        self.num_obs += self.contact_observation_dim
+        # The critic may read the fingertip forces even when the actor cannot.
+        # Its width is the actor's plus those forces, and it is left at None
+        # when the feature is off so PPO keeps its symmetric path.
+        self.critic_force_observation_dim = (
+            3 * len(self.cfg.contact.fingertip_names)
+            if bool(
+                getattr(
+                    self.cfg.contact, "critic_observes_fingertip_forces", False
+                )
+            )
+            else 0
+        )
+        if self.critic_force_observation_dim:
+            if not bool(getattr(self.cfg.contact, "enabled", False)):
+                raise ValueError(
+                    "critic_observes_fingertip_forces requires contact.enabled: "
+                    "the net contact force tensor is only wrapped when contact "
+                    "reporting is on"
+                )
+            self.num_privileged_obs = (
+                self.num_obs + self.critic_force_observation_dim
+            )
         self.proximity_fingertip_names = tuple(
             str(name).strip().lower()
             for name in self.cfg.rewards.fingertip_object_distance_names
@@ -275,6 +391,20 @@ class MotionImitationEnv:
             self.rsi_pregrasp_start_index,
             self.rsi_early_probability,
         ) = resolve_rsi_settings(self.cfg.env, self.reference.last_index)
+        # A config.json written before the assist existed simply keeps the
+        # disabled class default, so replaying an older run is unaffected.
+        self.object_assist_settings = resolve_object_assist_settings(
+            self.cfg.object_assist, self.reference.last_index
+        )
+        self.object_assist_enabled = self.object_assist_settings.enabled
+        self.object_assist_gates_object_reward = bool(
+            getattr(self.cfg.object_assist, "gate_object_reward", True)
+        )
+        # Iteration 0 of the schedule until PPO says otherwise. Evaluation
+        # processes never advance it and pin the scale to zero instead.
+        self.object_assist_scale = assist_scale_at(
+            self.object_assist_settings, 0
+        )
 
         # Purely a visual benchmark, and it doubles the simulated bodies, so
         # only an explicit opt-in builds it. evaluate.py ties it to --viewer;
@@ -390,7 +520,13 @@ class MotionImitationEnv:
 
         self.demo_to_asset = validate_joint_order(self.gym, asset)
         self.pd_properties = configure_pd_properties(
-            self.gym, asset, self.demo_to_asset
+            self.gym,
+            asset,
+            self.demo_to_asset,
+            arm_stiffness_scale=self.cfg.control.arm_stiffness_scale,
+            arm_damping_scale=self.cfg.control.arm_damping_scale,
+            hand_stiffness_scale=self.cfg.control.hand_stiffness_scale,
+            hand_damping_scale=self.cfg.control.hand_damping_scale,
         )
         self.collision_filter_bits = configure_asset_wrist_collision_filters(
             self.gym, asset
@@ -807,6 +943,15 @@ class MotionImitationEnv:
             dtype=torch.long,
             device=self.device,
         )
+        # The cuboid is a single-body actor, so its only body is where the
+        # assist wrench is applied.
+        self.cube_body_index = int(
+            self.gym.get_actor_rigid_body_index(
+                env, self.cube_handles[0], 0, gymapi.DOMAIN_ENV
+            )
+        )
+        if self.cube_body_index < 0:
+            raise ValueError("The cuboid rigid body was not found")
 
     def _paint_ghost(self, env, ghost) -> None:
         color = gymapi.Vec3(
@@ -844,6 +989,12 @@ class MotionImitationEnv:
         camera_properties.width = self.training_camera_width
         camera_properties.height = self.training_camera_height
         camera_properties.enable_tensors = False
+        # getattr keeps configurations written before the field existed usable;
+        # 90 degrees is Isaac Gym's own default and what the recorded training
+        # videos have always framed with.
+        camera_properties.horizontal_fov = float(
+            getattr(self.cfg.viewer, "training_camera_fov_deg", 90.0)
+        )
         env = self.envs[self.training_camera_env_index]
         handle = self.gym.create_camera_sensor(env, camera_properties)
         if handle < 0:
@@ -971,6 +1122,27 @@ class MotionImitationEnv:
         self.object_half_extents = torch.tensor(
             self.cfg.object.size_m, dtype=torch.float32, device=self.device
         ) / 2.0
+        # Isaac Gym takes one force and one torque per rigid body in the whole
+        # simulation, so the buffers cover every body and stay zero outside the
+        # cube column. They are only allocated when the assist can ever be on.
+        self.rigid_body_forces = None
+        self.rigid_body_torques = None
+        self.gravity_vector = torch.tensor(
+            self.cfg.sim.gravity, dtype=torch.float32, device=self.device
+        )
+        if self.object_assist_enabled:
+            self.rigid_body_forces = torch.zeros(
+                (self.num_envs * rigid_bodies_per_env, 3),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.rigid_body_torques = torch.zeros_like(self.rigid_body_forces)
+            self.cube_body_forces = self.rigid_body_forces.view(
+                self.num_envs, rigid_bodies_per_env, 3
+            )[:, self.cube_body_index]
+            self.cube_body_torques = self.rigid_body_torques.view(
+                self.num_envs, rigid_bodies_per_env, 3
+            )[:, self.cube_body_index]
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
@@ -981,7 +1153,17 @@ class MotionImitationEnv:
         self.obs_buf = torch.zeros(
             (self.num_envs, self.num_obs), dtype=torch.float32, device=self.device
         )
-        self.critic_obs_buf = None
+        self.critic_obs_buf = (
+            torch.zeros(
+                self.num_envs,
+                self.num_privileged_obs,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if self.critic_force_observation_dim
+            else None
+        )
+        self._critic_force_features = None
         self.rew_buf = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
@@ -1007,6 +1189,14 @@ class MotionImitationEnv:
         )
         self.episode_peak_object_com_height_m = torch.zeros_like(
             self.episode_initial_object_com_height_m
+        )
+        # Magnitudes of the wrench actually applied in the last step, kept for
+        # logging: they say how much of the task the crutch is still doing.
+        self.object_assist_force_n = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.object_assist_torque_nm = torch.zeros_like(
+            self.object_assist_force_n
         )
         self.actions = torch.zeros(
             (self.num_envs, self.num_actions), dtype=torch.float32, device=self.device
@@ -1040,6 +1230,8 @@ class MotionImitationEnv:
                 "fingertip_contact_reward",
                 "fingertip_contact_fraction",
                 "fingertip_contact_force_n",
+                "object_assist_force_n",
+                "object_assist_torque_nm",
             )
         }
         self.extras = {}
@@ -1110,6 +1302,12 @@ class MotionImitationEnv:
                 wrist_orientation, self.palm_orientation_in_wrist
             )
         )
+        if self.critic_force_observation_dim:
+            # Cached here, where the palm frame is already computed, and
+            # consumed by compute_observations below.
+            self._critic_force_features = self._fingertip_force_features(
+                palm_orientation_world
+            )
         robot_root = self.robot_root_state
         robot_position_world = robot_root[:, 0:3]
         robot_orientation_world = _normalize_canonical_quaternion(
@@ -1140,12 +1338,41 @@ class MotionImitationEnv:
             palm_orientation_world.unsqueeze(1).expand(-1, 5, -1),
             fingertip_positions_world - palm_position_world.unsqueeze(1),
         ).reshape(self.num_envs, 15)
-        return (
+        components = (
             palm_position_robot,
             palm_orientation_robot,
             fingertip_positions_palm,
             cube_orientation_palm,
             cube_center_palm,
+        )
+        if not self.contact_observation_enabled:
+            return components
+        return components + (
+            self._fingertip_force_features(palm_orientation_world),
+        )
+
+    def _fingertip_force_features(
+        self, palm_orientation_world: torch.Tensor
+    ) -> torch.Tensor:
+        """Scaled, clipped fingertip contact forces in the palm frame.
+
+        Contact forces go into the palm frame like the fingertip positions, so
+        "pressed from this direction" reads the same wherever the arm happens
+        to be. Shared by the actor observation and the privileged critic
+        observation so the two can never drift apart.
+        """
+        fingertip_forces_world = select_fingertip_forces(
+            self.net_contact_forces, self.contact_fingertip_body_indices
+        )
+        num_contact_tips = fingertip_forces_world.shape[1]
+        fingertip_forces_palm = _quat_rotate_inverse(
+            palm_orientation_world.unsqueeze(1).expand(-1, num_contact_tips, -1),
+            fingertip_forces_world,
+        )
+        return fingertip_force_observation(
+            fingertip_forces_palm,
+            self.contact_observation_force_scale_n,
+            self.contact_observation_clip,
         )
 
     @property
@@ -1216,6 +1443,77 @@ class MotionImitationEnv:
             gymtorch.unwrap_tensor(self.root_state_all),
             gymtorch.unwrap_tensor(cube_actor_ids),
             cube_actor_ids.numel(),
+        )
+
+    def set_training_iteration(self, iteration: int) -> float:
+        """Advance the assist curriculum and return the resulting scale.
+
+        PPO calls this once per update. Nothing else in the environment depends
+        on the iteration counter, so a process that never calls it (evaluation,
+        the headless tests) simply keeps the schedule's iteration-0 value.
+        """
+        self.object_assist_scale = assist_scale_at(
+            self.object_assist_settings, int(iteration)
+        )
+        return self.object_assist_scale
+
+    def object_reward_gate(self) -> float:
+        return object_reward_gate(
+            self.object_assist_enabled,
+            self.object_assist_gates_object_reward,
+            self.object_assist_scale,
+        )
+
+    def set_object_assist_scale(self, scale: float) -> float:
+        """Pin the assist scale, overriding the schedule until it is advanced."""
+        scale = float(scale)
+        if not math.isfinite(scale) or scale < 0.0:
+            raise ValueError("The object-assist scale must be finite and non-negative")
+        self.object_assist_scale = scale
+        return self.object_assist_scale
+
+    def _compute_object_assist(self, reference) -> None:
+        """Fill the cube's annealed PD + gravity-compensation wrench buffers.
+
+        The target is the reference sample the robot is being driven toward in
+        this step, so the assist and the position targets pull the same way.
+        """
+        active = self.reference_index >= (
+            self.object_assist_settings.active_from_reference_index
+        )
+        force, torque = object_assist_wrench(
+            self.cube_position,
+            self.cube_orientation,
+            self.cube_linear_velocity,
+            self.cube_angular_velocity,
+            self._cube_reference_root_states(reference),
+            self.object_assist_settings,
+            self.object_assist_scale,
+            float(self.cfg.object.mass_kg),
+            self.gravity_vector,
+            active,
+        )
+        self.cube_body_forces.copy_(force)
+        self.cube_body_torques.copy_(torque)
+        self.object_assist_force_n.copy_(
+            torch.linalg.vector_norm(force, dim=1)
+        )
+        self.object_assist_torque_nm.copy_(
+            torch.linalg.vector_norm(torque, dim=1)
+        )
+
+    def _push_object_assist(self) -> None:
+        """Queue the buffered wrench for the next ``simulate`` call.
+
+        PhysX consumes applied forces once per simulation step, so with a
+        decimation above one the same zero-order-hold wrench is queued again
+        before every substep.
+        """
+        self.gym.apply_rigid_body_force_tensors(
+            self.sim,
+            gymtorch.unwrap_tensor(self.rigid_body_forces),
+            gymtorch.unwrap_tensor(self.rigid_body_torques),
+            gymapi.ENV_SPACE,
         )
 
     def scale_actions(self, actions: torch.Tensor) -> torch.Tensor:
@@ -1394,6 +1692,10 @@ class MotionImitationEnv:
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        if self.contact_enabled:
+            # Otherwise the first observation of the episode would carry the
+            # forces from just before the reset.
+            self.gym.refresh_net_contact_force_tensor(self.sim)
         self.compute_observations()
         return self.obs_buf
 
@@ -1415,6 +1717,15 @@ class MotionImitationEnv:
         )
         if self.obs_buf.shape != (self.num_envs, self.num_obs):
             raise RuntimeError("Observation shape does not match configuration")
+        if self.critic_obs_buf is not None:
+            if self._critic_force_features is None:
+                raise RuntimeError(
+                    "Privileged critic observation requested but the fingertip "
+                    "forces were never computed"
+                )
+            self.critic_obs_buf.copy_(
+                torch.cat((self.obs_buf, self._critic_force_features), dim=1)
+            )
 
     def _compute_reward_and_errors(self) -> Dict[str, torch.Tensor]:
         reference = self.reference.sample(self.reference_index)
@@ -1470,21 +1781,41 @@ class MotionImitationEnv:
         )
 
         gaussian = lambda mse, std: torch.exp(-mse / (2.0 * float(std) ** 2))
-        position_reward = gaussian(position_mse, rewards_cfg.position_arm_std_rad)
+
+        def width(name, configured, mse):
+            """The width for one term: adaptive when enabled, else the config."""
+            tracker = self.adaptive_sigmas.get(name)
+            if tracker is None:
+                return float(configured)
+            return tracker.update(float(mse.mean().item()))
+
+        position_arm_std = width(
+            "position_arm", rewards_cfg.position_arm_std_rad, position_mse
+        )
+        position_hand_std = width(
+            "position_hand", rewards_cfg.position_hand_std_rad, hand_position_mse
+        )
+        action_rate_arm_std = width(
+            "action_rate_arm", rewards_cfg.action_rate_arm_std, action_rate_mse
+        )
+        action_rate_hand_std = width(
+            "action_rate_hand",
+            rewards_cfg.action_rate_hand_std,
+            hand_action_rate_mse,
+        )
+        position_reward = gaussian(position_mse, position_arm_std)
         velocity_reward = gaussian(
             velocity_mse, rewards_cfg.velocity_arm_std_rad_per_s
         )
-        action_rate_reward = gaussian(
-            action_rate_mse, rewards_cfg.action_rate_arm_std
-        )
+        action_rate_reward = gaussian(action_rate_mse, action_rate_arm_std)
         hand_position_reward = gaussian(
-            hand_position_mse, rewards_cfg.position_hand_std_rad
+            hand_position_mse, position_hand_std
         )
         hand_velocity_reward = gaussian(
             hand_velocity_mse, rewards_cfg.velocity_hand_std_rad_per_s
         )
         hand_action_rate_reward = gaussian(
-            hand_action_rate_mse, rewards_cfg.action_rate_hand_std
+            hand_action_rate_mse, action_rate_hand_std
         )
         object_position_reward = gaussian(
             object_position_error_m.square(),
@@ -1548,12 +1879,15 @@ class MotionImitationEnv:
             + float(rewards_cfg.velocity_hand_weight) * hand_velocity_reward
             + float(rewards_cfg.action_rate_hand_weight)
             * hand_action_rate_reward
-            + float(rewards_cfg.object_position_weight)
-            * object_position_reward
-            + float(rewards_cfg.object_orientation_weight)
-            * object_orientation_reward
+            + self.object_reward_gate()
+            * (
+                float(rewards_cfg.object_position_weight)
+                * object_position_reward
+                + float(rewards_cfg.object_orientation_weight)
+                * object_orientation_reward
+            )
             + self.proximity_weight * fingertip_object_distance_reward
-            + self.contact_reward_per_finger * fingertip_contact_reward
+            + self.contact_shaping_weight * fingertip_contact_reward
         )
         return {
             "q_error": arm_q_error,
@@ -1562,6 +1896,18 @@ class MotionImitationEnv:
             "hand_dq_error": hand_dq_error,
             "position_mse": position_mse,
             "velocity_mse": velocity_mse,
+            "adaptive_sigma_position_arm": torch.full_like(
+                position_mse, position_arm_std
+            ),
+            "adaptive_sigma_position_hand": torch.full_like(
+                position_mse, position_hand_std
+            ),
+            "adaptive_sigma_action_rate_arm": torch.full_like(
+                position_mse, action_rate_arm_std
+            ),
+            "adaptive_sigma_action_rate_hand": torch.full_like(
+                position_mse, action_rate_hand_std
+            ),
             "action_rate_mse": action_rate_mse,
             "hand_position_mse": hand_position_mse,
             "hand_velocity_mse": hand_velocity_mse,
@@ -1738,6 +2084,12 @@ class MotionImitationEnv:
         self.episode_sums["rms_action_rate"] += metrics[
             "action_rate_mse"
         ].sqrt()
+        self.episode_sums["object_assist_force_n"] += (
+            self.object_assist_force_n
+        )
+        self.episode_sums["object_assist_torque_nm"] += (
+            self.object_assist_torque_nm
+        )
 
     def _build_episode_summary(
         self,
@@ -1821,9 +2173,15 @@ class MotionImitationEnv:
         self.gym.set_dof_position_target_tensor(
             self.sim, gymtorch.unwrap_tensor(self.position_targets_all)
         )
+        # The helper wrench is computed from the pre-physics cube state against
+        # the same reference sample the position targets chase.
+        if self.object_assist_enabled:
+            self._compute_object_assist(next_reference)
 
         # Physics Step
         for _ in range(int(self.cfg.control.decimation)):
+            if self.object_assist_enabled:
+                self._push_object_assist()
             self.gym.simulate(self.sim)
         self.gym.fetch_results(self.sim, True)
         self.gym.refresh_dof_state_tensor(self.sim)
@@ -1908,6 +2266,11 @@ class MotionImitationEnv:
                 "fingertip_object_distance_per_finger_m"
             ],
             "proximity_active": metrics["proximity_active"],
+            # The wrench that was applied before this step's physics, so a
+            # rollout can report how much help the object still receives.
+            "object_assist_force_n": self.object_assist_force_n.clone(),
+            "object_assist_torque_nm": self.object_assist_torque_nm.clone(),
+            "object_assist_scale": self.object_assist_scale,
         }
         rewards = self.rew_buf.clone()
         dones = done.clone()

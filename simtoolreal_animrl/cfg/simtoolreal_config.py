@@ -52,6 +52,50 @@ class SimToolRealCfg(BaseEnvCfg):
         restitution = 0.0
         color = [0.78, 0.78, 0.82]
 
+    class object_assist:
+        # External helper wrench applied at the cube's centre of mass: a PD
+        # controller toward the demonstrated cube pose plus gravity
+        # compensation. Its scale decays linearly to zero over the configured
+        # iteration window, so the policy progressively takes over the force
+        # the hand has to supply. Off by default; train.py --object-assist and
+        # --set object_assist.* enable and tune it without changing any of the
+        # existing experiment launchers.
+        enabled = False
+        # "linear" anneals initial_scale -> final_scale between the two
+        # iterations below; "constant" holds initial_scale for the whole run
+        # and exists for ablations.
+        schedule = "linear"
+        start_iteration = 0
+        end_iteration = 6000
+        initial_scale = 1.0
+        final_scale = 0.0
+        # Critically-to-slightly-overdamped gains for the 0.2 kg cuboid:
+        # omega = sqrt(kp/m) ~ 24 rad/s, well inside the 60 Hz control rate at
+        # which the wrench is held constant.
+        position_stiffness_n_per_m = 120.0
+        position_damping_ns_per_m = 12.0
+        # Sized on the cuboid's smallest principal inertia (8.33e-5 kg m^2),
+        # which is the axis that would go unstable first.
+        orientation_stiffness_nm_per_rad = 0.06
+        orientation_damping_nms_per_rad = 0.006
+        torque_enabled = True
+        # Cancels m*g, so at scale 1 a cube already at its target floats there
+        # instead of needing a steady-state PD offset to stay put.
+        gravity_compensation = True
+        # Direction-preserving saturation, so a large transient pose error
+        # cannot launch the cube. m*g is only 1.96 N.
+        max_force_n = 30.0
+        max_torque_nm = 0.2
+        # The wrench is gated off before this demonstration index. Zero assists
+        # over the whole motion, including while the cube rests on the table.
+        active_from_reference_index = 0
+        # Scale the object position/orientation rewards by (1 - assist scale),
+        # so the policy is only paid for the cube tracking it produces itself.
+        # Without this the assist hands it those terms for free and there is no
+        # pressure to take the load over before the assist anneals away.
+        # Inert when the assist is off, where the scale is always zero.
+        gate_object_reward = True
+
     class table:
         size_m = [0.475, 0.4, 0.3]
         surface_below_robot_base_m = 0.035
@@ -100,6 +144,15 @@ class SimToolRealCfg(BaseEnvCfg):
         # At 100.0 the residual clamp never binds. The finger movements are 
         # effectively capped by the early terminations.
         clip_joint_target = 100.0
+        # Multipliers on the low-level position-drive gains in envs/controller.py.
+        # 1.0 reproduces the gains every run so far has used. Softening a limb
+        # lowers its bandwidth sqrt(k/J) so the drive filters the policy's
+        # step-to-step chatter rather than tracking it into the joint, and
+        # raises the damping ratio d/(2 sqrt(kJ)) at the same time.
+        arm_stiffness_scale = 1.0
+        arm_damping_scale = 1.0
+        hand_stiffness_scale = 1.0
+        hand_damping_scale = 1.0
 
     class contact:
         # Optional GPU contact shaping for the three fingers used by the
@@ -114,8 +167,32 @@ class SimToolRealCfg(BaseEnvCfg):
         # DG5F semantic mapping: finger 1=thumb, 2=index, 3=middle.
         fingertip_names = ["thumb", "index", "middle"]
         # Add this amount once per selected fingertip over the force threshold:
-        # 0, x, 2x or 3x at each control step with the default selection.
+        # 0, x, 2x or 3x at each control step with the default selection. Gated
+        # by reward_enabled below rather than by `enabled`, so switching the
+        # force tensor on for the observation does not quietly change the
+        # reward function too.
         reward_per_finger = 0.05
+        reward_enabled = False
+        # Append one 3D contact-force vector per selected fingertip to the
+        # observation vector, rotated into the palm frame like the fingertip
+        # positions and the cube pose already are. Needs `enabled`, which is
+        # what acquires the PhysX force tensor. Off by default, so every
+        # existing experiment keeps its 108D observation and its checkpoints
+        # stay loadable. train.py --contact-observations turns both on.
+        observe_fingertip_forces = False
+        # Asymmetric actor-critic: the actor stays blind while the critic also
+        # reads the fingertip contact forces. Privileged information is legal
+        # in the critic because the critic is discarded at deployment, and a
+        # value function that can see contact explains the returns a blind
+        # actor cannot, which lowers the advantage noise the actor learns from.
+        critic_observes_fingertip_forces = False
+        # The palm-frame force is divided by this before it reaches the policy,
+        # so a firm grasp lands near unit scale instead of tens of newtons.
+        observation_force_scale_n = 10.0
+        # Symmetric per-component clip applied after that scaling. A collision
+        # spike is worth several hundred newtons and would otherwise swamp the
+        # 108 inputs it sits beside.
+        observation_clip = 5.0
 
     class rewards:
         # Same weights and Gaussian widths as no_object_reward. Arm and hand
@@ -136,6 +213,25 @@ class SimToolRealCfg(BaseEnvCfg):
         position_hand_std_rad = 0.223607
         velocity_hand_std_rad_per_s = 1.0
         action_rate_hand_std = 5
+        # Adaptive widths. Off by default, so every existing run reproduces.
+        # When on, position_* and action_rate_* sigmas follow a slow average of
+        # their own MSE and hold the term near adaptive_sigma_target_reward, so
+        # it keeps a live gradient however good the policy gets. This is the
+        # sharpening ladder done continuously: the fixed widths above stop
+        # paying once the policy passes them, which is why mean_reward kept
+        # rising while the deployment score fell after iteration 1500.
+        adaptive_sigma_enabled = False
+        adaptive_sigma_target_reward = 0.6
+        adaptive_sigma_decay = 0.999
+        # Floors, below which a term stops demanding improvement. Set at the
+        # smoothest policy trained here (2026-08-26_sharpen_sigma), because
+        # asking for better than that has never been necessary and a width that
+        # chases the policy indefinitely is how blind_sharp traded its grasp
+        # away for tracking it did not need.
+        adaptive_sigma_position_arm_floor = 0.0061
+        adaptive_sigma_position_hand_floor = 0.0103
+        adaptive_sigma_action_rate_arm_floor = 0.0076
+        adaptive_sigma_action_rate_hand_floor = 0.0076
 
         # Cube position tracking rewards
         object_scale = 1
@@ -145,7 +241,7 @@ class SimToolRealCfg(BaseEnvCfg):
         object_orientation_std_rad = 0.5
 
         # Fingertip-object distance rewards
-        fingertip_object_distance_weight = 0.2 * object_scale
+        fingertip_object_distance_weight = 0 * 0.2 * object_scale
         fingertip_object_distance_std_m = 0.04
         fingertip_object_distance_names = ["thumb", "index", "middle"]
 

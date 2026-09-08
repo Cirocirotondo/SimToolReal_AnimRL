@@ -223,50 +223,6 @@ class RunnerModulesTest(unittest.TestCase):
         runner.best_evaluation_iteration = -1
         return runner
 
-    def test_policy_initialization_leaves_critic_and_optimizer_fresh(self):
-        source = self._checkpoint_runner()
-        with torch.no_grad():
-            for parameter in source.policy.parameters():
-                parameter.fill_(0.25)
-            for parameter in source.value.parameters():
-                parameter.fill_(0.75)
-        source.actor_obs_normalizer(torch.randn(7, 3))
-        source.critic_obs_normalizer(torch.randn(7, 3))
-        # Populate Adam's state so accidentally loading it is observable.
-        source.optimizer.zero_grad()
-        sum(parameter.sum() for parameter in source.policy.parameters()).backward()
-        source.optimizer.step()
-        infos = {
-            "total_timesteps": 12345,
-            "total_time_s": 67.0,
-            "best_evaluation_score": 0.9,
-            "best_evaluation_iteration": 42,
-            "actor_normalizer_count": source.actor_obs_normalizer.count,
-            "critic_normalizer_count": source.critic_obs_normalizer.count,
-        }
-
-        target = self._checkpoint_runner()
-        untouched_value = {
-            name: tensor.clone() for name, tensor in target.value.state_dict().items()
-        }
-        with TemporaryDirectory() as temporary_directory:
-            checkpoint = Path(temporary_directory) / "source.pt"
-            source.save(checkpoint, infos=infos)
-            returned_infos = target.initialize_policy(checkpoint)
-
-        self.assertEqual(returned_infos, infos)
-        for name, tensor in source.policy.state_dict().items():
-            self.assertTrue(torch.equal(target.policy.state_dict()[name], tensor))
-        for name, tensor in untouched_value.items():
-            self.assertTrue(torch.equal(target.value.state_dict()[name], tensor))
-        self.assertEqual(target.optimizer.state, {})
-        self.assertEqual(target.total_timesteps, 0)
-        self.assertEqual(target.best_evaluation_iteration, -1)
-        self.assertEqual(
-            target.actor_obs_normalizer.count,
-            source.actor_obs_normalizer.count,
-        )
-
     def test_training_config_matches_animrl_cartwheel(self):
         train = self.train_cfg
         self.assertEqual(train.runner.num_steps_per_env, 24)

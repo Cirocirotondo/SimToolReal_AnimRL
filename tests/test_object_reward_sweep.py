@@ -64,7 +64,6 @@ class ObjectRewardSweepTest(unittest.TestCase):
                     experiment["input_checkpoint"], expected_checkpoint
                 )
                 self.assertIn("--resume", experiment["command"])
-                self.assertNotIn("--initialize-from", experiment["command"])
 
     def test_scratch_runs_never_receive_a_checkpoint(self):
         with TemporaryDirectory() as temporary_directory:
@@ -90,7 +89,6 @@ class ObjectRewardSweepTest(unittest.TestCase):
                 self.assertIsNone(experiment["input_checkpoint"])
                 self.assertEqual(experiment["checkpoint_loading"], "random")
                 self.assertNotIn("--resume", experiment["command"])
-                self.assertNotIn("--initialize-from", experiment["command"])
 
     def test_diverged_run_does_not_stop_remaining_experiments(self):
         with TemporaryDirectory() as temporary_directory:

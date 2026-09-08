@@ -1,0 +1,1308 @@
+<title>Grasp Training Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    color-scheme: light;
+    --plane: #eaeef0;
+    --surface: #ffffff;
+    --surface-2: #f4f7f8;
+    --ink: #0c1418;
+    --ink-2: #4c5c63;
+    --muted: #7b8b92;
+    --line: #dbe2e5;
+    --line-strong: #c2ced3;
+    --accent: #0c6f78;
+    --accent-soft: rgba(12, 111, 120, 0.10);
+    --good: #0ca30c;
+    --warning: #b07800;
+    --serious: #c1613a;
+    --critical: #d03b3b;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --series-1-soft: rgba(42, 120, 214, 0.14);
+    --shadow: 0 1px 2px rgba(12, 20, 24, 0.06), 0 6px 18px -12px rgba(12, 20, 24, 0.30);
+    --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --plane: #0a0f12;
+      --surface: #131b1f;
+      --surface-2: #182126;
+      --ink: #e9eff1;
+      --ink-2: #a3b3ba;
+      --muted: #7b8f97;
+      --line: #243137;
+      --line-strong: #36474f;
+      --accent: #35b0b9;
+      --accent-soft: rgba(53, 176, 185, 0.14);
+      --good: #2fbf2f;
+      --warning: #fab219;
+      --serious: #ec835a;
+      --critical: #e56060;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --series-1-soft: rgba(57, 135, 229, 0.20);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 20px -14px rgba(0, 0, 0, 0.9);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane: #0a0f12;
+    --surface: #131b1f;
+    --surface-2: #182126;
+    --ink: #e9eff1;
+    --ink-2: #a3b3ba;
+    --muted: #7b8f97;
+    --line: #243137;
+    --line-strong: #36474f;
+    --accent: #35b0b9;
+    --accent-soft: rgba(53, 176, 185, 0.14);
+    --good: #2fbf2f;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #e56060;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-1-soft: rgba(57, 135, 229, 0.20);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 20px -14px rgba(0, 0, 0, 0.9);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-text-size-adjust: 100%;
+  }
+  h1, h2, h3 { margin: 0; text-wrap: balance; font-weight: 600; letter-spacing: -0.01em; }
+  h1 { font-size: 19px; }
+  h2 { font-size: 17px; }
+  h3 { font-size: 15px; }
+  p { margin: 0; }
+  a { color: var(--accent); }
+  button, input, select, textarea { font: inherit; color: inherit; }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 14px 96px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* ---- top bar ---------------------------------------------------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 30;
+    background: color-mix(in srgb, var(--plane) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar-inner {
+    max-width: 1120px; margin: 0 auto; padding: 10px 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .mark {
+    width: 26px; height: 26px; flex: 0 0 auto; border-radius: 7px;
+    background: var(--accent); color: #fff; display: grid; place-items: center;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+  }
+  .topbar h1 { font-size: 15px; }
+  .topbar .stamp { margin-left: auto; text-align: right; }
+  .stamp .num { font-size: 12px; color: var(--ink-2); }
+
+  .tabs {
+    display: flex; gap: 6px; overflow-x: auto; padding: 0 14px 10px;
+    max-width: 1120px; margin: 0 auto; scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab {
+    flex: 0 0 auto; padding: 6px 12px; border-radius: 999px;
+    border: 1px solid var(--line-strong); background: var(--surface);
+    color: var(--ink-2); text-decoration: none; font-size: 13px; font-weight: 500;
+  }
+  .tab:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---- machine strip ---------------------------------------------- */
+  .machine {
+    display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 20px;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 10px; border-radius: 8px; background: var(--surface);
+    border: 1px solid var(--line); font-size: 12.5px; color: var(--ink-2);
+    box-shadow: var(--shadow);
+  }
+  .chip b { color: var(--ink); font-weight: 600; font-family: var(--mono); font-size: 12px; }
+
+  /* ---- run card ---------------------------------------------------- */
+  section { margin-bottom: 30px; scroll-margin-top: 96px; }
+  .section-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+  .section-head .eyebrow { margin-left: auto; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;
+    margin-bottom: 14px;
+  }
+  .card.lead { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+  .card-head { padding: 14px 14px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .card-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .card-title .name {
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+    word-break: break-all; color: var(--ink);
+  }
+  .card-body { padding: 0 14px 14px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    font-family: var(--mono); letter-spacing: 0.04em; text-transform: uppercase;
+    border: 1px solid currentColor;
+  }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.live { color: var(--good); }
+  .pill.live .dot { animation: pulse 1.8s ease-in-out infinite; }
+  .pill.finished { color: var(--accent); }
+  .pill.stopped { color: var(--muted); }
+  .pill.diverged { color: var(--critical); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  @media (prefers-reduced-motion: reduce) { .pill.live .dot { animation: none; } }
+
+  .rail { height: 5px; border-radius: 3px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--line); }
+  .rail > i { display: block; height: 100%; background: var(--accent); }
+  .rail-meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--ink-2); margin-top: 5px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: var(--line); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .tile { background: var(--surface); padding: 11px 14px; }
+  .tile .label { font-size: 11px; color: var(--muted); font-weight: 500; }
+  .tile .value { font-family: var(--mono); font-size: 21px; font-weight: 600; letter-spacing: -0.02em; margin-top: 1px; }
+  .tile .sub { font-size: 11.5px; color: var(--ink-2); font-family: var(--mono); }
+  .tile .sub.good { color: var(--good); }
+  .tile .sub.bad { color: var(--critical); }
+  @media (min-width: 720px) { .tiles { grid-template-columns: repeat(4, 1fr); } }
+
+  .findings { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 7px; }
+  .findings li {
+    display: grid; grid-template-columns: 16px 1fr; gap: 8px;
+    font-size: 13.5px; color: var(--ink-2); line-height: 1.45;
+  }
+  .findings .glyph { font-family: var(--mono); font-weight: 700; font-size: 12px; line-height: 1.6; }
+  .findings .good .glyph { color: var(--good); }
+  .findings .warning .glyph { color: var(--warning); }
+  .findings .critical .glyph { color: var(--critical); }
+  .findings .neutral .glyph { color: var(--muted); }
+
+  .charts { display: grid; gap: 10px; margin-top: 16px; }
+  @media (min-width: 640px) { .charts { grid-template-columns: 1fr 1fr; } }
+  .chart {
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px 6px;
+    background: var(--surface-2); position: relative;
+  }
+  .chart-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+  .chart-head .now { margin-left: auto; font-family: var(--mono); font-size: 12.5px; font-weight: 600; }
+  .chart svg { display: block; width: 100%; touch-action: pan-y; }
+  .tip {
+    position: absolute; pointer-events: none; opacity: 0; transform: translate(-50%, -100%);
+    background: var(--ink); color: var(--surface); padding: 4px 7px; border-radius: 6px;
+    font-family: var(--mono); font-size: 11px; white-space: nowrap; z-index: 5;
+    transition: opacity .1s;
+  }
+
+  .strip { display: flex; gap: 10px; overflow-x: auto; padding: 4px 0 8px; scroll-snap-type: x mandatory; }
+  .clip { flex: 0 0 min(84vw, 320px); scroll-snap-align: start; position: relative; }
+  .clip.wide { flex: 0 0 min(92vw, 460px); }
+  .clip video { width: 100%; border-radius: 9px; border: 1px solid var(--line); background: #000; display: block; }
+  .clip .cap { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .clip .zoom {
+    position: absolute; top: 6px; right: 6px; z-index: 2; width: 32px; height: 32px;
+    display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer;
+    border: 1px solid rgba(255, 255, 255, 0.34); border-radius: 8px;
+    background: rgba(6, 12, 14, 0.58); color: #fff; font-size: 15px; line-height: 1;
+    -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+  }
+  .clip .zoom:hover { background: rgba(6, 12, 14, 0.82); }
+
+  .lightbox {
+    position: fixed; inset: 0; z-index: 60; background: rgba(4, 8, 10, 0.95);
+    display: flex; flex-direction: column; gap: 10px; padding: 12px;
+    align-items: center; justify-content: center;
+  }
+  .lightbox video {
+    width: 100%; max-width: 1080px; max-height: 78vh; display: block;
+    background: #000; border-radius: 10px;
+  }
+  .lb-bar {
+    width: 100%; max-width: 1080px; display: flex; align-items: center; gap: 10px;
+  }
+  .lb-bar .cap { font-family: var(--mono); font-size: 12px; color: #ccd7db; }
+  .lb-close {
+    margin-left: auto; border: 1px solid rgba(255, 255, 255, 0.32); background: transparent;
+    color: #e9eff1; border-radius: 8px; padding: 7px 13px; font-size: 13px; cursor: pointer;
+  }
+  .lb-close:hover { border-color: #fff; }
+  .figure img { width: 100%; border-radius: 9px; border: 1px solid var(--line); display: block; }
+
+  /* The per-joint plots are one tall panel per joint -- 20 for the hand -- so
+     they get a bounded scroll box here and the full page on demand. */
+  .plot { position: relative; margin-top: 10px; }
+  .plot-frame {
+    max-height: 460px; overflow-y: auto; border: 1px solid var(--line);
+    border-radius: 9px; background: var(--surface);
+  }
+  .plot-frame img { width: 100%; display: block; }
+  .plot .cap { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .plot .zoom { position: absolute; top: 6px; right: 6px; }
+  .lightbox img { max-width: 100%; background: #fff; border-radius: 8px; }
+  .lightbox .lb-scroll { overflow: auto; max-height: 82vh; width: 100%; max-width: 1080px; }
+
+  details { border-top: 1px solid var(--line); }
+  details > summary {
+    cursor: pointer; padding: 11px 14px; font-size: 13px; font-weight: 500;
+    color: var(--ink-2); list-style: none; display: flex; align-items: center; gap: 8px;
+  }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::after { content: "+"; margin-left: auto; font-family: var(--mono); color: var(--muted); }
+  details[open] > summary::after { content: "\2212"; }
+  details > summary:hover { color: var(--accent); }
+  .details-body { padding: 0 14px 14px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; }
+  td.k { font-family: var(--mono); font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+  td.v { font-family: var(--mono); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+  td.d { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .scroll-x { overflow-x: auto; }
+
+  /* Long demo filenames and dotted config paths have no natural break points,
+     so both tables wrap inside fixed columns instead of scrolling sideways. */
+  table.facts { table-layout: fixed; }
+  table.facts td.k { width: 38%; }
+  table.diffs { table-layout: fixed; }
+  table.diffs th:first-child, table.diffs td:first-child { width: 44%; }
+  @media (max-width: 560px) {
+    table.facts td.k, table.facts td.v { display: block; width: auto; }
+    table.facts td.k { border-bottom: 0; padding-bottom: 1px; }
+    table.diffs { font-size: 12px; }
+    table.diffs th, table.diffs td { padding-right: 6px; }
+    table.diffs th:first-child, table.diffs td:first-child { width: 40%; }
+  }
+
+  code, .cmd {
+    font-family: var(--mono); font-size: 12px; background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px;
+    display: block; white-space: pre-wrap; word-break: break-all; color: var(--ink-2);
+  }
+  .copy {
+    margin-top: 6px; border: 1px solid var(--line-strong); background: var(--surface);
+    color: var(--ink-2); border-radius: 7px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  .copy:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---- console ------------------------------------------------------ */
+  .console-grid { display: grid; gap: 14px; }
+  @media (min-width: 860px) { .console-grid { grid-template-columns: 1fr 1fr; } }
+  label { display: block; font-size: 12px; color: var(--muted); font-weight: 500; margin: 10px 0 4px; }
+  input, select, textarea {
+    width: 100%; padding: 9px 10px; border-radius: 9px; border: 1px solid var(--line-strong);
+    background: var(--surface-2); font-size: 14px;
+  }
+  textarea { min-height: 84px; resize: vertical; font-size: 14px; }
+  input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  .verdicts { display: flex; flex-wrap: wrap; gap: 6px; }
+  .verdict {
+    padding: 6px 11px; border-radius: 999px; border: 1px solid var(--line-strong);
+    background: var(--surface-2); font-size: 13px; cursor: pointer;
+  }
+  .verdict[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .send {
+    margin-top: 12px; width: 100%; padding: 11px; border-radius: 10px; border: none;
+    background: var(--accent); color: #fff; font-weight: 600; font-size: 15px; cursor: pointer;
+  }
+  .send:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status-line { font-size: 12.5px; color: var(--muted); margin-top: 8px; min-height: 18px; }
+  .log { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .log li { border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; background: var(--surface-2); }
+  .log .meta { display: flex; gap: 8px; align-items: center; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .log .body { font-size: 13.5px; margin-top: 3px; white-space: pre-wrap; }
+  .log .reply { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line-strong); font-size: 13px; color: var(--ink-2); }
+  .tag { padding: 1px 6px; border-radius: 5px; border: 1px solid currentColor; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .tag.queued { color: var(--warning); }
+  .tag.done { color: var(--good); }
+  .tag.new { color: var(--accent); }
+  .tag.seen { color: var(--muted); }
+
+  footer { border-top: 1px solid var(--line); padding-top: 16px; color: var(--ink-2); font-size: 13px; }
+  footer dt { font-family: var(--mono); font-size: 12px; color: var(--ink); margin-top: 8px; }
+  footer dd { margin: 1px 0 0; }
+  .empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+</style>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="mark">DG</div>
+    <div>
+      <h1>Grasp Training Deck</h1>
+      <div class="eyebrow" id="subtitle">UR5e + DG5F &middot; RL + imitation</div>
+    </div>
+    <div class="stamp">
+      <div class="eyebrow">Snapshot</div>
+      <div class="num" id="snapshot">&mdash;</div>
+    </div>
+  </div>
+  <nav class="tabs">
+    <a class="tab" href="#now">Now</a>
+    <a class="tab" href="#runs">Runs</a>
+    <a class="tab" href="#archive">Archive</a>
+    <a class="tab" href="#console">Say something</a>
+    <a class="tab" href="#legend">Legend</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div class="machine" id="machine"></div>
+
+  <section id="now">
+    <div class="section-head">
+      <h2>What is running now</h2>
+      <span class="eyebrow" id="now-count"></span>
+    </div>
+    <div id="lead"></div>
+  </section>
+
+  <section id="runs">
+    <div class="section-head">
+      <h2>Recent runs</h2>
+      <span class="eyebrow">newest first</span>
+    </div>
+    <div id="run-list"></div>
+  </section>
+
+  <section id="archive">
+    <div class="section-head">
+      <h2>Every run on the box</h2>
+      <span class="eyebrow" id="archive-count"></span>
+    </div>
+    <div class="card"><div class="card-body scroll-x" style="padding-top:14px">
+      <table id="archive-table"></table>
+    </div></div>
+  </section>
+
+  <section id="console">
+    <div class="section-head">
+      <h2>Say something</h2>
+      <span class="eyebrow">goes straight to Claude</span>
+    </div>
+    <div class="console-grid">
+      <div class="card"><div class="card-body" style="padding-top:14px">
+        <h3>Feedback on a run</h3>
+        <p class="eyebrow" style="margin-top:4px">Claude reads these next time you talk</p>
+        <label for="fb-run">Run</label>
+        <select id="fb-run"></select>
+        <label>Verdict</label>
+        <div class="verdicts" id="fb-verdicts"></div>
+        <label for="fb-text">Note</label>
+        <textarea id="fb-text" placeholder="e.g. the hand closes too early, and the cube never leaves the table after iteration 4000"></textarea>
+        <button class="send" id="fb-send">Send feedback</button>
+        <div class="status-line" id="fb-status"></div>
+      </div></div>
+
+      <div class="card"><div class="card-body" style="padding-top:14px">
+        <h3>Queue a training</h3>
+        <p class="eyebrow" style="margin-top:4px">Builds the exact command for Claude to launch</p>
+        <label for="rq-preset">Starting point</label>
+        <select id="rq-preset">
+          <option value="assist">Object-assist curriculum</option>
+          <option value="plain">Plain scratch run</option>
+          <option value="resume">Continue a run further</option>
+          <option value="sweep">Entropy sweep</option>
+        </select>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div><label for="rq-iters">Iterations</label><input id="rq-iters" class="num" type="number" min="1" step="100" value="12000"></div>
+          <div><label for="rq-seed">Seed</label><input id="rq-seed" class="num" type="number" value="42"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div><label for="rq-assist">Assist ends at</label><input id="rq-assist" class="num" type="number" min="0" step="500" value="6000"></div>
+          <div><label for="rq-entropy">Entropy coef</label><input id="rq-entropy" class="num" type="text" value="0.001"></div>
+        </div>
+        <label for="rq-extra">Extra overrides (one per line, PATH=VALUE)</label>
+        <textarea id="rq-extra" style="min-height:56px" placeholder="rewards.object_position_weight=0.8"></textarea>
+        <label for="rq-note">Why</label>
+        <textarea id="rq-note" style="min-height:56px" placeholder="what you want to find out"></textarea>
+        <label>Command Claude will run</label>
+        <code class="cmd" id="rq-preview"></code>
+        <button class="send" id="rq-send">Queue this training</button>
+        <div class="status-line" id="rq-status"></div>
+      </div></div>
+    </div>
+
+    <div class="section-head" style="margin-top:18px">
+      <h3>Outbox</h3>
+      <span class="eyebrow" id="outbox-count"></span>
+    </div>
+    <ul class="log" id="outbox"><li class="empty" id="outbox-empty">Nothing sent yet.</li></ul>
+  </section>
+
+  <footer id="legend">
+    <h3>What the numbers mean</h3>
+    <dl>
+      <dt>Mean step reward</dt><dd>Sum of the imitation and object terms, per control step. The ceiling with the current weights is about 2.4.</dd>
+      <dt>Evaluation score</dt><dd>Deterministic replay from fixed and sampled RSI frames, always unassisted. This is what picks <span class="num">best_model.pt</span>. <b>Do not compare it between runs.</b> It is computed on the fixed cohort and subtracts that cohort's early-termination fraction outright, and it is built from Gaussian reward terms &mdash; so changing a reward sigma moves the score of an unchanged policy. Use the two cohorts and the scale-free numbers below instead.</dd>
+      <dt>Trained starts vs fixed starts</dt><dd>Every evaluation runs two cohorts. <b>Trained starts</b> follow the RSI distribution the run actually trains on, and are the honest measure of the policy. <b>Fixed starts</b> replay four phases of the demonstration &mdash; frames 0, 276, 553 and 830 &mdash; and <span class="num">pregrasp_mixture</span> concentrates 80% of its training in [740, 830], so three of the four begin where the policy is barely trained. A whole cohort failing is exactly 16 of 64 episodes, which is why that number sticks at 25%.</dd>
+      <dt>Vibration (rms action rate)</dt><dd>Root-mean-square step-to-step change in the commanded action. Independent of every reward sigma, so it is the one smoothness number comparable across all runs. The base blind run sits at 2.53; <span class="num">sharpen_sigma</span>, the smoothest policy on the box, reaches 0.008. Under about 0.1 is where a policy stops shaking hard enough to worry a real joint.</dd>
+      <dt>Cube lift</dt><dd>Peak height of the cube's centre of mass above where that episode reset it. Under 20 mm means it never really left the table.</dd>
+      <dt>Early termination</dt><dd>Fraction of episodes killed by the arm/hand tracking thresholds instead of reaching the horizon.</dd>
+      <dt>Action std</dt><dd>Policy exploration width. The divergence guard aborts the run at 15.</dd>
+      <dt>Two kinds of clip</dt><dd>Training clips are 10 s of one environment mid-rollout, every 500 updates. The evaluation replay is the whole demonstration played deterministically at the end of the run, with the green reference robot beside the policy robot.</dd>
+      <dt>Object-assist scale</dt><dd>Strength of the external PD wrench helping the cube along the demonstration. It decays to zero, so the policy has to take over.</dd>
+    </dl>
+    <p style="margin-top:14px" id="refresh-note"></p>
+  </footer>
+</div>
+
+<script>
+const DATA = __DASHBOARD_DATA__;
+
+/* ---------- helpers ------------------------------------------------- */
+const $ = (sel, root) => (root || document).querySelector(sel);
+const el = (tag, cls, text) => {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+};
+const fmt = (value, digits) => {
+  if (value === undefined || value === null || !isFinite(value)) return "\u2014";
+  const d = digits === undefined ? 3 : digits;
+  return Number(value).toFixed(d);
+};
+const int = (value) => (value === undefined || value === null || !isFinite(value)
+  ? "\u2014" : Math.round(value).toLocaleString("en-US"));
+const ago = (seconds) => {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return (s / 3600).toFixed(1) + " h ago";
+  return Math.round(s / 86400) + " d ago";
+};
+const duration = (seconds) => {
+  if (!isFinite(seconds) || seconds <= 0) return "\u2014";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  return h > 0 ? h + "h " + String(m).padStart(2, "0") + "m" : m + "m";
+};
+const seriesMeta = {};
+DATA.series_meta.forEach((meta) => { seriesMeta[meta.key] = meta; });
+const last = (points) => (points && points.length ? points[points.length - 1][1] : null);
+const bestOf = (points, dir) => {
+  if (!points || !points.length) return null;
+  const values = points.map((p) => p[1]);
+  return dir === "down" ? Math.min.apply(null, values) : Math.max.apply(null, values);
+};
+/* The per-iteration maximum spikes on a single lucky environment, so the
+   headline reads the recent window rather than the all-time best. */
+const recentLift = (run) => {
+  const points = run.series.episode_max_peak_object_com_lift_m || [];
+  if (!points.length) return { best: null, window: 0 };
+  const n = Math.max(1, Math.floor(points.length * 0.1));
+  const slice = points.slice(-n);
+  return {
+    best: Math.max.apply(null, slice.map((p) => p[1])),
+    window: slice[slice.length - 1][0] - slice[0][0] + 1,
+  };
+};
+const tail = (points, fraction) => {
+  if (!points || points.length < 6) return null;
+  const n = Math.max(3, Math.floor(points.length * (fraction || 0.25)));
+  const late = points.slice(-n).reduce((a, p) => a + p[1], 0) / n;
+  const early = points.slice(-2 * n, -n);
+  if (!early.length) return null;
+  return late - early.reduce((a, p) => a + p[1], 0) / early.length;
+};
+
+/* ---------- header -------------------------------------------------- */
+const generatedAt = DATA.generated_at * 1000;
+$("#snapshot").textContent = new Date(generatedAt).toLocaleString([], {
+  month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+});
+$("#subtitle").textContent = DATA.runs.length + " runs \u00b7 "
+  + DATA.runs.filter((run) => run.status === "live").length + " live";
+$("#refresh-note").innerHTML =
+  "This page is a snapshot taken on <b>" + (DATA.host || "the training box") +
+  "</b>. Ask Claude to refresh it \u2014 it reruns " +
+  "<span class=\"num\">scripts/build_training_dashboard.py</span> and republishes to this same link.";
+
+const machine = $("#machine");
+const liveRuns = DATA.runs.filter((run) => run.status === "live");
+machine.appendChild(chip("Snapshot", ago((Date.now() - generatedAt) / 1000)));
+if (DATA.gpu) {
+  machine.appendChild(chip(DATA.gpu.name.replace("NVIDIA ", ""),
+    DATA.gpu.utilization + " \u00b7 " + DATA.gpu.memory_used + " / " + DATA.gpu.memory_total));
+  machine.appendChild(chip("GPU temp", DATA.gpu.temperature_c + " \u00b0C"));
+}
+machine.appendChild(chip("Training processes", String(DATA.processes.length)));
+DATA.processes.forEach((proc) => {
+  machine.appendChild(chip("pid " + proc.pid, duration(proc.elapsed_s) + " up"));
+});
+function chip(label, value) {
+  const node = el("span", "chip");
+  node.appendChild(el("span", null, label));
+  node.appendChild(el("b", null, value));
+  return node;
+}
+
+/* ---------- charts --------------------------------------------------- */
+function drawChart(host, points, opts) {
+  const width = Math.max(220, host.clientWidth);
+  const height = opts.height || 116;
+  const padL = 34, padR = 8, padT = 8, padB = 16;
+  const xs = points.map((p) => p[0]);
+  const ys = points.map((p) => p[1]);
+  let lo = Math.min.apply(null, ys), hi = Math.max.apply(null, ys);
+  if (hi - lo < 1e-9) { hi = lo + Math.max(Math.abs(lo) * 0.05, 1e-6); }
+  const pad = (hi - lo) * 0.12;
+  lo -= pad; hi += pad;
+  const x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+  const sx = (v) => padL + (x1 === x0 ? 0 : (v - x0) / (x1 - x0)) * (width - padL - padR);
+  const sy = (v) => padT + (1 - (v - lo) / (hi - lo)) * (height - padT - padB);
+
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", opts.label + ", " + points.length + " samples");
+
+  const gridStyle = "stroke:var(--line);stroke-width:1";
+  [lo + (hi - lo) * 0.5, hi - pad, lo + pad].forEach((value, index) => {
+    const line = document.createElementNS(ns, "line");
+    line.setAttribute("x1", padL); line.setAttribute("x2", width - padR);
+    line.setAttribute("y1", sy(value)); line.setAttribute("y2", sy(value));
+    line.setAttribute("style", gridStyle + (index === 0 ? ";stroke-dasharray:2 4" : ""));
+    svg.appendChild(line);
+  });
+
+  const path = points.map((p, i) => (i ? "L" : "M") + sx(p[0]).toFixed(1) + " " + sy(p[1]).toFixed(1)).join("");
+  const area = document.createElementNS(ns, "path");
+  area.setAttribute("d", path + "L" + sx(x1).toFixed(1) + " " + (height - padB) + "L" + sx(x0).toFixed(1) + " " + (height - padB) + "Z");
+  area.setAttribute("fill", "var(--series-1-soft)");
+  area.setAttribute("stroke", "none");
+  svg.appendChild(area);
+
+  const line = document.createElementNS(ns, "path");
+  line.setAttribute("d", path);
+  line.setAttribute("fill", "none");
+  line.setAttribute("stroke", opts.color || "var(--series-1)");
+  line.setAttribute("stroke-width", "2");
+  line.setAttribute("stroke-linejoin", "round");
+  line.setAttribute("stroke-linecap", "round");
+  svg.appendChild(line);
+
+  if (opts.dots) {
+    points.forEach((p) => {
+      const dot = document.createElementNS(ns, "circle");
+      dot.setAttribute("cx", sx(p[0])); dot.setAttribute("cy", sy(p[1])); dot.setAttribute("r", "2.4");
+      dot.setAttribute("fill", opts.color || "var(--series-1)");
+      svg.appendChild(dot);
+    });
+  }
+  const endpoint = document.createElementNS(ns, "circle");
+  endpoint.setAttribute("cx", sx(x1)); endpoint.setAttribute("cy", sy(points[points.length - 1][1]));
+  endpoint.setAttribute("r", "4"); endpoint.setAttribute("fill", opts.color || "var(--series-1)");
+  endpoint.setAttribute("stroke", "var(--surface-2)"); endpoint.setAttribute("stroke-width", "2");
+  svg.appendChild(endpoint);
+
+  const label = (x, y, text, anchor) => {
+    const node = document.createElementNS(ns, "text");
+    node.setAttribute("x", x); node.setAttribute("y", y);
+    node.setAttribute("text-anchor", anchor || "start");
+    node.setAttribute("style", "fill:var(--muted);font-family:var(--mono);font-size:9.5px");
+    node.textContent = text;
+    return node;
+  };
+  const tick = (v) => (Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(3));
+  svg.appendChild(label(2, sy(hi - pad) + 3, tick(hi - pad)));
+  svg.appendChild(label(2, sy(lo + pad) + 3, tick(lo + pad)));
+  svg.appendChild(label(padL, height - 3, "it " + int(x0)));
+  svg.appendChild(label(width - padR, height - 3, int(x1), "end"));
+
+  const cursor = document.createElementNS(ns, "line");
+  cursor.setAttribute("y1", padT); cursor.setAttribute("y2", height - padB);
+  cursor.setAttribute("style", "stroke:var(--line-strong);stroke-width:1");
+  cursor.setAttribute("opacity", "0");
+  svg.appendChild(cursor);
+
+  host.innerHTML = "";
+  host.appendChild(svg);
+  const tip = el("div", "tip");
+  host.parentNode.appendChild(tip);
+
+  const move = (event) => {
+    const rect = svg.getBoundingClientRect();
+    const px = (event.touches ? event.touches[0].clientX : event.clientX) - rect.left;
+    const target = x0 + ((px - padL) / (width - padL - padR)) * (x1 - x0);
+    let nearest = points[0];
+    for (const point of points) {
+      if (Math.abs(point[0] - target) < Math.abs(nearest[0] - target)) nearest = point;
+    }
+    cursor.setAttribute("x1", sx(nearest[0])); cursor.setAttribute("x2", sx(nearest[0]));
+    cursor.setAttribute("opacity", "1");
+    tip.style.opacity = "1";
+    tip.style.left = Math.min(Math.max(sx(nearest[0]), 40), width - 40) + "px";
+    tip.style.top = (host.offsetTop + sy(nearest[1]) - 6) + "px";
+    tip.textContent = "it " + int(nearest[0]) + " \u00b7 " + fmt(nearest[1], opts.digits);
+  };
+  const leave = () => { cursor.setAttribute("opacity", "0"); tip.style.opacity = "0"; };
+  svg.addEventListener("pointermove", move);
+  svg.addEventListener("pointerdown", move);
+  svg.addEventListener("pointerleave", leave);
+  svg.addEventListener("touchmove", move, { passive: true });
+  svg.addEventListener("touchend", leave);
+}
+
+function chartCard(run, key) {
+  const points = run.series[key];
+  if (!points || points.length < 2) return null;
+  const meta = seriesMeta[key] || { label: key, unit: "" };
+  const card = el("div", "chart");
+  const head = el("div", "chart-head");
+  head.appendChild(el("span", "eyebrow", meta.label + (meta.unit ? " (" + meta.unit + ")" : "")));
+  const digits = meta.unit === "m" ? 4 : meta.key === "episode_length" ? 1 : 3;
+  head.appendChild(el("span", "now", fmt(last(points), digits)));
+  card.appendChild(head);
+  const host = el("div", "chart-host");
+  card.appendChild(host);
+  const isSparse = SPARSE_KEYS.has(key);
+  const render = () => drawChart(host, points, {
+    label: meta.label, digits: digits, dots: isSparse && points.length < 60,
+  });
+  card.__render = render;
+  return card;
+}
+
+/* ---------- run cards ------------------------------------------------ */
+const STATUS_TEXT = { live: "live", finished: "finished", stopped: "stopped", diverged: "diverged" };
+const CHART_KEYS = [
+  "mean_reward", "evaluation_score",
+  "evaluation_uniform_early_termination_fraction",
+  "evaluation_fixed_early_termination_fraction",
+  "evaluation_uniform_mean_peak_object_com_lift_m",
+  "evaluation_fixed_mean_rms_action_rate",
+  "episode_max_peak_object_com_lift_m",
+  "episode_mean_object_position_error_m", "episode_early_termination_fraction",
+  "episode_mean_fingertip_object_distance_m", "mean_action_std", "object_assist_scale",
+  "episode_length",
+];
+const SPARSE_KEYS = new Set([
+  "evaluation_score",
+  "evaluation_uniform_early_termination_fraction",
+  "evaluation_fixed_early_termination_fraction",
+  "evaluation_uniform_mean_peak_object_com_lift_m",
+  "evaluation_fixed_mean_rms_action_rate",
+]);
+
+function runCard(run, lead) {
+  const card = el("div", "card" + (lead ? " lead" : ""));
+  const head = el("div", "card-head");
+  const title = el("div", "card-title");
+  const pill = el("span", "pill " + run.status);
+  pill.appendChild(el("i", "dot"));
+  pill.appendChild(el("span", null, STATUS_TEXT[run.status] || run.status));
+  title.appendChild(pill);
+  title.appendChild(el("span", "name", run.name));
+  head.appendChild(title);
+
+  const planned = run.planned_iterations || run.iteration;
+  const fraction = planned ? Math.min(1, (run.iteration + 1) / planned) : 0;
+  const rail = el("div", "rail");
+  const fill = el("i");
+  fill.style.width = (fraction * 100).toFixed(1) + "%";
+  if (run.status === "diverged") fill.style.background = "var(--critical)";
+  if (run.status === "stopped") fill.style.background = "var(--muted)";
+  rail.appendChild(fill);
+  head.appendChild(rail);
+
+  const meta = el("div", "rail-meta");
+  meta.appendChild(el("span", "num", int(run.iteration) + " / " + int(planned) + " updates"));
+  const right = el("span", "num");
+  if (run.status === "live" && run.seconds_per_iteration && planned > run.iteration) {
+    right.textContent = "~" + duration((planned - run.iteration) * run.seconds_per_iteration) + " left";
+  } else {
+    right.textContent = "touched " + ago((generatedAt / 1000) - run.updated_at);
+  }
+  meta.appendChild(right);
+  head.appendChild(meta);
+  card.appendChild(head);
+
+  card.appendChild(tiles(run));
+
+  const body = el("div", "card-body");
+  if (run.findings && run.findings.length) {
+    const list = el("ul", "findings");
+    run.findings.forEach((finding) => {
+      const item = el("li", finding.level);
+      const glyph = { good: "\u2191", warning: "!", critical: "\u00d7", neutral: "\u00b7" }[finding.level] || "\u00b7";
+      item.appendChild(el("span", "glyph", glyph));
+      item.appendChild(el("span", null, finding.text));
+      list.appendChild(item);
+    });
+    body.appendChild(list);
+  }
+
+  const charts = el("div", "charts");
+  const rendered = [];
+  CHART_KEYS.forEach((key) => {
+    const chart = chartCard(run, key);
+    if (chart) { charts.appendChild(chart); rendered.push(chart); }
+  });
+  if (rendered.length) body.appendChild(charts);
+  card.appendChild(body);
+  card.__charts = rendered;
+
+  if (run.eval_videos && run.eval_videos.length) {
+    card.appendChild(evalVideoBlock(run, lead));
+  }
+  if (run.eval_figures && run.eval_figures.length) {
+    card.appendChild(evalFigureBlock(run));
+  }
+  if (run.videos && run.videos.length) {
+    card.appendChild(videoBlock(run, lead && !(run.eval_videos || []).length));
+  } else if (run.overview) {
+    const details = el("details");
+    details.appendChild(summary("Final evaluation figure"));
+    const inner = el("div", "details-body figure");
+    const image = el("img");
+    image.src = run.overview.src;
+    image.alt = "Evaluation overview plot for " + run.name;
+    image.loading = "lazy";
+    inner.appendChild(image);
+    details.appendChild(inner);
+    card.appendChild(details);
+  }
+
+  card.appendChild(specificBlock(run));
+  return card;
+}
+
+function summary(text) {
+  const node = el("summary");
+  node.appendChild(el("span", null, text));
+  return node;
+}
+
+/* One clip: the player, its caption and the button that blows it up to the
+   whole page.  Phones give the inline player a fullscreen control that is too
+   small to hit, so the overlay is the reliable way to see a run up close. */
+function clipItem(src, caption, wide, loop) {
+  const item = el("div", "clip" + (wide ? " wide" : ""));
+  const video = el("video");
+  video.src = src;
+  video.controls = true;
+  video.playsInline = true;
+  video.muted = true;
+  if (loop) video.loop = true;
+  video.preload = "none";
+  item.appendChild(video);
+
+  const zoom = el("button", "zoom", "\u2922");
+  zoom.type = "button";
+  zoom.title = "Open full page";
+  zoom.setAttribute("aria-label", "Open this clip full page");
+  zoom.addEventListener("click", () => openLightbox(video, caption));
+  item.appendChild(zoom);
+
+  item.appendChild(el("div", "cap", caption));
+  return item;
+}
+
+let lightboxHome = null;
+
+/* Takes either a <video> or an <img>: both are moved into the overlay and put
+   back where they came from on close. */
+function openLightbox(node, caption) {
+  if (lightboxHome) return;
+  const isVideo = node.tagName === "VIDEO";
+  const box = el("div", "lightbox");
+  const bar = el("div", "lb-bar");
+  bar.appendChild(el("div", "cap", caption));
+  const close = el("button", "lb-close", "Close");
+  close.type = "button";
+  bar.appendChild(close);
+  box.appendChild(bar);
+
+  /* The clips are inlined data URIs, so the element is moved rather than
+     cloned and put back where it came from on close. */
+  const home = el("span");
+  home.hidden = true;
+  node.parentNode.insertBefore(home, node);
+  lightboxHome = { home: home, video: node, box: box, isVideo: isVideo };
+
+  if (isVideo) {
+    box.appendChild(node);
+  } else {
+    // A tall plot needs its own scroller inside the overlay.
+    const scroll = el("div", "lb-scroll");
+    scroll.appendChild(node);
+    box.appendChild(scroll);
+    lightboxHome.scroll = scroll;
+  }
+  document.body.appendChild(box);
+  document.body.style.overflow = "hidden";
+
+  if (isVideo) {
+    const started = node.play();
+    if (started && started.catch) started.catch(() => {});
+  }
+
+  const shut = () => closeLightbox();
+  close.addEventListener("click", shut);
+  box.addEventListener("click", (event) => { if (event.target === box) shut(); });
+  lightboxHome.onKey = (event) => { if (event.key === "Escape") shut(); };
+  document.addEventListener("keydown", lightboxHome.onKey);
+
+  /* iOS only ever fullscreens the native player itself; everywhere else the
+     overlay goes fullscreen, and if that is blocked it still covers the page. */
+  if (isVideo && !document.fullscreenEnabled && node.webkitEnterFullscreen) {
+    try { node.webkitEnterFullscreen(); } catch (error) { /* overlay is enough */ }
+  } else if (box.requestFullscreen) {
+    const request = box.requestFullscreen();
+    if (request && request.catch) request.catch(() => {});
+  }
+}
+
+function closeLightbox() {
+  const ref = lightboxHome;
+  if (!ref) return;
+  lightboxHome = null;
+  document.removeEventListener("keydown", ref.onKey);
+  if (document.fullscreenElement && document.exitFullscreen) {
+    const exit = document.exitFullscreen();
+    if (exit && exit.catch) exit.catch(() => {});
+  }
+  if (ref.isVideo) ref.video.pause();
+  ref.home.parentNode.replaceChild(ref.video, ref.home);
+  ref.box.remove();
+  document.body.style.overflow = "";
+}
+
+function videoBlock(run, open) {
+  const details = el("details");
+  if (open) details.open = true;
+  details.appendChild(summary("Recorded clips (" + run.videos.length + ")"));
+  const inner = el("div", "details-body");
+  const strip = el("div", "strip");
+  run.videos.slice().reverse().forEach((clip) => {
+    strip.appendChild(clipItem(clip.src, "iteration " + int(clip.iteration), false, true));
+  });
+  inner.appendChild(strip);
+  inner.appendChild(el("p", "eyebrow", "env 0, 10 s of the training rollout \u00b7 tap \u2922 for full page"));
+  details.appendChild(inner);
+  return details;
+}
+
+function evalVideoBlock(run, open) {
+  const details = el("details");
+  if (open) details.open = true;
+  details.appendChild(summary("Evaluation replay, with the reference robot"));
+  const inner = el("div", "details-body");
+  const strip = el("div", "strip");
+  run.eval_videos.forEach((clip) => {
+    strip.appendChild(clipItem(clip.src, clip.name.replace(/^eval_/, ""), true, false));
+  });
+  inner.appendChild(strip);
+  const note = el("p", "eyebrow");
+  note.innerHTML = "green = the demonstration, white = the policy \u00b7 "
+    + "deterministic replay of the whole motion, no assist \u00b7 tap \u2922 for full page";
+  inner.appendChild(note);
+  details.appendChild(inner);
+  return details;
+}
+
+function evalFigureBlock(run) {
+  const details = el("details");
+  details.appendChild(summary("Evaluation plots (" + run.eval_figures.length + ")"));
+  const inner = el("div", "details-body");
+  run.eval_figures.forEach((figure) => {
+    const item = el("div", "plot");
+    const frame = el("div", "plot-frame");
+    const image = el("img");
+    image.src = figure.src;
+    image.alt = figure.label + " for " + run.name;
+    image.loading = "lazy";
+    frame.appendChild(image);
+    item.appendChild(frame);
+
+    const zoom = el("button", "zoom", "\u2922");
+    zoom.type = "button";
+    zoom.title = "Open full page";
+    zoom.setAttribute("aria-label", "Open " + figure.label + " full page");
+    zoom.addEventListener("click", () => openLightbox(image, figure.label));
+    item.appendChild(zoom);
+
+    item.appendChild(el("div", "cap", figure.label + " \u00b7 " + figure.caption));
+    inner.appendChild(item);
+  });
+  inner.appendChild(el("p", "eyebrow",
+    "from the final deterministic evaluation \u00b7 scroll inside a plot, or tap \u2922 for full page"));
+  details.appendChild(inner);
+  return details;
+}
+
+function tiles(run) {
+  const grid = el("div", "tiles");
+  const reward = run.series.mean_reward || [];
+  const rewardDelta = tail(reward);
+  grid.appendChild(tile("Mean reward", fmt(last(reward), 3), rewardDelta === null ? "" :
+    (rewardDelta >= 0 ? "\u2191 " : "\u2193 ") + fmt(Math.abs(rewardDelta), 3) + " lately",
+    rewardDelta === null ? "" : (rewardDelta >= 0 ? "good" : "bad")));
+
+  // Both evaluation cohorts, never the score alone. evaluation_score is
+  // computed on the fixed cohort and subtracts its early-termination fraction,
+  // and three of that cohort's four start phases sit outside the window
+  // pregrasp_mixture trains -- so a healthy policy routinely reads as failing.
+  const uniEarly = run.series.evaluation_uniform_early_termination_fraction || [];
+  const fixEarly = run.series.evaluation_fixed_early_termination_fraction || [];
+  const uniLatest = last(uniEarly), fixLatest = last(fixEarly);
+  grid.appendChild(tile("Failed episodes",
+    uniLatest === null ? "\u2014" : (uniLatest * 100).toFixed(0) + "%",
+    fixLatest === null ? "trained starts" :
+      "trained starts \u00b7 fixed starts " + (fixLatest * 100).toFixed(0) + "%",
+    uniLatest !== null && uniLatest > 0.10 ? "bad" : "good"));
+
+  const uniLift = run.series.evaluation_uniform_mean_peak_object_com_lift_m || [];
+  const liftLatest = last(uniLift);
+  const recent = recentLift(run);
+  grid.appendChild(tile("Cube lift",
+    liftLatest !== null ? (liftLatest * 1000).toFixed(0) :
+      (recent.best === null ? "\u2014" : (recent.best * 1000).toFixed(0)),
+    liftLatest !== null ? "mm, trained starts, deterministic" :
+      (recent.best === null ? "no cube data" : "mm best of the last " + recent.window + " updates"),
+    (liftLatest !== null ? liftLatest : recent.best) < 0.02 ? "bad" : "good"));
+
+  const rate = run.series.evaluation_fixed_mean_rms_action_rate || [];
+  const rateLatest = last(rate);
+  grid.appendChild(tile("Vibration",
+    rateLatest === null ? "\u2014" : fmt(rateLatest, 3),
+    rateLatest === null ? "no evaluation yet" : "rms action rate \u00b7 target 0.008",
+    rateLatest !== null && rateLatest < 0.15 ? "good" : (rateLatest > 1.0 ? "bad" : "")));
+  return grid;
+}
+
+function tile(label, value, sub, tone) {
+  const node = el("div", "tile");
+  node.appendChild(el("div", "label", label));
+  node.appendChild(el("div", "value", value));
+  if (sub) node.appendChild(el("div", "sub" + (tone ? " " + tone : ""), sub));
+  return node;
+}
+
+function specificBlock(run) {
+  const details = el("details");
+  details.appendChild(summary("What is specific about this run"));
+  const inner = el("div", "details-body");
+
+  const facts = el("table", "facts");
+  const rows = [
+    ["demonstration", run.demonstration || "\u2014"],
+    ["environments", int(run.num_envs)],
+    ["episode length", int(run.episode_length) + " steps"],
+    ["seed", run.seed === undefined || run.seed === null ? "\u2014" : String(run.seed)],
+    ["checkpoints", int(run.checkpoints) + (run.best_checkpoint ? " (+ best_model.pt)" : "")],
+    ["wall clock", duration(run.total_time_s)],
+    ["samples", run.total_timesteps ? (run.total_timesteps / 1e6).toFixed(1) + " M" : "\u2014"],
+  ];
+  rows.forEach(([key, value]) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", "k", key));
+    tr.appendChild(el("td", "v", value));
+    facts.appendChild(tr);
+  });
+  inner.appendChild(facts);
+
+  if (run.overrides && run.overrides.length) {
+    inner.appendChild(el("p", "eyebrow", "command-line overrides"));
+    run.overrides.forEach((item) => inner.appendChild(el("code", "cmd", "--set " + item)));
+  }
+
+  if (run.differences && run.differences.length) {
+    inner.appendChild(el("p", "eyebrow", "config differences vs the repository defaults"));
+    const table = el("table", "diffs");
+    const head = el("tr");
+    ["field", "this run", "default now"].forEach((name) => head.appendChild(el("th", null, name)));
+    table.appendChild(head);
+    run.differences.forEach((row, index) => {
+      const tr = el("tr");
+      if (index >= 8) tr.hidden = true;
+      tr.appendChild(el("td", "k", row.path));
+      tr.appendChild(el("td", "v", JSON.stringify(row.value)));
+      tr.appendChild(el("td", "d", JSON.stringify(row.default)));
+      table.appendChild(tr);
+    });
+    const scroller = el("div", "scroll-x");
+    scroller.appendChild(table);
+    inner.appendChild(scroller);
+    if (run.differences.length > 8) {
+      const more = el("button", "copy", "Show all " + run.differences.length + " differences");
+      more.addEventListener("click", () => {
+        Array.from(table.querySelectorAll("tr")).forEach((tr) => { tr.hidden = false; });
+        more.remove();
+      });
+      inner.appendChild(more);
+    }
+  }
+
+  inner.appendChild(el("p", "eyebrow", "how it was launched"));
+  inner.appendChild(el("code", "cmd", run.command));
+  const copy = el("button", "copy", "Copy command");
+  copy.addEventListener("click", () => {
+    navigator.clipboard && navigator.clipboard.writeText(run.command);
+    copy.textContent = "Copied";
+    setTimeout(() => { copy.textContent = "Copy command"; }, 1500);
+  });
+  inner.appendChild(copy);
+  inner.appendChild(el("p", "eyebrow", "log directory"));
+  inner.appendChild(el("code", "cmd", run.path));
+  details.appendChild(inner);
+  return details;
+}
+
+/* ---------- layout --------------------------------------------------- */
+const featured = DATA.runs.filter((run) => run.featured);
+const leadRun = featured[0];
+const leadHost = $("#lead");
+if (leadRun) {
+  leadHost.appendChild(runCard(leadRun, true));
+  $("#now-count").textContent = liveRuns.length
+    ? liveRuns.length + " live" : "nothing training right now";
+} else {
+  leadHost.appendChild(el("p", "empty", "No runs found under " + DATA.log_root));
+}
+
+const runList = $("#run-list");
+featured.slice(1).forEach((run) => runList.appendChild(runCard(run, false)));
+if (!featured.slice(1).length) runList.appendChild(el("p", "empty", "Only one run has detailed history in this snapshot."));
+
+const archive = $("#archive-table");
+$("#archive-count").textContent = DATA.runs.length + " total";
+const headRow = el("tr");
+["run", "status", "updates", "reward", "eval best", "lift mm", "started"].forEach((name) => headRow.appendChild(el("th", null, name)));
+archive.appendChild(headRow);
+DATA.runs.forEach((run) => {
+  const tr = el("tr");
+  tr.appendChild(el("td", "k", run.id));
+  const status = el("td");
+  const pill = el("span", "pill " + run.status);
+  pill.appendChild(el("i", "dot"));
+  pill.appendChild(el("span", null, STATUS_TEXT[run.status] || run.status));
+  status.appendChild(pill);
+  tr.appendChild(status);
+  tr.appendChild(el("td", "v", int(run.iteration)));
+  tr.appendChild(el("td", "v", fmt(last(run.series.mean_reward), 2)));
+  tr.appendChild(el("td", "v", fmt(bestOf(run.series.evaluation_score, "up"), 3)));
+  const lift = bestOf(run.series.episode_max_peak_object_com_lift_m, "up");
+  tr.appendChild(el("td", "v", lift === null ? "\u2014" : (lift * 1000).toFixed(0)));
+  tr.appendChild(el("td", "d", run.started || "\u2014"));
+  archive.appendChild(tr);
+});
+
+/* Charts draw at their real pixel width, so they are drawn once the card is
+   visible and again after a resize settles. */
+function renderVisibleCharts() {
+  document.querySelectorAll(".card").forEach((card) => {
+    if (!card.__charts) return;
+    const details = card.querySelector("details");
+    card.__charts.forEach((chart) => {
+      if (chart.offsetParent === null) return;
+      chart.__render();
+    });
+    if (details) { /* body charts are always visible; details hold media only */ }
+  });
+}
+renderVisibleCharts();
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(renderVisibleCharts, 180);
+});
+
+/* ---------- console -------------------------------------------------- */
+const runSelect = $("#fb-run");
+DATA.runs.forEach((run) => {
+  const option = el("option", null, (run.status === "live" ? "\u25cf " : "") + run.id);
+  option.value = run.id;
+  runSelect.appendChild(option);
+});
+if (leadRun) runSelect.value = leadRun.id;
+
+const VERDICTS = ["Looks good", "Keep watching", "Stop this run", "Change something"];
+let verdict = VERDICTS[0];
+const verdictHost = $("#fb-verdicts");
+VERDICTS.forEach((name) => {
+  const button = el("button", "verdict", name);
+  button.type = "button";
+  button.setAttribute("aria-pressed", String(name === verdict));
+  button.addEventListener("click", () => {
+    verdict = name;
+    Array.from(verdictHost.children).forEach((child) => {
+      child.setAttribute("aria-pressed", String(child.textContent === verdict));
+    });
+  });
+  verdictHost.appendChild(button);
+});
+
+function buildCommand() {
+  const preset = $("#rq-preset").value;
+  const iterations = $("#rq-iters").value || "12000";
+  const seed = $("#rq-seed").value || "42";
+  const entropy = $("#rq-entropy").value.trim();
+  const assistEnd = $("#rq-assist").value || "6000";
+  const extra = $("#rq-extra").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (preset === "sweep") {
+    return "python scripts/run_pregrasp_entropy_sweep.py --iterations " + iterations;
+  }
+  const parts = ["python scripts/train.py", "--iterations " + iterations, "--seed " + seed];
+  if (preset === "assist") {
+    parts.push("--object-assist", "--object-assist-end-iteration " + assistEnd);
+  }
+  if (preset === "resume") {
+    const run = DATA.runs.find((r) => r.id === runSelect.value) || leadRun;
+    if (run) parts.push("--resume " + run.path + "/best_model.pt");
+  }
+  parts.push("--record-video");
+  if (entropy) parts.push("--set train.algorithm.entropy_coef=" + entropy);
+  extra.forEach((item) => parts.push("--set " + item));
+  return parts.join(" ");
+}
+function refreshPreview() { $("#rq-preview").textContent = buildCommand(); }
+["#rq-preset", "#rq-iters", "#rq-seed", "#rq-entropy", "#rq-assist", "#rq-extra"].forEach((sel) => {
+  $(sel).addEventListener("input", refreshPreview);
+  $(sel).addEventListener("change", refreshPreview);
+});
+refreshPreview();
+
+const outbox = $("#outbox");
+const outboxEmpty = $("#outbox-empty");
+let store = null;
+
+function setStatus(node, text, tone) {
+  node.textContent = text;
+  node.style.color = tone === "bad" ? "var(--critical)" : tone === "good" ? "var(--good)" : "var(--muted)";
+}
+
+function renderOutbox(items) {
+  outbox.innerHTML = "";
+  if (!items.length) {
+    outbox.appendChild(outboxEmpty);
+    $("#outbox-count").textContent = "";
+    return;
+  }
+  $("#outbox-count").textContent = items.length + " sent";
+  items.forEach((item) => {
+    const li = el("li");
+    const meta = el("div", "meta");
+    meta.appendChild(el("span", "tag " + (item.status || "new"), item.status || "new"));
+    meta.appendChild(el("span", null, item.kind === "request" ? "training request" : item.verdict || "feedback"));
+    meta.appendChild(el("span", null, new Date(item.createdAt).toLocaleString([], {
+      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })));
+    li.appendChild(meta);
+    if (item.runId) li.appendChild(el("div", "meta", item.runId));
+    if (item.command) li.appendChild(el("code", "cmd", item.command));
+    if (item.text) li.appendChild(el("div", "body", item.text));
+    if (item.reply) li.appendChild(el("div", "reply", "Claude: " + item.reply));
+    outbox.appendChild(li);
+  });
+}
+
+const localKey = "grasp-deck-outbox";
+function localItems() {
+  try { return JSON.parse(localStorage.getItem(localKey) || "[]"); } catch (error) { return []; }
+}
+function rememberLocal(item) {
+  try {
+    const items = localItems();
+    items.unshift(item);
+    localStorage.setItem(localKey, JSON.stringify(items.slice(0, 20)));
+  } catch (error) { /* private window: the outbox is simply not remembered */ }
+  renderOutbox(localItems());
+}
+renderOutbox(localItems());
+
+async function send(collection, payload, statusNode, okText) {
+  const item = Object.assign({ createdAt: new Date().toISOString(), status: collection === "requests" ? "queued" : "new" }, payload);
+  if (!store) {
+    rememberLocal(item);
+    setStatus(statusNode, "Saved on this device only \u2014 open the published link so Claude can read it.", "bad");
+    return;
+  }
+  setStatus(statusNode, "Sending\u2026");
+  try {
+    await store.collection(collection).add(item);
+    setStatus(statusNode, okText, "good");
+  } catch (error) {
+    rememberLocal(item);
+    setStatus(statusNode, "Could not send (" + (error && error.code ? error.code : "unknown") + "). Kept on this device.", "bad");
+  }
+}
+
+$("#fb-send").addEventListener("click", () => {
+  const text = $("#fb-text").value.trim();
+  if (!text) { setStatus($("#fb-status"), "Write a note first.", "bad"); return; }
+  const run = DATA.runs.find((item) => item.id === runSelect.value);
+  send("feedback", {
+    kind: "feedback",
+    runId: runSelect.value,
+    runName: run ? run.name : runSelect.value,
+    iteration: run ? run.iteration : null,
+    verdict: verdict,
+    text: text,
+    snapshot: DATA.generated_iso,
+  }, $("#fb-status"), "Sent. Claude picks it up next time you talk.");
+  $("#fb-text").value = "";
+});
+
+$("#rq-send").addEventListener("click", () => {
+  send("requests", {
+    kind: "request",
+    preset: $("#rq-preset").value,
+    command: buildCommand(),
+    text: $("#rq-note").value.trim(),
+    baseRunId: runSelect.value,
+  }, $("#rq-status"), "Queued. Ask Claude to run the outbox.");
+  $("#rq-note").value = "";
+});
+
+/* The store arrives after the page has rendered, so nothing above waits on it. */
+(async () => {
+  if (!window.claude || !window.claude.use) return;
+  const db = await window.claude.use("db");
+  if (!db) return;
+  store = db;
+  const merge = { feedback: [], requests: [] };
+  const push = (name) => (snap) => {
+    merge[name] = snap.docs.map((doc) => Object.assign({ id: doc.id }, doc.data()));
+    const items = merge.feedback.concat(merge.requests)
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    renderOutbox(items);
+  };
+  const fail = () => { /* keep whatever is on screen */ };
+  db.collection("feedback").orderBy("createdAt", "desc").limit(25).onSnapshot(push("feedback"), fail);
+  db.collection("requests").orderBy("createdAt", "desc").limit(25).onSnapshot(push("requests"), fail);
+})();
+</script>
+

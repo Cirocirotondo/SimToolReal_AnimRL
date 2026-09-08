@@ -78,13 +78,23 @@ class DeterministicEvaluator:
         # otherwise leave its final policy unranked.
         if not is_final and int(iteration) % self.interval != 0:
             return None
+        # Evaluation always measures the unassisted policy: with the object
+        # assist still on, a checkpoint would be ranked on a task the crutch is
+        # partly solving. getattr keeps the stub environments of the unit tests
+        # usable.
+        pin_assist_scale = getattr(self.env, "set_object_assist_scale", None)
+        assist_scale = getattr(self.env, "object_assist_scale", 0.0)
         with preserve_random_state():
             runner.eval_mode()
+            if pin_assist_scale is not None:
+                pin_assist_scale(0.0)
             try:
                 fixed = self._evaluate_suite(runner, self.fixed_indices)
                 uniform = self._evaluate_suite(runner, self.uniform_indices)
             finally:
                 runner.train_mode()
+                if pin_assist_scale is not None:
+                    pin_assist_scale(assist_scale)
 
         stats = {}
         for suite_name, suite_stats in (("fixed", fixed), ("uniform", uniform)):
@@ -372,6 +382,31 @@ class DeterministicEvaluator:
         }
 
 
+# PhysX sizes its GPU buffers from these two fields, not from the environment
+# count, so the 64-environment evaluator would otherwise allocate the whole
+# budget the trainer asked for. It runs as a second process beside the live
+# training context, and measuring one evaluation showed the card go from 8.4 GB
+# to 14.3 GB for the few seconds both were up -- the spike that has been killing
+# runs at 500-iteration boundaries.
+EVALUATION_MAX_GPU_CONTACT_PAIRS = 1024 * 1024
+
+
+def clamp_evaluation_physx(physx_cfg, max_contact_pairs=None):
+    """Shrink the evaluation process's PhysX GPU budget, never grow it.
+
+    Returns the value it settled on. Clamping rather than assigning keeps a run
+    that deliberately configured something smaller from being pushed upward.
+    """
+    limit = (
+        EVALUATION_MAX_GPU_CONTACT_PAIRS
+        if max_contact_pairs is None
+        else int(max_contact_pairs)
+    )
+    current = int(physx_cfg.max_gpu_contact_pairs)
+    physx_cfg.max_gpu_contact_pairs = min(current, limit)
+    return physx_cfg.max_gpu_contact_pairs
+
+
 class SubprocessDeterministicEvaluator:
     """Run evaluation in an isolated process and leave training PhysX intact."""
 
@@ -392,6 +427,9 @@ class SubprocessDeterministicEvaluator:
         self.sim_device = str(sim_device)
         self.config_path = Path(config_path).resolve()
         self.run_dir = Path(run_dir).resolve()
+        # Consecutive failures, so a persistently broken evaluator is visible
+        # in the log rather than quietly producing a run with no scores.
+        self.consecutive_failures = 0
         if self.interval <= 0 or self.num_envs <= 0:
             raise ValueError(
                 "Evaluation interval and environment count must be positive"
@@ -426,7 +464,30 @@ class SubprocessDeterministicEvaluator:
         try:
             subprocess.run(command, check=True)
             with output.open("r", encoding="utf-8") as metrics_file:
-                return json.load(metrics_file)
+                metrics = json.load(metrics_file)
+        except (subprocess.CalledProcessError, OSError, ValueError) as error:
+            # This process is a second PhysX context on the same card as the
+            # training one, which makes it the likelier of the two to be refused
+            # GPU memory. Training already holds everything it needs, so a failed
+            # evaluation costs this iteration's score rather than the whole run.
+            # A missing or truncated metrics file lands here too: an evaluator
+            # killed mid-write leaves exactly that.
+            self.consecutive_failures += 1
+            print(
+                "Evaluation at iteration {} failed ({}: {}). Training continues; "
+                "{} consecutive evaluation(s) have failed.".format(
+                    int(iteration),
+                    type(error).__name__,
+                    error,
+                    self.consecutive_failures,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        else:
+            self.consecutive_failures = 0
+            return metrics
         finally:
             checkpoint.unlink(missing_ok=True)
             output.unlink(missing_ok=True)

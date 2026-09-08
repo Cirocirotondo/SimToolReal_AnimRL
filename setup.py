@@ -7,5 +7,8 @@ setup(
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=["numpy", "tensorboard", "torch"],
-    extras_require={"video": ["imageio", "imageio-ffmpeg"]},
+    extras_require={
+        "video": ["imageio", "imageio-ffmpeg"],
+        "sim2sim": ["matplotlib>=3.5", "mujoco>=3.2"],
+    },
 )

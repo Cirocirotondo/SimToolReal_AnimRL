@@ -10,6 +10,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
+from simtoolreal_animrl.runners.deployment_score import (
+    deployment_score,
+    deployment_terms,
+)
 from simtoolreal_animrl.runners.modules.normalizer import EmpiricalNormalization
 from simtoolreal_animrl.runners.modules.policy import Policy
 from simtoolreal_animrl.runners.modules.value import Value
@@ -124,6 +128,8 @@ class PPO:
         self.total_timesteps = 0
         self.total_time_s = 0.0
         self.best_evaluation_score = -math.inf
+        self.best_deployment_score = -math.inf
+        self.best_deployment_iteration = -1
         self.best_evaluation_iteration = -1
         self.divergence_streak = 0
         self.env.reset()
@@ -163,6 +169,8 @@ class PPO:
         fingertip_contact_reward_sum = 0.0
         fingertip_contact_fraction_sum = 0.0
         fingertip_contact_force_sum = 0.0
+        object_assist_force_sum = 0.0
+        object_assist_torque_sum = 0.0
         rms_hand_position_error_sum = 0.0
         rms_hand_action_rate_sum = 0.0
         rms_position_error_sum = 0.0
@@ -267,6 +275,12 @@ class PPO:
                 fingertip_contact_force_sum += float(
                     infos["mean_fingertip_contact_force_n"].mean()
                 )
+                object_assist_force_sum += float(
+                    infos["object_assist_force_n"].mean()
+                )
+                object_assist_torque_sum += float(
+                    infos["object_assist_torque_nm"].mean()
+                )
                 rms_hand_position_error_sum += float(
                     infos["rms_hand_position_error"].mean()
                 )
@@ -348,6 +362,12 @@ class PPO:
             ),
             "mean_fingertip_contact_force_n": (
                 fingertip_contact_force_sum / rollout_steps
+            ),
+            "mean_object_assist_force_n": (
+                object_assist_force_sum / rollout_steps
+            ),
+            "mean_object_assist_torque_nm": (
+                object_assist_torque_sum / rollout_steps
             ),
             "mean_rms_hand_position_error": (
                 rms_hand_position_error_sum / rollout_steps
@@ -564,6 +584,9 @@ class PPO:
         end_iteration = start_iteration + num_iterations
         for iteration in range(start_iteration, end_iteration):
             iteration_start = time.perf_counter()
+            # Advance the object-assist curriculum before the rollout, so every
+            # transition of this update sees one constant assist scale.
+            object_assist_scale = self.env.set_training_iteration(iteration)
             self._maybe_start_training_video(iteration, checkpoint_dir)
             collection_start = iteration_start
             rollout = self.collect_rollout()
@@ -587,6 +610,7 @@ class PPO:
                     "value_loss": float(value_loss),
                     "surrogate_loss": float(surrogate_loss),
                     "mean_action_std": float(self.policy.action_std.mean()),
+                    "object_assist_scale": float(object_assist_scale),
                     "learning_rate": float(self.learning_rate),
                     "collection_time_s": collection_time,
                     "learning_time_s": learning_time,
@@ -630,6 +654,31 @@ class PPO:
                             checkpoint_dir / "best_model.pt",
                             infos=self._checkpoint_infos(stats),
                         )
+                    # Second, independent selection. evaluation_score above is
+                    # computed on the fixed cohort and moves when a reward
+                    # sigma changes; this one uses only the trained-start
+                    # cohort and physical measurements, so it answers a
+                    # different question: is this checkpoint the one to put on
+                    # the real robot?
+                    stats.update(deployment_terms(stats))
+                    deployment = deployment_score(stats)
+                    if deployment is not None:
+                        stats["deployment_score"] = float(deployment)
+                        is_best_deployment = (
+                            deployment > self.best_deployment_score
+                        )
+                        if is_best_deployment:
+                            self.best_deployment_score = float(deployment)
+                            self.best_deployment_iteration = iteration
+                        stats["deployment_best_score"] = float(
+                            self.best_deployment_score
+                        )
+                        stats["deployment_is_best"] = float(is_best_deployment)
+                        if is_best_deployment and checkpoint_dir is not None:
+                            self.save(
+                                checkpoint_dir / "best_deployment_model.pt",
+                                infos=self._checkpoint_infos(stats),
+                            )
             history.append(stats)
 
             if metrics_path is not None:
@@ -695,6 +744,9 @@ class PPO:
             "Contact/mean_fingertip_force_n": (
                 "mean_fingertip_contact_force_n"
             ),
+            "ObjectAssist/scale": "object_assist_scale",
+            "ObjectAssist/force_n": "mean_object_assist_force_n",
+            "ObjectAssist/torque_nm": "mean_object_assist_torque_nm",
             "Tracking/object_position_error_m": (
                 "mean_object_position_error_m"
             ),
@@ -891,6 +943,7 @@ class PPO:
             "total_timesteps": int(self.total_timesteps),
             "total_time_s": float(self.total_time_s),
             "best_evaluation_score": float(self.best_evaluation_score),
+            "best_deployment_score": float(self.best_deployment_score),
             "best_evaluation_iteration": int(self.best_evaluation_iteration),
         }
         if self.normalize_observation:
@@ -985,26 +1038,12 @@ class PPO:
             self.best_evaluation_score = float(
                 infos.get("best_evaluation_score", -math.inf)
             )
+            self.best_deployment_score = float(
+                infos.get("best_deployment_score", -math.inf)
+            )
             self.best_evaluation_iteration = int(
                 infos.get("best_evaluation_iteration", -1)
             )
-            self._load_normalizer_counts(infos, load_normalizers)
-        return infos
-
-    def initialize_policy(self, path, load_normalizers=True):
-        """Warm-start only the actor side of a checkpoint.
-
-        The value network and optimizer are intentionally left freshly
-        initialized. This is useful when the policy is retained but the reward
-        function has changed, making the checkpoint's value targets and Adam
-        moments stale. Training/evaluation counters also remain at their new-run
-        defaults.
-        """
-        loaded = self._read_checkpoint(path)
-        self.policy.load_state_dict(loaded["policy_dict"])
-        self._load_normalizers(loaded, load_normalizers)
-        infos = loaded.get("infos")
-        if isinstance(infos, dict):
             self._load_normalizer_counts(infos, load_normalizers)
         return infos
 

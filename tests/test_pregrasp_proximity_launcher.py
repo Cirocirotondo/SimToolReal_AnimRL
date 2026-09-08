@@ -38,7 +38,6 @@ class PregraspProximityLauncherTest(unittest.TestCase):
     def test_command_is_scratch_and_uses_only_pregrasp_rsi(self):
         command = LAUNCHER.build_command(self._args(), Path("/tmp/fresh-run"))
         self.assertNotIn("--resume", command)
-        self.assertNotIn("--initialize-from", command)
         self.assertEqual(command[command.index("--seed") + 1], "43")
         self.assertIn("env.episode_length=200", command)
         self.assertIn("env.reference_init_distribution=pregrasp_mixture", command)

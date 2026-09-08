@@ -74,6 +74,10 @@ class BaseEnvCfg(ABCConfig):
         training_camera_env_index = 0
         training_camera_width = 640
         training_camera_height = 480
+        # Horizontal field of view of the off-screen camera. Isaac Gym's own
+        # default is 90 degrees, which is what every recorded training video so
+        # far used; a narrower angle tightens the shot around the robot.
+        training_camera_fov_deg = 90.0
         # Second, collision-free actor per environment that replays the
         # demonstration kinematically as a side-by-side visual benchmark.
         # It doubles the simulated bodies, so it stays off for training.
