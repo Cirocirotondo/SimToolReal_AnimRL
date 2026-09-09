@@ -33,6 +33,26 @@ DEFAULT_CHECKPOINT = REPO_ROOT / (
     "logs/simtoolreal/2026-09-07_003258_pg830_blind512_n256/best_model.pt"
 )
 
+# Effective Isaac Gym position-drive gains used to train adapt_sigma. The hand
+# Kp values already include control.hand_stiffness_scale=0.5; damping was not
+# scaled. Keep these values local so sim2sim does not depend on training code.
+TRAINING_ARM_KP = (1000.0, 1000.0, 1000.0, 200.0, 200.0, 100.0)
+TRAINING_ARM_KD = (100.0, 100.0, 100.0, 10.0, 10.0, 10.0)
+TRAINING_HAND_KP = (
+    21.4859, 200.0, 21.4859, 21.4859,
+    21.4859, 21.4859, 21.4859, 21.4859,
+    21.4859, 21.4859, 21.4859, 21.4859,
+    21.4859, 21.4859, 21.4859, 21.4859,
+    21.4859, 21.4859, 21.4859, 21.4859,
+)
+TRAINING_HAND_KD = (
+    0.1, 0.9475, 0.3012, 0.1821,
+    0.7523, 0.4126, 0.2856, 0.1365,
+    0.7587, 0.4126, 0.2856, 0.1365,
+    0.7274, 0.4126, 0.2856, 0.1365,
+    0.2662, 0.4796, 0.3012, 0.1821,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -61,6 +81,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arm-kv", type=float, default=20.0)
     parser.add_argument("--hand-kp", type=float, default=5.0)
     parser.add_argument("--hand-kv", type=float, default=0.25)
+    parser.add_argument(
+        "--training-pd-gains",
+        action="store_true",
+        help=(
+            "Use the hardcoded per-joint Isaac Gym Kp/Kd values used to train "
+            "the adapt_sigma policy. This "
+            "takes precedence over --arm-kp/--arm-kv/--hand-kp/--hand-kv."
+        ),
+    )
     parser.add_argument(
         "--contact-settle-seconds",
         type=float,
@@ -139,6 +168,12 @@ def main() -> None:
         )
 
     actor = AnimRLInferencePolicy(run, device=args.device)
+    control_cfg = env_cfg["control"]
+    training_joint_kp = None
+    training_joint_kd = None
+    if args.training_pd_gains:
+        training_joint_kp = TRAINING_ARM_KP + TRAINING_HAND_KP
+        training_joint_kd = TRAINING_ARM_KD + TRAINING_HAND_KD
     scene_config = MujocoSceneConfig.from_saved_config(
         run.repo_root,
         env_cfg,
@@ -148,6 +183,8 @@ def main() -> None:
         arm_kv=args.arm_kv,
         hand_kp=args.hand_kp,
         hand_kv=args.hand_kv,
+        joint_kp=training_joint_kp,
+        joint_kv=training_joint_kd,
         enable_reference_ghost=args.reference_ghost,
     )
     defaults = np.asarray(
@@ -155,7 +192,6 @@ def main() -> None:
         + env_cfg["init_state"]["default_hand_joint_angles"],
         dtype=np.float64,
     )
-    control_cfg = env_cfg["control"]
     control_dt = 1.0 / float(env_cfg["motion"]["frequency_hz"])
     start_index = int(args.rsi_index)
     action_scales = np.concatenate(
@@ -191,18 +227,21 @@ def main() -> None:
         previous_action = (previous_targets - defaults) / action_scales
         reference_index = start_index
         steps = 0
+        if scene_config.joint_kp is not None:
+            pd_description = "hardcoded adapt_sigma training per-joint gains"
+        else:
+            pd_description = "arm={}/{}, hand={}/{}".format(
+                args.arm_kp, args.arm_kv, args.hand_kp, args.hand_kv
+            )
         print(
             "MuJoCo AnimRL sim2sim: checkpoint={}, observations/actions=108/26, "
             "RSI={}, control=60 Hz, physics={:.1f} Hz, viewer={}, "
-            "PD arm={}/{}, hand={}/{}".format(
+            "PD {}".format(
                 run.checkpoint_path,
                 start_index,
                 1.0 / args.sim_dt,
                 not args.headless,
-                args.arm_kp,
-                args.arm_kv,
-                args.hand_kp,
-                args.hand_kv,
+                pd_description,
             )
         )
         if settling["steps"]:

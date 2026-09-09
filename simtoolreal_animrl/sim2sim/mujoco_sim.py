@@ -45,6 +45,8 @@ class MujocoSceneConfig:
     arm_kv: float = 20.0
     hand_kp: float = 5.0
     hand_kv: float = 0.25
+    joint_kp: Optional[tuple[float, ...]] = None
+    joint_kv: Optional[tuple[float, ...]] = None
     sim_dt: float = 1.0 / 600.0
     enable_viewer: bool = True
     enable_reference_ghost: bool = True
@@ -61,6 +63,8 @@ class MujocoSceneConfig:
         arm_kv: float = 20.0,
         hand_kp: float = 5.0,
         hand_kv: float = 0.25,
+        joint_kp: Optional[tuple[float, ...]] = None,
+        joint_kv: Optional[tuple[float, ...]] = None,
         enable_reference_ghost: bool = True,
     ) -> "MujocoSceneConfig":
         asset = env_cfg["asset"]
@@ -102,6 +106,8 @@ class MujocoSceneConfig:
             arm_kv=float(arm_kv),
             hand_kp=float(hand_kp),
             hand_kv=float(hand_kv),
+            joint_kp=tuple(joint_kp) if joint_kp is not None else None,
+            joint_kv=tuple(joint_kv) if joint_kv is not None else None,
             sim_dt=float(sim_dt),
             enable_viewer=bool(enable_viewer),
             enable_reference_ghost=bool(enable_reference_ghost),
@@ -134,6 +140,20 @@ class MujocoSceneConfig:
         for name in ("arm_kp", "arm_kv", "hand_kp", "hand_kv"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0.0:
                 raise ValueError("{} must be finite and positive".format(name))
+        if (self.joint_kp is None) != (self.joint_kv is None):
+            raise ValueError(
+                "joint_kp and joint_kv must either both be set or both be None"
+            )
+        for name in ("joint_kp", "joint_kv"):
+            values = getattr(self, name)
+            if values is not None and (
+                len(values) != len(JOINT_NAMES)
+                or not np.all(np.isfinite(values))
+                or np.any(np.asarray(values) <= 0.0)
+            ):
+                raise ValueError(
+                    "{} must contain one finite positive gain per joint".format(name)
+                )
 
 
 class AnimRLMujocoSim:
@@ -324,8 +344,12 @@ class AnimRLMujocoSim:
             actuator.ctrlrange = np.asarray((lower, upper))
             actuator.forcelimited = True
             actuator.forcerange = np.asarray((-effort, effort))
-            kp = self.config.arm_kp if index < 6 else self.config.hand_kp
-            kv = self.config.arm_kv if index < 6 else self.config.hand_kv
+            if self.config.joint_kp is not None:
+                kp = self.config.joint_kp[index]
+                kv = self.config.joint_kv[index]
+            else:
+                kp = self.config.arm_kp if index < 6 else self.config.hand_kp
+                kv = self.config.arm_kv if index < 6 else self.config.hand_kv
             actuator.gaintype = mujoco.mjtGain.mjGAIN_FIXED
             actuator.gainprm[0] = kp
             actuator.biastype = mujoco.mjtBias.mjBIAS_AFFINE
