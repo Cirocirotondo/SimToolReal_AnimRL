@@ -229,6 +229,33 @@ class MujocoBackendTest(unittest.TestCase):
             self.assertEqual(int(simulation.model.geom_contype[floor]), 0)
             self.assertEqual(int(simulation.model.geom_conaffinity[floor]), 0)
 
+    def test_per_joint_pd_gains_are_installed_in_mujoco_actuators(self):
+        run = load_saved_run(CHECKPOINT, CONFIG)
+        joint_kp = tuple(float(index + 1) for index in range(ACTION_DIM))
+        joint_kv = tuple(float(index + 2) for index in range(ACTION_DIM))
+        config = MujocoSceneConfig.from_saved_config(
+            ROOT_DIR,
+            run.env_cfg,
+            enable_viewer=False,
+            joint_kp=joint_kp,
+            joint_kv=joint_kv,
+        )
+        np.testing.assert_allclose(config.joint_kp, joint_kp)
+        np.testing.assert_allclose(config.joint_kv, joint_kv)
+        with AnimRLMujocoSim(config) as simulation:
+            np.testing.assert_allclose(
+                simulation.model.actuator_gainprm[
+                    simulation._actuator_ids, 0
+                ],
+                config.joint_kp,
+            )
+            np.testing.assert_allclose(
+                simulation.model.actuator_biasprm[
+                    simulation._actuator_ids, 2
+                ],
+                -np.asarray(config.joint_kv),
+            )
+
     def test_reference_ghost_is_green_offset_and_kinematic(self):
         run = load_saved_run(CHECKPOINT, CONFIG)
         reference = JointDemonstration60Hz.load(

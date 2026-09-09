@@ -23,8 +23,10 @@ Run headless without real-time pacing:
 ```
 
 The runner accepts `--rsi-index`, `--max-steps`, and MuJoCo-specific arm/hand
-PD overrides. An RSI state that already contains hand/cube contacts receives a
-0.1 s fixed-cube/fixed-arm contact warm start by default; pass
+PD overrides. Pass `--training-pd-gains` to use the hardcoded per-joint Isaac
+Gym Kp/Kd values of the `adapt_sigma` training setup, including its 0.5 hand
+stiffness scale. An RSI state that already contains hand/cube contacts receives
+a 0.1 s fixed-cube/fixed-arm contact warm start by default; pass
 `--contact-settle-seconds 0` to inspect the raw reset. Use `--help` for the
 complete list.
 
