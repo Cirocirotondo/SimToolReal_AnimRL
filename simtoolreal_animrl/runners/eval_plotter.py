@@ -389,6 +389,24 @@ class EvaluationPlotter:
         )
         return paths
 
+    def finalize_arm_action(self, output_path) -> Optional[str]:
+        """Write only the arm-action diagnostic to an explicit PNG path."""
+        arrays = self._arrays()
+        if not arrays:
+            return None
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            plt = _use_agg()
+        except ImportError:
+            print("[eval-plot] matplotlib missing; arm plot skipped.", flush=True)
+            return None
+        self._save_action_per_joint(
+            plt, path.parent, arrays, "arm", output_path=path
+        )
+        print("[eval-plot] Arm actions: {}".format(path), flush=True)
+        return str(path)
+
     def _save_overview(self, plt, episode_dir, data, reason) -> Dict[str, str]:
         time_s = data["time_s"]
         fig, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
@@ -856,7 +874,9 @@ class EvaluationPlotter:
         plt.close(fig)
         return {"{}_joint_tracking_png".format(group): str(path)}
 
-    def _save_action_per_joint(self, plt, episode_dir, data, group) -> Dict[str, str]:
+    def _save_action_per_joint(
+        self, plt, episode_dir, data, group, output_path=None
+    ) -> Dict[str, str]:
         """One panel per joint of the block, to expose per-joint chatter."""
         time_s = data["time_s"]
         action = data["action"] if group == "arm" else data["hand_action"]
@@ -931,7 +951,11 @@ class EvaluationPlotter:
             "{} actions per joint — {}".format(group.capitalize(), self._slug)
         )
         fig.tight_layout()
-        path = episode_dir / "{}_action_per_joint.png".format(group)
+        path = (
+            Path(output_path)
+            if output_path is not None
+            else episode_dir / "{}_action_per_joint.png".format(group)
+        )
         fig.savefig(path, dpi=150)
         plt.close(fig)
         return {"{}_action_per_joint_png".format(group): str(path)}

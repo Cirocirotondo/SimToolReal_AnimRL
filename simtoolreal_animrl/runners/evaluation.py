@@ -34,9 +34,16 @@ def preserve_random_state():
 class DeterministicEvaluator:
     """Evaluate deterministic policy means on repeatable RSI cohorts."""
 
-    def __init__(self, env, interval, seed, fixed_phases):
+    def __init__(
+        self, env, interval, seed, fixed_phases, arm_action_plot_path=None
+    ):
         self.env = env
         self.interval = int(interval)
+        self.arm_action_plot_path = (
+            Path(arm_action_plot_path)
+            if arm_action_plot_path is not None
+            else None
+        )
         if self.interval <= 0:
             raise ValueError("Evaluation interval must be positive")
 
@@ -84,12 +91,28 @@ class DeterministicEvaluator:
         # usable.
         pin_assist_scale = getattr(self.env, "set_object_assist_scale", None)
         assist_scale = getattr(self.env, "object_assist_scale", 0.0)
-        with preserve_random_state():
+        with preserve_random_state(), torch.inference_mode():
             runner.eval_mode()
             if pin_assist_scale is not None:
                 pin_assist_scale(0.0)
             try:
-                fixed = self._evaluate_suite(runner, self.fixed_indices)
+                plotter = None
+                if self.arm_action_plot_path is not None:
+                    # Import lazily so metric-only evaluation does not import
+                    # matplotlib or select a backend.
+                    from simtoolreal_animrl.runners.eval_plotter import (
+                        EvaluationPlotter,
+                    )
+
+                    plotter = EvaluationPlotter(
+                        self.arm_action_plot_path.parent, env_idx=0
+                    )
+                if plotter is None:
+                    fixed = self._evaluate_suite(runner, self.fixed_indices)
+                else:
+                    fixed = self._evaluate_suite(
+                        runner, self.fixed_indices, plotter=plotter
+                    )
                 uniform = self._evaluate_suite(runner, self.uniform_indices)
             finally:
                 runner.train_mode()
@@ -114,8 +137,11 @@ class DeterministicEvaluator:
         self.env.compute_observations()
         return self.env.get_observations()
 
-    def _evaluate_suite(self, runner, reference_indices):
+    def _evaluate_suite(self, runner, reference_indices, plotter=None):
         observations = self._reset_to_indices(reference_indices)
+        plotter_active = plotter is not None
+        if plotter_active:
+            plotter.start_episode("episode_00", self.env)
         active = torch.ones(
             self.env.num_envs, dtype=torch.bool, device=self.env.device
         )
@@ -173,6 +199,24 @@ class DeterministicEvaluator:
                         max_abs_action, float(actions[active].abs().max())
                     )
                 observations, _, rewards, dones, infos = self.env.step(actions)
+                if plotter_active:
+                    plotter.record(
+                        self.env,
+                        int(episode_steps[plotter.env_idx].item()) + 1,
+                        actions,
+                        rewards,
+                        dones,
+                        infos,
+                    )
+                    if bool(dones[plotter.env_idx]):
+                        if bool(infos["early_termination"][plotter.env_idx]):
+                            reason = "early termination"
+                        elif bool(infos["time_outs"][plotter.env_idx]):
+                            reason = "timeout"
+                        else:
+                            reason = "done"
+                        plotter.finalize_arm_action(self.arm_action_plot_path)
+                        plotter_active = False
 
                 active_float = active.float()
                 episode_steps += active_float
@@ -251,6 +295,9 @@ class DeterministicEvaluator:
                 active &= ~completed
                 if not bool(active.any()):
                     break
+
+        if plotter_active:
+            plotter.finalize_arm_action(self.arm_action_plot_path)
 
         # A horizon should always end every initial episode. Treat anything
         # still active as a failed evaluation rather than silently ignoring it.
@@ -430,6 +477,7 @@ class SubprocessDeterministicEvaluator:
         # Consecutive failures, so a persistently broken evaluator is visible
         # in the log rather than quietly producing a run with no scores.
         self.consecutive_failures = 0
+        self.last_success_iteration = -1
         if self.interval <= 0 or self.num_envs <= 0:
             raise ValueError(
                 "Evaluation interval and environment count must be positive"
@@ -473,6 +521,23 @@ class SubprocessDeterministicEvaluator:
             # A missing or truncated metrics file lands here too: an evaluator
             # killed mid-write leaves exactly that.
             self.consecutive_failures += 1
+            if self.consecutive_failures >= 3:
+                # An unmeasured run is not a cheap loss: dr_asym trained 4800
+                # iterations with every evaluation failing, so there was no way
+                # to tell whether those iterations helped or hurt. The usual
+                # cause is the training process leaving too little GPU memory
+                # for the second Isaac Gym process this spawns.
+                print(
+                    "\n{} EVALUATIONS HAVE FAILED IN A ROW. This run is "
+                    "training BLIND -- no unassisted measurement since "
+                    "iteration {}. Check GPU memory: reduce "
+                    "sim.physx.max_gpu_contact_pairs or the environment "
+                    "count.\n".format(
+                        self.consecutive_failures, self.last_success_iteration
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
             print(
                 "Evaluation at iteration {} failed ({}: {}). Training continues; "
                 "{} consecutive evaluation(s) have failed.".format(
@@ -487,6 +552,7 @@ class SubprocessDeterministicEvaluator:
             return None
         else:
             self.consecutive_failures = 0
+            self.last_success_iteration = iteration
             return metrics
         finally:
             checkpoint.unlink(missing_ok=True)

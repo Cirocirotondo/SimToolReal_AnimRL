@@ -55,12 +55,34 @@ class AdaptiveSigmaTest(unittest.TestCase):
             tracker.update(1e-9)
         self.assertEqual(tracker.sigma, 0.02)
 
-    def test_it_never_loosens_again(self):
-        """A width that grew back would forgive a regression already paid for."""
-        tracker = AdaptiveSigma(initial=0.10, floor=1e-4, decay=0.0)
+    def test_a_regression_relaxes_the_width_only_up_to_the_slack(self):
+        tracker = AdaptiveSigma(initial=0.10, floor=1e-4, decay=0.0, slack=1.5)
         tight = tracker.update(0.0001)
         after_regression = tracker.update(10.0)
-        self.assertEqual(after_regression, tight)
+        self.assertAlmostEqual(after_regression, tight * 1.5)
+
+    def test_slack_one_reproduces_the_strict_ratchet(self):
+        tracker = AdaptiveSigma(initial=0.10, floor=1e-4, decay=0.0, slack=1.0)
+        tight = tracker.update(0.0001)
+        self.assertAlmostEqual(tracker.update(10.0), tight)
+
+    def test_a_regressing_term_keeps_a_usable_gradient(self):
+        """adapt_sigma's failure: the arm width locked at 0.0268 while error
+        drifted to 0.0747, leaving the term at almost no reward for 1500
+        iterations, so nothing pointed the policy back."""
+        strict = AdaptiveSigma(initial=0.10, floor=1e-4, decay=0.0, slack=1.0)
+        slack = AdaptiveSigma(initial=0.10, floor=1e-4, decay=0.0, slack=1.5)
+        best, regressed = 0.0318 ** 2, 0.0747 ** 2
+        for tracker in (strict, slack):
+            tracker.update(best)
+        # 0.060 with the strict ratchet against 0.286 with slack: nearly 5x
+        # the gradient to climb back on.
+        self.assertLess(reward(regressed, strict.update(regressed)), 0.07)
+        self.assertGreater(reward(regressed, slack.update(regressed)), 0.25)
+
+    def test_a_slack_below_one_is_rejected(self):
+        with self.assertRaises(ValueError):
+            AdaptiveSigma(initial=0.1, floor=0.01, slack=0.9)
 
     def test_the_decay_smooths_a_single_bad_batch(self):
         slow = AdaptiveSigma(initial=0.10, floor=1e-4, decay=0.999)
