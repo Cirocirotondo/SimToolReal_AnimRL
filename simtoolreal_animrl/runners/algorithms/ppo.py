@@ -610,6 +610,14 @@ class PPO:
                     "value_loss": float(value_loss),
                     "surrogate_loss": float(surrogate_loss),
                     "mean_action_std": float(self.policy.action_std.mean()),
+                    # The adaptive reward widths, so the ladder the reward is
+                    # climbing is visible rather than inferred.
+                    **{
+                        "adaptive_sigma_" + name: float(tracker.sigma)
+                        for name, tracker in getattr(
+                            self.env, "adaptive_sigmas", {}
+                        ).items()
+                    },
                     "object_assist_scale": float(object_assist_scale),
                     "learning_rate": float(self.learning_rate),
                     "collection_time_s": collection_time,

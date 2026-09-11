@@ -39,9 +39,20 @@ class AdaptiveSigma:
     the ladder never ends: sigma chases the policy down indefinitely and the
     term keeps demanding improvement in a dimension that no longer matters,
     which is how blind_sharp traded its grasp away for tracking it did not need.
+
+    ``slack`` is how far above its tightest value the width may relax when the
+    policy regresses. A width pinned to the all-time best sounds strict but is
+    self-defeating: adapt_sigma's arm width locked at 0.0268 while arm error
+    drifted 0.0318 -> 0.0747, so the term sat at almost zero reward for 1500
+    iterations and stopped providing a gradient at all -- the dead zone the
+    class exists to avoid, reached from the other side. Allowing a bounded
+    relaxation keeps the term informative during a regression while still
+    making the regression cost something.
     """
 
-    def __init__(self, initial, floor, target_reward=0.6, decay=0.999):
+    def __init__(
+        self, initial, floor, target_reward=0.6, decay=0.999, slack=1.5
+    ):
         if float(floor) <= 0.0:
             raise ValueError("Adaptive sigma floor must be positive")
         if not 0.0 <= float(decay) < 1.0:
@@ -51,6 +62,10 @@ class AdaptiveSigma:
         self.target_reward = float(target_reward)
         self.decay = float(decay)
         self.mean_squared_error = None
+        if float(slack) < 1.0:
+            raise ValueError("Adaptive sigma slack must be at least 1.0")
+        self.slack = float(slack)
+        self.tightest = float(initial)
 
     def update(self, batch_mean_squared_error):
         """Fold in one iteration's MSE and return the width to use next."""
@@ -65,10 +80,18 @@ class AdaptiveSigma:
             )
         target = sigma_for_target(self.mean_squared_error, self.target_reward)
         if target is not None:
-            # Never loosen: a width that grows again would forgive regressions
-            # the policy has already been paid to fix.
-            self.sigma = max(self.floor, min(self.sigma, target))
+            target = max(self.floor, target)
+            self.tightest = min(self.tightest, target)
+            # Tighten freely; relax only up to slack x the tightest width ever
+            # reached, so a regression is expensive but still has a gradient
+            # pointing back.
+            self.sigma = min(target, self.tightest * self.slack)
+            self.sigma = max(self.floor, self.sigma)
         return self.sigma
 
     def state(self):
-        return {"sigma": self.sigma, "mean_squared_error": self.mean_squared_error}
+        return {
+            "sigma": self.sigma,
+            "tightest": self.tightest,
+            "mean_squared_error": self.mean_squared_error,
+        }

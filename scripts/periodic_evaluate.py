@@ -74,16 +74,27 @@ def main():
     runner = None
     try:
         runner = PPO(env, train_cfg, log_dir=None, device=env.device)
-        runner.load(
+        checkpoint_infos = runner.load(
             args.checkpoint,
             load_optimizer=False,
             load_normalizers=True,
+        )
+        evaluation_iteration = int(
+            (checkpoint_infos or {}).get("evaluation_iteration", 0)
+        )
+        arm_action_plot_path = (
+            args.checkpoint.parent
+            / "eval_arm_actions"
+            / "arm_action_per_joint_iter_{:06d}.png".format(
+                evaluation_iteration
+            )
         )
         evaluator = DeterministicEvaluator(
             env,
             interval=1,
             seed=args.seed,
             fixed_phases=args.fixed_phases,
+            arm_action_plot_path=arm_action_plot_path,
         )
         metrics = evaluator(0, runner)
         args.output.parent.mkdir(parents=True, exist_ok=True)

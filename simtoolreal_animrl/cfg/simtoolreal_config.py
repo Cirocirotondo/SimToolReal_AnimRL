@@ -20,8 +20,88 @@ class SimToolRealCfg(BaseEnvCfg):
         # reference-end timeout, hence the inclusive maximum start is 1106.
         reference_init_distribution = "uniform"
         rsi_early_probability = 0.20 # used only when reference_init_distribution = "pregrasp_mixture"
+        # Perturbation applied to the reference pose at reset, in radians. The
+        # real arm can never be placed exactly on a demonstration frame, so a
+        # policy trained only on exact frames has never seen the states it will
+        # actually start from. It also blurs the RSI distribution's edges: the
+        # measured 54x jitter jump at reference frame 690 is a seam where a
+        # barely-trained approach meets a heavily-trained grasp, and noisy
+        # starts spread mass across that boundary instead of stacking it on one
+        # side. Zero reproduces every run so far.
+        rsi_position_noise_arm_rad = 0.0
+        rsi_position_noise_hand_rad = 0.0
+        # Velocities are differentiated encoder counts on hardware, never the
+        # exact values the demonstration carries.
+        rsi_velocity_noise_scale = 0.0
         rsi_pregrasp_start_index = 740 # proximity reward starts from this demonstration index
         rsi_max_start_index = 1106
+
+    class domain_randomization:
+        # Per-environment physical variation, sampled once at creation.
+        #
+        # Added after a measured transfer failure: pg830_blind512_n256, the
+        # ROUGHEST policy trained here, moved to MuJoCo well, while the 25x and
+        # 47x smoother blind_quiet2 and adapt_sigma failed there with matching
+        # PD gains in both simulators. The smooth policies grip at 1.6-2.9 N
+        # where the rough one uses 6.3 N; that margin is a property of one
+        # contact model, not of the task. A policy cannot fit a friction
+        # coefficient that differs in every environment.
+        #
+        # Each value is a fractional spread about the nominal: 0.4 means
+        # uniform in [0.6, 1.4]. Zero disables that parameter, and enabled =
+        # False reproduces every run so far.
+        enabled = False
+        arm_stiffness_range = 0.0
+        arm_damping_range = 0.0
+        hand_stiffness_range = 0.0
+        hand_damping_range = 0.0
+        fingertip_friction_range = 0.0
+        object_friction_range = 0.0
+        object_mass_range = 0.0
+        # Extra physical parameters, all multiplicative like the rest.
+        table_friction_range = 0.0
+        robot_link_mass_range = 0.0
+        # External impulses. Domain randomisation varies the world's parameters
+        # but leaves it deterministic -- nothing ever pushes the robot. A policy
+        # that has only been disturbed by its own actions has no recovery
+        # behaviour, and a real arm is knocked by cable drag while a real cube
+        # is nudged by an imperfect placement.
+        #
+        # Probability is per environment per control step, so 0.02 at 60 Hz is
+        # roughly one push per environment per second. Sparse on purpose: a
+        # continuous push is a force field the policy learns to lean against.
+        robot_impulse_probability = 0.0
+        robot_impulse_n = 0.0
+        # Deliberately light. The cube is 0.2 kg, so 1 N for one 60 Hz step is
+        # about 0.08 m/s -- enough to require a correction, not enough to throw
+        # the object out of the hand.
+        object_impulse_probability = 0.0
+        object_impulse_n = 0.0
+        # Feed the sampled multipliers to the critic. Only possible on a run
+        # trained from scratch: it widens the critic input, so no existing value
+        # network can be warm-started into it. Without this the value function
+        # sees identical observations from environments with different friction
+        # and must average over outcomes it cannot explain, and that unexplained
+        # variance lands in the advantages the actor learns from.
+        critic_observes_parameters = False
+        # Sensor realism. The policy reads exact joint angles and velocities
+        # here; hardware reads encoder counts and a differentiated velocity.
+        # Beyond robustness this suppresses chatter for a reason rather than by
+        # decree: a high-gain reactive policy amplifies measurement noise into
+        # action noise and is punished for it. Velocity takes the larger share
+        # because differentiating a quantised position is where real noise lives.
+        obs_q_noise_rad = 0.0
+        obs_dq_noise_rad_s = 0.0
+        # A constant per-joint offset standing in for an encoder zero error,
+        # drawn once per environment: a bias the policy could average away over
+        # a few steps would not be a bias.
+        obs_q_bias_rad = 0.0
+        # Control latency in whole control steps, drawn once per environment.
+        # A command issued now reaches a real joint later, so an aggressive
+        # corrector overshoots -- training with delay forces the low-gain
+        # behaviour that survives the transfer. Fixed per environment rather
+        # than per step, because per-step variation is jitter and averages out.
+        action_delay_max_steps = 0
 
     class asset:
         file = "assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf"
@@ -223,6 +303,11 @@ class SimToolRealCfg(BaseEnvCfg):
         adaptive_sigma_enabled = False
         adaptive_sigma_target_reward = 0.6
         adaptive_sigma_decay = 0.999
+        # How far a width may relax above its tightest value when the policy
+        # regresses. 1.0 pins it to the all-time best, which sounds strict but
+        # left adapt_sigma's arm term at ~0.06 reward for 1500 iterations with
+        # no gradient pointing back; 1.5 gives 0.29 there instead.
+        adaptive_sigma_slack = 1.5
         # Floors, below which a term stops demanding improvement. Set at the
         # smoothest policy trained here (2026-08-26_sharpen_sigma), because
         # asking for better than that has never been necessary and a width that
