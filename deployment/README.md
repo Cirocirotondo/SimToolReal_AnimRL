@@ -113,17 +113,15 @@ limiter relaxed.
 ```bash
 cd /home/duplo/git/tesollo_ros2
 source /opt/ros/humble/setup.bash && source install_dg5f/setup.bash
-ros2 launch dg5f_driver dg5f_right_driver.launch.py
+ros2 launch dg5f_driver dg5f_right_pid_all_controller.launch.py
 ```
 
-> Use `dg5f_right_driver.launch.py`, **not** `dg5f_right_pid_all_controller.launch.py`.
-> The `pid_all` launch spawns `rj_dg_pospid`, which takes
-> `control_msgs/MultiDOFCommand` on `/dg5f_right/rj_dg_pospid/reference`, while
-> `dg5f_policy_ros_bridge.py` publishes `trajectory_msgs/JointTrajectory` on
-> `/dg5f_right_controller/joint_trajectory` and subscribes to `/joint_states`.
-> Wrong topic *and* wrong message type. With `pid_all` you must override
-> `--joint-state-topic` / `--command-topic` and teach the bridge the other
-> message type first.
+The bridge now defaults to the same direct streaming position-PID command path
+as Tesollo's reversible safe-motion test: `control_msgs/msg/MultiDOFCommand`
+on `/dg5f_right/rj_dg_pospid/reference`. This avoids continuously replanning
+spline trajectories for a 60 Hz position stream. It republishes the latest
+accepted target at 100 Hz, matching the safe-motion test's continuous streaming;
+the watchdog still switches to a measured-position hold if policy packets stop.
 
 **Hand bridge** (ROS 2 Humble's Python 3.10, a separate process from the policy):
 
@@ -133,9 +131,18 @@ source /opt/ros/humble/setup.bash && source /home/duplo/git/tesollo_ros2/install
 python3 dg5f_policy_ros_bridge.py
 ```
 
-The bridge is reused unmodified and owns the last line of hand safety: joint
+The namespaced state and PID command topics are bridge defaults. Topic flags are
+only needed with a different DG5F driver namespace. The previous spline path is
+available with `--controller-mode trajectory`; its points use a positive 0.1 s
+`time_from_start`. Restart both the driver and bridge after this update because
+already-running processes retain the old controller and message type.
+
+The bridge owns the last line of hand safety: joint
 limit clipping, a 0.12 rad per-command step clamp, rejection of commands while
 `/joint_states` is stale, and a measured-position hold when the policy stops.
+Before a combined rollout, hand homing now streams the start target for up to
+10 seconds and requires measured error below 0.18 rad. It aborts instead of
+allowing an operator override if the hand has not converged.
 
 **Arm.** Ethernet, `ur5` profile (192.168.1.10), Remote Control on the tablet:
 
@@ -152,23 +159,48 @@ demonstration.
 ## 3. The commissioning ladder
 
 ```bash
-cd /home/duplo/simone/SimToolReal_AnimRL
-PY=~/venvs/animrl-deploy/bin/python
-CKPT=best_models/2026-09-07_003258_pg830_blind512_n256/best_model.pt
+cd /home/duplo/simone/SimToolReal_AnimRL_deploy108
+PY=/home/duplo/simone/SimToolReal/.venv/bin/python
+CKPT=/home/duplo/simone/SimToolReal_AnimRL/logs/simtoolreal/2026-09-08_210218_dr_long4/model_3000.pt
 ```
+
+The deployment runner applies two one-second startup protections by default:
+the policy action is blended from the demonstration action to the learned
+action (`--startup-policy-blend-seconds 1.0`), and the resulting position target
+is ramped from the verified home pose (`--startup-ramp-seconds 1.0`). The first
+one removes the shoulder-lift action overshoot; the second limits commanded
+motion. Do not disable either protection on this checkpoint.
+
+The policy blend is measured in demonstration time: one second means 60 policy
+frames even during a slowed 1 Hz or 5 Hz commissioning run. This intentionally
+makes the handoff slower in wall-clock time at reduced control rates and avoids
+large action steps between sparse evaluations.
+
+The event-triggered quaternion policy-output transition is also enabled by
+default. It begins when the legacy sign flip is actually observed, blends to
+the canonical policy for one second, and then remains canonical. No command-line
+flag is required. `--no-smooth-quaternion-transition` is provided only for
+controlled diagnostics and should not be used for this checkpoint on hardware.
+
+MuJoCo sim2sim uses the per-joint arm gains from training by default. The old
+scalar `300/20` arm PD permits a large gravity-driven shoulder-lift transient;
+it is now available only when explicitly requested with
+`--scalar-arm-pd-gains`.
 
 **Stage 1 — sim2sim with physics.** The real gate. Not this script: this script
 has no physics, so a full-simulation run here is strictly weaker.
 
 ```bash
-$PY scripts/run_mujoco_sim2sim.py --checkpoint $CKPT --rsi-index 0
+$PY scripts/run_mujoco_sim2sim.py --checkpoint $CKPT --rsi-index 0 \
+  --smooth-quaternion-transition
 ```
 
 **Stage 2 — dry run, no hardware.** Confirms the policy loads, the observation
 builds and the monitors behave. Nothing is commanded.
 
 ```bash
-$PY deployment/run_policy_real.py --checkpoint $CKPT --no-viewer --no-realtime
+$PY deployment/run_policy_real.py --checkpoint $CKPT --no-viewer --no-realtime \
+  --smooth-quaternion-transition
 ```
 
 **Stage 3 — read hardware, command nothing.** Needs the low-level controller,
@@ -176,22 +208,41 @@ the DG5F driver and the bridge. Verifies both state streams and the FK.
 
 ```bash
 $PY deployment/run_policy_real.py --checkpoint $CKPT \
-  --use-real-arm-state --use-real-hand-state --max-steps 200
+  --use-real-arm-state --use-real-hand-state --max-steps 200 --no-viewer
 ```
 
-**Stage 4 — hand alone, stepped and slow.** The arm stays simulated on the
-demonstration trajectory. Two confirmations: a typed `SEND`, then Space.
+**Stage 4 — arm alone with ideal context, stepped and slow.** Only the physical
+arm state enters the observation and only the arm is commanded. Hand `q/dq`
+and cube pose come from the ideal demonstration; MuJoCo FK combines them with
+the measured arm to rebuild palm and fingertip observations in every tick.
+Two confirmations are required: a typed `SEND`, then Space.
+The Space prompt continues polling UR5 state, so taking time to inspect the
+start pose does not manufacture a stale-state failure.
+The homing command contains start, midpoint, and target samples because the
+low-level controller's spline implementation requires at least three points.
+In single-subsystem commissioning, the action-discontinuity interlock monitors
+only the subsystem that is physically armed. Outputs for the disconnected side
+are diagnostic and cannot stop an otherwise safe physical-side rollout; both
+sides are monitored when both outputs are armed.
 
 ```bash
 $PY deployment/run_policy_real.py --checkpoint $CKPT \
-  --send-to-hand --debug-step --control-hz 1 --hand-action-scale 0.2 --max-steps 10
+  --commission-arm-only-ideal-context --debug-step --control-hz 1 \
+  --arm-action-scale 0.2 --max-steps 10
 ```
 
-**Stage 5 — arm alone**, hand simulated:
+**Stage 5 — hand alone with ideal context, stepped and slow.** Only the physical
+hand state enters the observation and only the hand is commanded. Arm `q/dq`
+and cube pose come from the ideal demonstration; MuJoCo FK supplies the full
+hybrid observation. While waiting for Space, the runner refreshes the current
+hand target at 20 Hz. This keeps the bridge's 0.25-second watchdog satisfied;
+if the runner exits or crashes, refreshes stop and the bridge returns to its
+measured-position hold.
 
 ```bash
 $PY deployment/run_policy_real.py --checkpoint $CKPT \
-  --send-to-arm --debug-step --control-hz 1 --arm-action-scale 0.2 --max-steps 10
+  --commission-hand-only-ideal-context --debug-step --control-hz 1 \
+  --hand-action-scale 0.2 --max-steps 10
 ```
 
 **Stage 6 — both, stepped**, then both free-running slow, then raise the rate:
@@ -199,11 +250,13 @@ $PY deployment/run_policy_real.py --checkpoint $CKPT \
 ```bash
 # stepped
 $PY deployment/run_policy_real.py --checkpoint $CKPT --send-to-arm --send-to-hand \
-  --debug-step --control-hz 1 --arm-action-scale 0.2 --hand-action-scale 0.2 --max-steps 10
+  --smooth-quaternion-transition --debug-step --control-hz 1 \
+  --arm-action-scale 0.2 --hand-action-scale 0.2 --max-steps 10
 
 # free-running, slow, smoothed, short
 $PY deployment/run_policy_real.py --checkpoint $CKPT --send-to-arm --send-to-hand \
-  --control-hz 5 --arm-action-scale 0.3 --hand-action-scale 0.3 \
+  --smooth-quaternion-transition --control-hz 5 \
+  --arm-action-scale 0.3 --hand-action-scale 0.3 \
   --target-smoothing 0.6 --max-steps 100
 
 # then, one change at a time: control-hz 5 -> 10 -> 20 -> 60,
@@ -220,9 +273,10 @@ cd /home/duplo/git/robohand/src/tag-pose-estimation
   --config config/pose_estimation_configs/parallelepiped_5x5x15cm_robot_frame.json
 
 # terminal B -- check the frame agrees with the demonstration, then run
-$PY deployment/run_policy_real.py --checkpoint $CKPT --check-cube-frame --rsi-index 0
+$PY deployment/run_policy_real.py --checkpoint $CKPT --smooth-quaternion-transition \
+  --check-cube-frame --rsi-index 0 --pose-address tcp://127.0.0.1:5558
 $PY deployment/run_policy_real.py --checkpoint $CKPT --send-to-arm --send-to-hand \
-  --cube-source pose-estimation
+  --smooth-quaternion-transition --cube-source pose-estimation
 ```
 
 ---

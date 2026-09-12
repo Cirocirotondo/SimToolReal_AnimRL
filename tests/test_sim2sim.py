@@ -13,10 +13,12 @@ from simtoolreal_animrl.sim2sim.constants import (
     PALM_POSITION_IN_WRIST,
 )
 from simtoolreal_animrl.sim2sim.observation import (
+    QuaternionContinuity,
     actions_to_position_targets,
     build_observation,
     normalize_canonical_quaternion,
     quat_rotate_xyzw,
+    smoothstep01,
 )
 from simtoolreal_animrl.sim2sim.policy import (
     AnimRLInferencePolicy,
@@ -35,6 +37,34 @@ EVALUATION = RUN_DIR / "eval_best_model.json"
 
 
 class Sim2SimMathTest(unittest.TestCase):
+    def test_smoothstep_is_clamped_and_has_expected_midpoint(self):
+        self.assertEqual(smoothstep01(-1.0), 0.0)
+        self.assertEqual(smoothstep01(0.0), 0.0)
+        self.assertEqual(smoothstep01(0.5), 0.5)
+        self.assertEqual(smoothstep01(1.0), 1.0)
+        self.assertEqual(smoothstep01(2.0), 1.0)
+
+    def test_quaternion_continuity_unwraps_both_blocks_independently(self):
+        continuity = QuaternionContinuity()
+        first = np.zeros(BASE_OBSERVATION_DIM, dtype=np.float32)
+        first[82:86] = (0.1, 0.2, 0.3, 0.9)
+        first[101:105] = (0.4, -0.2, 0.1, 0.8)
+        first[82:86] /= np.linalg.norm(first[82:86])
+        first[101:105] /= np.linalg.norm(first[101:105])
+        np.testing.assert_array_equal(continuity.apply(first), first)
+
+        second = first.copy()
+        second[82:86] *= -1.0
+        result = continuity.apply(second)
+        np.testing.assert_allclose(result[82:86], first[82:86])
+        np.testing.assert_allclose(result[101:105], first[101:105])
+        self.assertAlmostEqual(float(np.linalg.norm(result[82:86])), 1.0, places=6)
+        self.assertAlmostEqual(float(np.linalg.norm(result[101:105])), 1.0, places=6)
+
+    def test_quaternion_continuity_rejects_wrong_observation_size(self):
+        with self.assertRaises(ValueError):
+            QuaternionContinuity().apply(np.zeros(107, dtype=np.float32))
+
     def test_quaternion_rotation_and_canonical_sign(self):
         half_sqrt = np.sqrt(0.5)
         quarter_turn_z = np.asarray((0.0, 0.0, half_sqrt, half_sqrt))

@@ -190,8 +190,9 @@ class SpikeMonitor:
         }
         message = (
             "{} discontinuity: {} moved {:.4f} in one step "
-            "(threshold {:.4f}). This is the signature of the quaternion "
-            "double-cover crossing; see deployment/README.md.".format(
+            "(threshold {:.4f}). This may come from an observation branch "
+            "change, startup mismatch, or out-of-distribution state; see "
+            "deployment/README.md.".format(
                 self.name.capitalize(), report["label"], magnitude, self.threshold
             )
         )
@@ -205,14 +206,20 @@ class SpikeMonitor:
         return report
 
 
-def wait_for_key(prompt: str, accept: tuple = (" ", "\r", "\n")) -> None:
-    """Block until an accepted key, raising KeyboardInterrupt on 'q'."""
+def wait_for_key(
+    prompt: str,
+    accept: tuple = (" ", "\r", "\n"),
+    on_wait=None,
+    wait_interval_s: float = 0.05,
+) -> None:
+    """Wait for a key while optionally servicing a safety keepalive."""
     print(prompt, end="", flush=True)
     if not sys.stdin.isatty():
         answer = input().strip().lower()
         if answer == "q":
             raise KeyboardInterrupt
         return
+    import select
     import termios
     import tty
 
@@ -221,6 +228,13 @@ def wait_for_key(prompt: str, accept: tuple = (" ", "\r", "\n")) -> None:
     try:
         tty.setcbreak(descriptor)
         while True:
+            readable, _, _ = select.select(
+                [descriptor], [], [], float(wait_interval_s)
+            )
+            if not readable:
+                if on_wait is not None:
+                    on_wait()
+                continue
             key = sys.stdin.read(1)
             if key.lower() == "q":
                 print()
