@@ -15,6 +15,49 @@ from .constants import (
 )
 
 
+class QuaternionContinuity:
+    """Keep legacy quaternion observations on the nearest sign branch.
+
+    ``q`` and ``-q`` encode the same rotation.  The legacy 108-D observation
+    canonicalizes each sample independently, which introduces an artificial
+    four-component discontinuity whenever the scalar component crosses zero.
+    This stateful adapter changes only the representation, never the pose.
+    """
+
+    BLOCKS = (slice(82, 86), slice(101, 105))
+
+    def __init__(self) -> None:
+        self.previous: list[np.ndarray | None] = [None, None]
+        self.last_flipped = [False, False]
+
+    def apply(self, observation: np.ndarray) -> np.ndarray:
+        continuous = np.asarray(observation, dtype=np.float32).copy()
+        if continuous.shape != (BASE_OBSERVATION_DIM,):
+            raise ValueError(
+                "observation must have shape ({},)".format(
+                    BASE_OBSERVATION_DIM
+                )
+            )
+        for index, block in enumerate(self.BLOCKS):
+            quaternion = continuous[block]
+            previous = self.previous[index]
+            flipped = (
+                previous is not None
+                and float(np.dot(quaternion, previous)) < 0.0
+            )
+            if flipped:
+                quaternion *= -1.0
+            self.last_flipped[index] = flipped
+            self.previous[index] = quaternion.copy()
+        return continuous
+
+
+def smoothstep01(value: float) -> float:
+    """C1-continuous interpolation weight clamped to [0, 1]."""
+    x = float(np.clip(value, 0.0, 1.0))
+    return x * x * (3.0 - 2.0 * x)
+
+
 def normalize_canonical_quaternion(quaternion: np.ndarray) -> np.ndarray:
     quaternion = np.asarray(quaternion, dtype=np.float64)
     norm = float(np.linalg.norm(quaternion))

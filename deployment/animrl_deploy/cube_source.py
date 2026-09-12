@@ -32,7 +32,7 @@ from typing import Optional, Protocol, Tuple
 import numpy as np
 import zmq
 
-DEFAULT_POSE_ADDRESS = "tcp://127.0.0.1:5557"
+DEFAULT_POSE_ADDRESS = "tcp://127.0.0.1:5558"
 
 CubeState = Tuple[np.ndarray, np.ndarray, np.ndarray]
 
@@ -111,6 +111,7 @@ class PoseEstimationCube:
         board_id: str = "0",
         minimum_confidence: float = 0.0,
         pose_timeout: float = 0.5,
+        z_offset_m: float = 0.03,
         context: Optional[zmq.Context] = None,
     ) -> None:
         self._owns_context = context is None
@@ -124,6 +125,7 @@ class PoseEstimationCube:
         self.board_id = str(board_id)
         self.minimum_confidence = float(minimum_confidence)
         self.pose_timeout = float(pose_timeout)
+        self.z_offset_m = float(z_offset_m)
         self._pose: Optional[np.ndarray] = None
         self._last_pose_at: Optional[float] = None
         self._zero = np.zeros(3, dtype=np.float64)
@@ -185,6 +187,7 @@ class PoseEstimationCube:
                 continue
             if not np.all(np.isfinite(position)) or not np.all(np.isfinite(rotation)):
                 continue
+            position[2] += self.z_offset_m
             self._pose = np.concatenate(
                 (position, self._rotation_matrix_to_xyzw(rotation))
             )

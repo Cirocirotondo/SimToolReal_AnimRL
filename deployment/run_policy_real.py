@@ -34,8 +34,10 @@ from simtoolreal_animrl.sim2sim.constants import (
     JOINT_NAMES,
 )
 from simtoolreal_animrl.sim2sim.observation import (
+    QuaternionContinuity,
     actions_to_position_targets,
     build_observation,
+    smoothstep01,
 )
 from simtoolreal_animrl.sim2sim.policy import AnimRLInferencePolicy, load_saved_run
 
@@ -166,6 +168,7 @@ def check_cube_frame(args, reference) -> int:
         board_id=args.pose_board_id,
         minimum_confidence=args.pose_min_confidence,
         pose_timeout=args.pose_timeout,
+        z_offset_m=args.pose_z_offset_m,
     )
     demo = DemonstrationCube(reference)
     try:
@@ -265,6 +268,7 @@ def main() -> int:
             board_id=args.pose_board_id,
             minimum_confidence=args.pose_min_confidence,
             pose_timeout=args.pose_timeout,
+            z_offset_m=args.pose_z_offset_m,
         )
 
     arm_client = None
@@ -379,7 +383,24 @@ def print_banner(args, run, reference, arm_scale, hand_scale, send_arm, send_han
         args.max_arm_step_rad, args.max_hand_step_rad
     ))
     print("  target smoothing: {:g}".format(args.target_smoothing))
+    print("  startup policy  : {:g} demo-s reference-to-policy blend".format(
+        args.startup_policy_blend_seconds
+    ))
+    print("  startup target  : {:g} s home-to-target ramp".format(
+        args.startup_ramp_seconds
+    ))
+    print("  quaternion mode : {}".format(
+        "event-triggered smooth transition"
+        if args.smooth_quaternion_transition
+        else ("continuous" if args.continuous_quaternions else "canonical")
+    ))
     print("  cube source     : {}".format(args.cube_source))
+    if args.commission_arm_only_ideal_context:
+        print("  hybrid context  : real arm + ideal hand/cube + MuJoCo FK")
+    elif args.commission_hand_only_ideal_context:
+        print("  hybrid context  : real hand + ideal arm/cube + MuJoCo FK")
+    else:
+        print("  simulated state : {}".format(args.simulated_state_source))
     print("  arm output      : {}".format("ARMED" if send_arm else "simulated"))
     print("  hand output     : {}".format("ARMED" if send_hand else "simulated"))
     print("  action spike    : {} above {:g}".format(
@@ -410,10 +431,18 @@ def home_arm(arm_client, target_q, args) -> None:
                 distance, args.max_home_distance_rad
             )
         )
-    wait_for_key("Press Space to send the homing trajectory, or q to abort: ")
+    # The arm state socket is polled by this process. Keep draining it while
+    # the operator inspects the pose; otherwise a deliberate pause at this
+    # prompt makes a healthy state stream appear stale immediately afterward.
+    wait_for_key(
+        "Press Space to send the homing trajectory, or q to abort: ",
+        on_wait=arm_client.poll,
+    )
     seconds = max(args.home_seconds, distance / max(args.home_speed_rad_s, 1e-6))
+    midpoint = 0.5 * (measured + target_q)
     arm_client.send_trajectory(
-        np.asarray([0.0, seconds]), np.stack([measured, target_q])
+        np.asarray([0.0, 0.5 * seconds, seconds]),
+        np.stack([measured, midpoint, target_q]),
     )
     deadline = time.monotonic() + seconds + args.home_settle_seconds
     while time.monotonic() < deadline:
@@ -446,16 +475,37 @@ def home_hand(hand_client, target_q, args) -> None:
     for _ in range(int(args.home_settle_seconds / max(args.hand_home_step_seconds, 1e-3))):
         hand_client.send_target(target_q)
         time.sleep(args.hand_home_step_seconds)
-    measured = hand_client.require_fresh_state()
-    error = float(np.max(np.abs(target_q - measured)))
-    print("  homing finished, max|q-target| = {:.4f} rad".format(error))
-    if error > args.hand_home_tolerance_rad:
-        print(
-            "  NOTE: residual hand error above {:.3f} rad. The DG5F does not "
-            "always reach a free-space target exactly; continue only if the "
-            "pose looks right.".format(args.hand_home_tolerance_rad)
+    settle_deadline = time.monotonic() + args.hand_home_timeout_seconds
+    while True:
+        measured = hand_client.require_fresh_state()
+        absolute_error = np.abs(target_q - measured)
+        if float(np.max(absolute_error)) <= args.hand_home_tolerance_rad:
+            break
+        if time.monotonic() >= settle_deadline:
+            break
+        hand_client.send_target(target_q)
+        time.sleep(args.hand_home_step_seconds)
+    worst_index = int(np.argmax(absolute_error))
+    error = float(absolute_error[worst_index])
+    print(
+        "  homing finished, max|q-target| = {:.4f} rad on {} "
+        "(measured={:.4f}, target={:.4f})".format(
+            error,
+            HAND_JOINT_NAMES[worst_index],
+            measured[worst_index],
+            target_q[worst_index],
         )
-        wait_for_key("  Press Space to continue, or q to abort: ")
+    )
+    if error > args.hand_home_tolerance_rad:
+        raise SafetyAbort(
+            "Hand did not reach the start pose within {:.1f} s: {} remains "
+            "{:.4f} rad from target (limit {:.4f} rad).".format(
+                args.hand_home_timeout_seconds,
+                HAND_JOINT_NAMES[worst_index],
+                error,
+                args.hand_home_tolerance_rad,
+            )
+        )
 
 
 def run_policy(
@@ -488,11 +538,20 @@ def run_policy(
         smoothing=args.target_smoothing,
     )
     limiter.reset(start_q)
+    if send_arm and not send_hand:
+        spike_slice = slice(0, ARM_DOF)
+        spike_labels = list(ARM_JOINT_NAMES)
+    elif send_hand and not send_arm:
+        spike_slice = slice(ARM_DOF, ARM_DOF + HAND_DOF)
+        spike_labels = list(HAND_JOINT_NAMES)
+    else:
+        spike_slice = slice(None)
+        spike_labels = list(JOINT_NAMES)
     action_spikes = SpikeMonitor(
         args.max_action_step,
         mode=args.spike_mode,
         name="action",
-        labels=list(JOINT_NAMES),
+        labels=spike_labels,
         grace_steps=args.spike_grace_steps,
     )
     simulated_arm = SimulatedSide(
@@ -509,7 +568,14 @@ def run_policy(
     )
 
     previous_targets = start_q.copy()
+    quaternion_continuity = (
+        QuaternionContinuity()
+        if args.continuous_quaternions or args.smooth_quaternion_transition
+        else None
+    )
+    motion_frequency_hz = float(reference.frequency_hz)
     reference_index = int(args.rsi_index)
+    quaternion_transition_started_at = None
     steps = 0
     started_at = time.perf_counter()
     overruns = 0
@@ -547,20 +613,109 @@ def run_policy(
             measured_q, measured_dq, cube_pose, cube_linear, cube_angular
         )
         phase = reference_index / float(reference.last_index)
-        observation = build_observation(
+        canonical_observation = build_observation(
             state,
             previous_targets,
             phase,
             kinematics.joint_lower_limits,
             kinematics.joint_upper_limits,
         )
+        continuity_active = (
+            quaternion_continuity is not None
+            and args.continuous_quaternions
+            and (
+                args.continuous_quaternions_until_seconds is None
+                or reference_index / motion_frequency_hz
+                < args.continuous_quaternions_until_seconds
+            )
+        )
+        observation = canonical_observation
+        if continuity_active:
+            observation = quaternion_continuity.apply(observation)
 
         # -- policy --------------------------------------------------------
-        actions = actor(observation)
-        action_spikes.update(actions)
+        if args.smooth_quaternion_transition:
+            continuous_observation = quaternion_continuity.apply(
+                canonical_observation
+            )
+            demo_seconds = reference_index / motion_frequency_hz
+            if (
+                quaternion_transition_started_at is None
+                and any(quaternion_continuity.last_flipped)
+            ):
+                quaternion_transition_started_at = demo_seconds
+                print(
+                    "Quaternion action transition triggered at {:.3f} s".format(
+                        demo_seconds
+                    )
+                )
+            progress = (
+                0.0
+                if quaternion_transition_started_at is None
+                else (demo_seconds - quaternion_transition_started_at)
+                / args.quaternion_transition_duration_seconds
+            )
+            canonical_weight = smoothstep01(progress)
+            if canonical_weight <= 0.0:
+                actions = actor(continuous_observation)
+            elif canonical_weight >= 1.0:
+                actions = actor(canonical_observation)
+            else:
+                actions = (
+                    (1.0 - canonical_weight) * actor(continuous_observation)
+                    + canonical_weight * actor(canonical_observation)
+                )
+        else:
+            actions = actor(observation)
+        if args.startup_policy_blend_seconds > 0.0:
+            startup_policy_progress = (
+                steps
+                / (
+                    args.startup_policy_blend_seconds
+                    * motion_frequency_hz
+                )
+            )
+            if startup_policy_progress < 1.0:
+                current_reference = reference.sample(
+                    torch.tensor([reference_index], dtype=torch.long)
+                )
+                # Action-space warm starting must remain in the policy's
+                # training units.  Hardware action scaling is applied later
+                # by actions_to_position_targets; using the reduced physical
+                # scale here would inflate reference actions by 1/scale.
+                native_arm_scale = arm_scale / args.arm_action_scale
+                native_hand_scale = hand_scale / args.hand_action_scale
+                action_scales = np.concatenate(
+                    (
+                        np.full(ARM_DOF, native_arm_scale, dtype=np.float64),
+                        np.full(HAND_DOF, native_hand_scale, dtype=np.float64),
+                    )
+                )
+                reference_actions = (
+                    current_reference.q[0].numpy() - defaults
+                ) / action_scales
+                policy_weight = smoothstep01(startup_policy_progress)
+                actions = (
+                    (1.0 - policy_weight) * reference_actions
+                    + policy_weight * actions
+                )
+        # A commissioning mode deliberately leaves one subsystem disconnected.
+        # Its policy outputs remain useful diagnostics, but must not stop the
+        # physically armed subsystem. When both are armed, monitor all 26.
+        action_spikes.update(actions[spike_slice])
         raw_targets = actions_to_position_targets(
             actions, defaults, arm_scale, hand_scale, residual_clip
         )
+        if args.startup_ramp_seconds > 0.0:
+            startup_progress = (
+                (steps + 1) * control_dt / args.startup_ramp_seconds
+            )
+            if startup_progress < 1.0:
+                startup_weight = smoothstep01(startup_progress)
+                raw_targets = (
+                    (1.0 - startup_weight) * start_q
+                    + startup_weight * raw_targets
+                )
         applied_targets, limit_info = limiter.apply(raw_targets)
 
         # -- output --------------------------------------------------------
@@ -650,7 +805,18 @@ def run_policy(
             )
 
         if args.debug_step:
-            wait_for_key("  [step {}] Space for the next step, q to stop: ".format(steps))
+            hand_keepalive = None
+            if send_hand:
+                hand_target = applied_targets[ARM_DOF:].copy()
+
+                def hand_keepalive() -> None:
+                    hand_client.require_fresh_state()
+                    hand_client.send_target(hand_target)
+
+            wait_for_key(
+                "  [step {}] Space for the next step, q to stop: ".format(steps),
+                on_wait=hand_keepalive,
+            )
         elif not args.no_realtime:
             remaining = control_dt - (time.perf_counter() - loop_started)
             if remaining > 0.0:
@@ -670,7 +836,7 @@ def run_policy(
             "Largest single-step action change: {:.4f} on {} (threshold {:g}, "
             "{} detection(s)).".format(
                 action_spikes.worst,
-                JOINT_NAMES[action_spikes.worst_index],
+                spike_labels[action_spikes.worst_index],
                 action_spikes.threshold,
                 action_spikes.detections,
             )
@@ -705,6 +871,23 @@ def parse_args() -> argparse.Namespace:
     output.add_argument("--send-to-hand", action="store_true")
     output.add_argument("--use-real-arm-state", action="store_true")
     output.add_argument("--use-real-hand-state", action="store_true")
+    commissioning = output.add_mutually_exclusive_group()
+    commissioning.add_argument(
+        "--commission-arm-only-ideal-context",
+        action="store_true",
+        help=(
+            "Command/read only the arm; source hand q/dq and cube pose from "
+            "the demonstration and rebuild kinematics in the loop."
+        ),
+    )
+    commissioning.add_argument(
+        "--commission-hand-only-ideal-context",
+        action="store_true",
+        help=(
+            "Command/read only the hand; source arm q/dq and cube pose from "
+            "the demonstration and rebuild kinematics in the loop."
+        ),
+    )
 
     scaling = parser.add_argument_group("motion scaling and limits")
     scaling.add_argument("--arm-action-scale", type=float, default=1.0)
@@ -714,6 +897,21 @@ def parse_args() -> argparse.Namespace:
     scaling.add_argument(
         "--target-smoothing", type=float, default=0.0,
         help="EMA weight on the previous target, in [0, 1). 0 disables it.",
+    )
+    scaling.add_argument(
+        "--startup-ramp-seconds", type=float, default=1.0,
+        help=(
+            "Smoothly ramp targets from the verified home pose to the policy "
+            "target (default: 1.0 s; 0 disables)."
+        ),
+    )
+    scaling.add_argument(
+        "--startup-policy-blend-seconds", type=float, default=1.0,
+        help=(
+            "Start exactly on the demonstration action and smoothly transfer "
+            "to the learned action over this many seconds of 60 Hz "
+            "demonstration frames (default: 1.0; 0 disables)."
+        ),
     )
 
     monitors = parser.add_argument_group("safety monitors")
@@ -756,8 +954,14 @@ def parse_args() -> argparse.Namespace:
         choices=("demonstration", "frozen", "pose-estimation"),
         default="demonstration",
     )
-    cube_group.add_argument("--pose-address", default="tcp://127.0.0.1:5557")
+    cube_group.add_argument("--pose-address", default="tcp://127.0.0.1:5558")
     cube_group.add_argument("--pose-board-id", default="0")
+    cube_group.add_argument(
+        "--pose-z-offset-m",
+        type=float,
+        default=0.03,
+        help="Add this calibration offset to the live estimator Z coordinate.",
+    )
     cube_group.add_argument("--pose-min-confidence", type=float, default=0.0)
     cube_group.add_argument("--pose-timeout", type=float, default=0.5)
     cube_group.add_argument("--pose-wait-seconds", type=float, default=10.0)
@@ -784,10 +988,11 @@ def parse_args() -> argparse.Namespace:
     homing.add_argument("--home-speed-rad-s", type=float, default=0.15)
     homing.add_argument("--home-settle-seconds", type=float, default=1.5)
     homing.add_argument("--home-tolerance-rad", type=float, default=0.05)
-    homing.add_argument("--max-home-distance-rad", type=float, default=1.5)
+    homing.add_argument("--max-home-distance-rad", type=float, default=1.9)
     homing.add_argument("--hand-home-step-rad", type=float, default=0.03)
     homing.add_argument("--hand-home-step-seconds", type=float, default=0.02)
-    homing.add_argument("--hand-home-tolerance-rad", type=float, default=0.15)
+    homing.add_argument("--hand-home-tolerance-rad", type=float, default=0.18)
+    homing.add_argument("--hand-home-timeout-seconds", type=float, default=10.0)
     homing.add_argument("--brake-seconds", type=float, default=0.5)
 
     behaviour = parser.add_argument_group("behaviour")
@@ -795,6 +1000,44 @@ def parse_args() -> argparse.Namespace:
     behaviour.add_argument("--no-viewer", action="store_true")
     behaviour.add_argument("--no-ghost", action="store_true")
     behaviour.add_argument("--no-realtime", action="store_true")
+    behaviour.add_argument(
+        "--continuous-quaternions",
+        action="store_true",
+        help=(
+            "For legacy 108-D policies, unwrap the palm and palm-relative "
+            "cube quaternion signs against the preceding observation. This "
+            "removes the artificial w=0 sign jump without changing rotation."
+        ),
+    )
+    behaviour.add_argument(
+        "--continuous-quaternions-until-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Use --continuous-quaternions only before this absolute "
+            "demonstration time. A branch change at the cutoff may itself "
+            "be discontinuous; validate it before hardware use."
+        ),
+    )
+    behaviour.add_argument(
+        "--smooth-quaternion-transition",
+        dest="smooth_quaternion_transition",
+        action="store_true",
+        default=True,
+        help=(
+            "Blend policy outputs from continuous to canonical quaternion "
+            "observations after the detected sign crossing (default: enabled)."
+        ),
+    )
+    behaviour.add_argument(
+        "--no-smooth-quaternion-transition",
+        dest="smooth_quaternion_transition",
+        action="store_false",
+        help="Disable the event-triggered quaternion policy-output transition.",
+    )
+    behaviour.add_argument(
+        "--quaternion-transition-duration-seconds", type=float, default=1.0,
+    )
     behaviour.add_argument("--print-every", type=int, default=30)
     behaviour.add_argument(
         "--simulated-state-source",
@@ -823,12 +1066,56 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if args.commission_arm_only_ideal_context:
+        if args.send_to_hand or args.use_real_hand_state:
+            parser.error(
+                "arm-only ideal-context mode cannot send to or read the real hand"
+            )
+        args.send_to_arm = True
+        args.use_real_arm_state = True
+        args.simulated_state_source = "demonstration"
+        args.cube_source = "demonstration"
+    elif args.commission_hand_only_ideal_context:
+        if args.send_to_arm or args.use_real_arm_state:
+            parser.error(
+                "hand-only ideal-context mode cannot send to or read the real arm"
+            )
+        args.send_to_hand = True
+        args.use_real_hand_state = True
+        args.simulated_state_source = "demonstration"
+        args.cube_source = "demonstration"
     if args.control_hz <= 0.0:
         parser.error("--control-hz must be positive")
     if args.max_steps < 0:
         parser.error("--max-steps cannot be negative")
+    if (
+        args.continuous_quaternions_until_seconds is not None
+        and args.continuous_quaternions_until_seconds < 0.0
+    ):
+        parser.error("--continuous-quaternions-until-seconds cannot be negative")
+    if (
+        args.continuous_quaternions_until_seconds is not None
+        and not args.continuous_quaternions
+    ):
+        parser.error(
+            "--continuous-quaternions-until-seconds requires "
+            "--continuous-quaternions"
+        )
+    if args.smooth_quaternion_transition and args.continuous_quaternions:
+        parser.error(
+            "--smooth-quaternion-transition and --continuous-quaternions "
+            "are mutually exclusive"
+        )
+    if args.quaternion_transition_duration_seconds <= 0.0:
+        parser.error("--quaternion-transition-duration-seconds must be positive")
     if not 0.0 <= args.target_smoothing < 1.0:
         parser.error("--target-smoothing must lie in [0, 1)")
+    if args.startup_ramp_seconds < 0.0:
+        parser.error("--startup-ramp-seconds cannot be negative")
+    if args.startup_policy_blend_seconds < 0.0:
+        parser.error("--startup-policy-blend-seconds cannot be negative")
+    if args.hand_home_timeout_seconds <= 0.0:
+        parser.error("--hand-home-timeout-seconds must be positive")
     for name in ("arm_action_scale", "hand_action_scale"):
         if getattr(args, name) <= 0.0:
             parser.error("--{} must be positive".format(name.replace("_", "-")))
