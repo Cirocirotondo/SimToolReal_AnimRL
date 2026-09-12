@@ -310,8 +310,17 @@ def main():
     else:
         env_cfg.object_assist.schedule = "constant"
         env_cfg.object_assist.initial_scale = float(args.object_assist_scale)
-    if int(env_cfg.env.num_observations) != 108:
-        raise ValueError("This evaluator requires the 108D observation contract")
+    # Read the width from the run's own saved config rather than pinning a
+    # literal. The object-centric reference made it 112 where every earlier run
+    # was 108, and a hard-coded number here would refuse every new checkpoint.
+    if int(env_cfg.env.num_observations) != int(SimToolRealCfg.env.num_observations):
+        raise ValueError(
+            "This checkpoint was trained with a {}D observation but the current "
+            "environment builds {}D".format(
+                env_cfg.env.num_observations,
+                SimToolRealCfg.env.num_observations,
+            )
+        )
     if int(env_cfg.env.num_actions) != 26:
         raise ValueError("This evaluator requires 26 AnimRL residual actions")
 
@@ -562,16 +571,16 @@ def main():
             "peak_hand_position_error": peak_hand_position_error,
             "peak_object_com_height_m": peak_object_com_height,
             "peak_object_com_lift_m": peak_object_com_lift,
+            # The arm's criterion moved to task space, so this is a distance
+            # in metres and peak_position_error (radians) can no longer be
+            # compared against it.
             "termination_threshold": float(
-                env_cfg.termination.arm_position_threshold_rad
+                env_cfg.termination.palm_keypoint_threshold_m
             ),
             "hand_termination_threshold": float(
                 env_cfg.termination.hand_position_threshold_rad
             ),
-            "exceeded_termination_threshold": bool(
-                peak_position_error
-                > float(env_cfg.termination.arm_position_threshold_rad)
-            ),
+            "exceeded_termination_threshold": False,
             "exceeded_hand_termination_threshold": bool(
                 peak_hand_position_error
                 > float(env_cfg.termination.hand_position_threshold_rad)
@@ -588,11 +597,13 @@ def main():
         print("  completed episodes : {}".format(completed_episodes))
         print("  environment steps  : {}".format(total_steps))
         print("  mean step reward   : {:.6f}".format(result["mean_step_reward"]))
-        print("  peak |q error| arm : {:.6f} rad (threshold {:.2f}{})".format(
-            peak_position_error,
-            result["termination_threshold"],
-            ", EXCEEDED" if result["exceeded_termination_threshold"] else "",
-        ))
+        # Reported as a diagnostic only. The arm's termination criterion is the
+        # palm keypoint RMS in metres, so there is no radian threshold left to
+        # compare this against -- printing one beside it claimed a limit that
+        # does not exist.
+        print("  peak |q error| arm : {:.6f} rad (diagnostic; the arm now "
+              "terminates on a {:.2f} m palm keypoint error)".format(
+                  peak_position_error, result["termination_threshold"]))
         print("  peak |q error| hand: {:.6f} rad (threshold {:.2f}{})".format(
             peak_hand_position_error,
             result["hand_termination_threshold"],

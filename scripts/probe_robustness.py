@@ -537,7 +537,10 @@ def run_worker(args):
     )
     runner = None
     try:
-        expected_obs = 108
+        # The probe perturbs named slices of the observation, so it has to
+        # agree with the layout the environment actually builds -- but that
+        # width is a config value, not a constant of nature.
+        expected_obs = int(env.cfg.env.num_observations)
         if env.num_obs != expected_obs:
             raise ValueError(
                 "Observation layout changed: {} != {}. The noise slices in this "

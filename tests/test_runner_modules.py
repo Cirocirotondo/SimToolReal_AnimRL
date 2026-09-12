@@ -258,25 +258,19 @@ class RunnerModulesTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             update_config_from_dict(restored, {"unknown": 1})
 
-    def test_default_rsi_is_uniform_over_the_reachable_range(self):
-        """Every start the cube survives is equally likely by default.
-
-        The skewed pre-grasp default left the approach at a few percent of
-        episode coverage, which teaches the grasp from an RSI reset but not
-        how to reach it from frame 0.
-        """
+    def test_default_rsi_uses_the_pregrasp_mixture(self):
+        """Most resets practise the difficult closure while some start early."""
         settings = resolve_rsi_settings(self.env_cfg.env, 1107)
-        self.assertEqual(settings, ("uniform", 1106, 740, 0.20))
+        self.assertEqual(settings, ("pregrasp_mixture", 830, 740, 0.20))
         generator = torch.Generator(device="cpu")
         generator.manual_seed(123)
         indices = sample_rsi_indices(
             100000, torch.device("cpu"), *settings, generator=generator
         )
         self.assertGreaterEqual(int(indices.min()), 0)
-        self.assertLessEqual(int(indices.max()), 1106)
-        # 367 of the 1107 valid starts lie at or beyond frame 740.
+        self.assertLessEqual(int(indices.max()), 830)
         pregrasp_fraction = float((indices >= 740).float().mean())
-        self.assertAlmostEqual(pregrasp_fraction, 367.0 / 1107.0, delta=0.01)
+        self.assertAlmostEqual(pregrasp_fraction, 0.80, delta=0.01)
 
     def test_pregrasp_rsi_mixture_respects_ranges_and_probability(self):
         """The skewed sampler stays correct even though it is no longer default."""
@@ -358,11 +352,19 @@ class RunnerModulesTest(unittest.TestCase):
         num_envs = 4
         ones = torch.ones(num_envs)
         infos = {
-            "position_reward": 0.6 * ones,
+            # The keypoint terms now carry the robot half of position_score,
+            # because they are what the reward actually optimises. The joint
+            # values below are deliberately different so a score still built
+            # from them would not go unnoticed.
+            "palm_keypoint_reward": 0.6 * ones,
+            "fingertip_keypoint_reward": 0.4 * ones,
+            "palm_keypoint_error_m": torch.zeros(num_envs),
+            "fingertip_keypoint_error_m": torch.zeros(num_envs),
+            "position_reward": 0.1 * ones,
             "velocity_reward": ones,
             "action_rate_reward": ones,
             "rms_action_rate": torch.zeros(num_envs),
-            "hand_position_reward": 0.4 * ones,
+            "hand_position_reward": 0.2 * ones,
             "hand_velocity_reward": ones,
             "hand_action_rate_reward": ones,
             # Perfect position, worst orientation: the two object terms differ
@@ -454,7 +456,7 @@ class RunnerModulesTest(unittest.TestCase):
             stats["mean_peak_object_com_height_m"], 0.55, places=6
         )
         self.assertAlmostEqual(stats["max_peak_object_com_lift_m"], 0.0, places=6)
-        # 0.5 * (0.5 * (0.6 + 0.4) + 0.8), with no early terminations.
+        # 0.5 * (0.5 * (palm 0.6 + fingertip 0.4) + 0.8), no early terminations.
         self.assertAlmostEqual(stats["position_score"], 0.65, places=6)
 
     def test_zero_object_weights_score_on_robot_pose_alone(self):
@@ -466,6 +468,7 @@ class RunnerModulesTest(unittest.TestCase):
         stats = self._score_with_object_weights(0.0, 0.0)
         self.assertEqual(stats["mean_object_pose_score"], 0.0)
         # Robot pose alone, on the same 0-1 scale: 0.5 * (0.6 + 0.4).
+        # Built from the keypoint terms, not the joint ones (0.1 and 0.2 here).
         self.assertAlmostEqual(stats["position_score"], 0.5, places=6)
         for name, value in stats.items():
             if isinstance(value, float):

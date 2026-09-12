@@ -11,14 +11,15 @@ class ConfigAndDemoTest(unittest.TestCase):
     def test_animrl_configuration_values(self):
         env_cfg = SimToolRealCfg()
         train_cfg = SimToolRealTrainCfg()
-        self.assertEqual(env_cfg.env.num_envs, 4096)
+        self.assertEqual(env_cfg.env.num_envs, 256)
         self.assertEqual(env_cfg.env.episode_length, 360)
-        self.assertEqual(env_cfg.env.num_observations, 108)
         self.assertEqual(env_cfg.env.num_actions, 26)
-        self.assertEqual(env_cfg.env.reference_init_distribution, "uniform")
+        self.assertEqual(
+            env_cfg.env.reference_init_distribution, "pregrasp_mixture"
+        )
         self.assertEqual(env_cfg.env.rsi_early_probability, 0.20)
         self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 740)
-        self.assertEqual(env_cfg.env.rsi_max_start_index, 1106)
+        self.assertEqual(env_cfg.env.rsi_max_start_index, 830)
         self.assertEqual(
             env_cfg.control.action_parameterization, "animrl_residual"
         )
@@ -29,19 +30,39 @@ class ConfigAndDemoTest(unittest.TestCase):
         # makes the step roughly twice as fast; see asset.self_collision.
         self.assertFalse(env_cfg.asset.self_collision)
         self.assertEqual(env_cfg.object.size_m, [0.15, 0.05, 0.05])
+        # 112, not the 108 every run before the object-centric reference used:
+        # both rotations became the continuous 6D representation.
+        self.assertEqual(env_cfg.env.num_observations, 112)
+        # The reachable yaw envelope is asymmetric, so this is a (low, high)
+        # pair rather than a +/- scalar. Measured, not chosen.
+        self.assertEqual(env_cfg.object_randomization.translation_x_min_m, -0.09)
+        self.assertEqual(env_cfg.object_randomization.translation_x_max_m, 0.09)
+        self.assertEqual(env_cfg.object_randomization.translation_y_min_m, 0.0)
+        self.assertEqual(env_cfg.object_randomization.translation_y_max_m, 0.15)
+        self.assertEqual(env_cfg.object_randomization.yaw_min_deg, -22.5)
+        self.assertEqual(env_cfg.object_randomization.yaw_max_deg, 45.0)
         self.assertEqual(env_cfg.object.mass_kg, 0.2)
         self.assertEqual(env_cfg.object.friction, 0.5)
         self.assertEqual(env_cfg.object.restitution, 0.0)
-        # Same weights, widths and terminations as model_7500; the environment
-        # separately tests the new demonstration-aware action-delta error.
+        # The object-centric reward. Palm and fingertip keypoints in the
+        # cuboid's frame carry the tracking; the joint-space terms survive at a
+        # small weight purely to pick one solution out of the arm's null space
+        # and the five spare finger degrees of freedom.
+        self.assertEqual(env_cfg.rewards.palm_keypoint_weight, 0.80)
+        self.assertEqual(env_cfg.rewards.fingertip_keypoint_weight, 0.48)
+        self.assertEqual(env_cfg.rewards.palm_keypoint_std_m, 0.05)
+        self.assertEqual(env_cfg.rewards.fingertip_keypoint_std_m, 0.025)
+        # Must match the value the transform bank was built with, or the
+        # reference keypoints describe a differently shaped hand.
+        self.assertEqual(env_cfg.rewards.palm_lever_arm_m, 0.1)
         expected_robot_rewards = {
-            "position_arm_weight": 0.8,
-            "velocity_arm_weight": 0.2,
+            "position_arm_weight": 0.06,
+            "velocity_arm_weight": 0.0,
             "action_rate_arm_weight": 0.2,
             "position_arm_std_rad": 0.223607,
             "velocity_arm_std_rad_per_s": 1.0,
             "action_rate_arm_std": 5,
-            "position_hand_weight": 0.48,
+            "position_hand_weight": 0.05,
             "velocity_hand_weight": 0.12,
             "action_rate_hand_weight": 0.12,
             "position_hand_std_rad": 0.223607,
@@ -51,9 +72,10 @@ class ConfigAndDemoTest(unittest.TestCase):
         for name, expected in expected_robot_rewards.items():
             self.assertEqual(getattr(env_cfg.rewards, name), expected)
         self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
-        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.2)
+        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.4)
+        # Off: the object-frame fingertip keypoints subsume what this shaped.
         self.assertEqual(
-            env_cfg.rewards.fingertip_object_distance_weight, 0.2
+            env_cfg.rewards.fingertip_object_distance_weight, 0.0
         )
         self.assertEqual(
             env_cfg.rewards.fingertip_object_distance_std_m, 0.04
@@ -68,7 +90,9 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertTrue(env_cfg.termination.object_position_enabled)
         self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.07)
         self.assertTrue(env_cfg.termination.enabled)
-        self.assertEqual(env_cfg.termination.arm_position_threshold_rad, 0.35)
+        # Task space, not joint space: the reward deliberately lets the arm
+        # leave the retargeted joint angles.
+        self.assertEqual(env_cfg.termination.palm_keypoint_threshold_m, 0.20)
         self.assertEqual(env_cfg.termination.hand_position_threshold_rad, 1.35)
         self.assertEqual(env_cfg.termination.grace_steps, 5)
         self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.035)
