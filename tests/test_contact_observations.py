@@ -12,11 +12,13 @@ from simtoolreal_animrl.envs.contact import (
 
 
 class ContactObservationConfigTest(unittest.TestCase):
-    def test_the_block_is_off_by_default_so_existing_runs_are_unchanged(self):
+    def test_the_block_is_off_by_default(self):
         cfg = SimToolRealCfg()
         self.assertFalse(cfg.contact.observe_fingertip_forces)
         self.assertEqual(fingertip_force_observation_dim(cfg.contact), 0)
-        self.assertEqual(cfg.env.num_observations, 108)
+        # 112 since the object-centric reference: both rotations in the
+        # observation became the continuous 6D representation.
+        self.assertEqual(cfg.env.num_observations, 112)
 
     def test_three_fingertips_add_nine_numbers(self):
         cfg = SimToolRealCfg()

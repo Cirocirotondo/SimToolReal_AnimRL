@@ -5,20 +5,21 @@ from .base_config import BaseEnvCfg, BaseTrainCfg
 
 class SimToolRealCfg(BaseEnvCfg):
     class env(BaseEnvCfg.env):
-        num_envs = 4096
+        num_envs = 256
         # Match the 2026-08-28 no_object_reward reference run.
         episode_length = 360
         num_actions = 26
-        # Existing 79D proprioception, followed by palm pose in the robot-base
-        # frame (3+4), five fingertip positions relative to the palm (15), and
-        # cube orientation/center relative to the palm (4+3).
-        num_observations = 108
+        # 79D proprioception, followed by palm pose in the robot-base frame
+        # (3 + 6), five fingertip positions relative to the palm (15), and the
+        # cuboid's orientation/centre relative to the palm (6 + 3).
+        #
+        # Both rotations are the continuous 6D representation rather than
+        # quaternions. This is 112 where every run before the object-centric
+        # reference was 108, so no earlier checkpoint loads into it -- which is
+        # fine, because every run here is trained from scratch.
+        num_observations = 112
         num_privileged_obs = None
-        reference_state_initialization = True
-        # The reference run sampled uniformly from every valid start frame.
-        # The demonstration has indices 0..1107 and 1107 is reserved for the
-        # reference-end timeout, hence the inclusive maximum start is 1106.
-        reference_init_distribution = "uniform"
+        reference_init_distribution = "pregrasp_mixture"
         rsi_early_probability = 0.20 # used only when reference_init_distribution = "pregrasp_mixture"
         # Perturbation applied to the reference pose at reset, in radians. The
         # real arm can never be placed exactly on a demonstration frame, so a
@@ -34,7 +35,7 @@ class SimToolRealCfg(BaseEnvCfg):
         # exact values the demonstration carries.
         rsi_velocity_noise_scale = 0.0
         rsi_pregrasp_start_index = 740 # proximity reward starts from this demonstration index
-        rsi_max_start_index = 1106
+        rsi_max_start_index = 830
 
     class domain_randomization:
         # Per-environment physical variation, sampled once at creation.
@@ -102,6 +103,47 @@ class SimToolRealCfg(BaseEnvCfg):
         # behaviour that survives the transfer. Fixed per environment rather
         # than per step, because per-step variation is jitter and averages out.
         action_delay_max_steps = 0
+
+    class object_randomization:
+        # Where the cuboid may be, per episode. The reference is retargeted for
+        # each sampled pose offline; see scripts/build_transform_bank.py.
+        #
+        # The yaw range is a (low, high) pair rather than a +/- scalar because
+        # the arm's feasible envelope is genuinely not symmetric. Measured at
+        # this translation, accepting a transform only if its whole clip solves,
+        # stays off the joint limits, and stays under half the arm's joint
+        # velocity limit:
+        #
+        #   yaw    -30   -15    0   +15   +30   +45   +60   +75   +90
+        #   accept 69%   93%  100%  96%   84%   63%   49%   63%   75%
+        #
+        # A symmetric range would clamp to about +/-15 degrees and discard the
+        # whole reachable positive side. Kept wide deliberately: every clip the
+        # bank admits is feasible and trackable, the sampling density is simply
+        # thinner above +30. If a run generalises poorly at high yaw, that
+        # thinness is the first thing to suspect -- a single scalar score
+        # averages it away.
+        #
+        # Velocity is what binds, not reach. An earlier range was chosen from a
+        # sweep that checked only reachability and joint limits; it admitted
+        # clips demanding 12.2 rad/s of a joint capped at pi.
+        # Continuous per-episode sampling range. The offline bank is only the
+        # nearest-neighbour source for arm IK; the physical cuboid uses the
+        # exact continuously sampled transform.
+        translation_x_min_m = -0.09
+        translation_x_max_m = 0.09
+        translation_y_min_m = 0.00
+        translation_y_max_m = 0.15
+        yaw_min_deg = -22.5
+        yaw_max_deg = 45.0
+        # Converts yaw separation to an equivalent Cartesian distance for the
+        # nearest-bank lookup: 10 degrees is about 1.75 cm at 0.1 m.
+        nearest_yaw_lever_arm_m = 0.10
+        # Relative to the repository root. Built offline rather than at startup:
+        # solving hundreds of clips takes minutes, and a transform must be
+        # proven feasible over the clip's whole length before an episode is
+        # allowed to start inside it.
+        bank_path = "banks/stage1.pt"
 
     class asset:
         file = "assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf"
@@ -177,7 +219,12 @@ class SimToolRealCfg(BaseEnvCfg):
         gate_object_reward = True
 
     class table:
-        size_m = [0.475, 0.4, 0.3]
+        # Grown from 0.475 x 0.4 for the randomised cuboid pose. The bar's
+        # in-plane half-diagonal is 0.079 m, so at +/-0.20 m of translation it
+        # reaches 0.279 m from the nominal centre, which is itself offset from
+        # the table centre by (-0.018, -0.020). The old top would have let the
+        # bar overhang its edge and tip before the episode began.
+        size_m = [0.75, 0.75, 0.3]
         surface_below_robot_base_m = 0.035
         friction = 0.5
         restitution = 0.0
@@ -188,15 +235,38 @@ class SimToolRealCfg(BaseEnvCfg):
         # At z=0 the demonstrated wrist intersects the ground around RSI 732.
         pos = [0.0, 0.6, 0.55]
         rot = [0.0, 0.0, 0.0, 1.0]
-        # AnimRL-style fixed default pose used by the residual action mapping.
-        # This is sample zero of the processed demonstration.
+        # Fixed default pose used by the residual action mapping:
+        # q_target = default + scale * action.
+        #
+        # The MEAN pose over the transform bank, not demonstration frame zero
+        # and not the bank's mid-range.
+        #
+        # Retargeting for a cuboid anywhere in the sampled envelope drives the
+        # arm far wider than the single recorded clip did -- wrist_1 alone spans
+        # 5.3 rad across the bank against the demonstration's 0.59 -- so the
+        # default matters more than it used to. A policy starts at action mean
+        # zero, which puts the arm exactly here, so what matters is the distance
+        # to a TYPICAL reference pose, not to the furthest one:
+        #
+        #   default          mean |a|   p50    p95    max
+        #   demo frame 0        5.79    6.16   8.99  14.86
+        #   bank mid-range      6.12    6.13   7.78  10.55
+        #   bank mean           4.10    3.62   7.36  15.87
+        #
+        # Mid-range was tried first and is a trap: it minimises the worst case
+        # and leaves the typical one slightly worse, pushing wrist_1's median
+        # residual from 1.86 to 6.01. Every episode then terminated early
+        # (measured: early fraction 1.00 against 0.59 with demo frame 0),
+        # because an untrained policy sits 1.5 rad from every reference.
+        #
+        # Recompute this whenever the bank's sampling range changes.
         default_arm_joint_angles = [
-            -1.5707905480,
-            -1.0499914063,
-            1.9499972045,
-            -0.9000079470,
-            1.5709867791,
-            -2.6179869035,
+            -1.7809368836,
+            -1.1789974103,
+            1.8940494728,
+            -0.6477838573,
+            1.1408713253,
+            -3.6591747714,
         ]
         # Sample zero of the demonstration for the 20 DG5F joints, in the
         # rj_dg_<finger>_<joint> order of controller.HAND_JOINT_NAMES.
@@ -275,19 +345,41 @@ class SimToolRealCfg(BaseEnvCfg):
         observation_clip = 5.0
 
     class rewards:
-        # Same weights and Gaussian widths as no_object_reward. Arm and hand
-        # terms sum to a maximum per-step reward of 1.92.
-        position_arm_weight = 0.8
-        velocity_arm_weight = 0.2
+        # --- object-centric tracking, the dominant terms -------------------
+        # The hand as nine keypoints measured in the cuboid's frame: the palm
+        # origin plus three points at a lever arm along its axes, and the five
+        # fingertips. Palm inherits the arm's old 0.8 and fingertips the hand's
+        # old 0.48, so the relative calibration this project already trusts
+        # carries over instead of being invented fresh.
+        palm_keypoint_weight = 0.80
+        fingertip_keypoint_weight = 0.48
+        # Sigmas are RMS keypoint distances in metres. 0.05 matches
+        # object_position_std_m; 0.025 is the bar's short half-extent, because
+        # the grasp needs more precision than the approach.
+        palm_keypoint_std_m = 0.05
+        fingertip_keypoint_std_m = 0.025
+        # The lever arm is the exchange rate between a metre of palm position
+        # error and a radian of palm rotation error: a point this far out moves
+        # by L * theta. 0.1 m reproduces the 0.05 m / 0.5 rad ratio the object
+        # terms already use. Must match the value the bank was built with.
+        palm_lever_arm_m = 0.1
+
+        # --- joint space, demoted to null-space selection -------------------
+        # These no longer do the tracking. A 6-DOF arm has a null space for a
+        # given palm pose and several IK branches; each finger has four joints
+        # serving a 3D fingertip target, so five finger degrees of freedom are
+        # otherwise unconstrained. Small but non-zero is what picks one
+        # solution, which is all that is wanted from them now.
+        position_arm_weight = 0.06
+        velocity_arm_weight = 0.0
         action_rate_arm_weight = 0.2
         position_arm_std_rad = 0.223607
         velocity_arm_std_rad_per_s = 1.0
-        # Demonstration-aware action-delta tracking, per block. The error is
-        # (a_t - a_{t-1}) - dq_demo * dt / action_scale because policy actions
-        # are dimensionless residuals rather than joint angles.
+        # Pure command smoothness for the arm: unlike joint-space imitation,
+        # this remains meaningful when the palm trajectory is retargeted.
         action_rate_arm_std = 5
 
-        position_hand_weight = 0.48
+        position_hand_weight = 0.05
         velocity_hand_weight = 0.12
         action_rate_hand_weight = 0.12
         position_hand_std_rad = 0.223607
@@ -321,7 +413,7 @@ class SimToolRealCfg(BaseEnvCfg):
         # Cube position tracking rewards
         object_scale = 1
         object_position_weight = 0.8 * object_scale
-        object_orientation_weight = 0.2 * object_scale
+        object_orientation_weight = 0.4 * object_scale
         object_position_std_m = 0.05
         object_orientation_std_rad = 0.5
 
@@ -332,7 +424,23 @@ class SimToolRealCfg(BaseEnvCfg):
 
     class termination:
         enabled = True
-        arm_position_threshold_rad = 0.35
+        # Task space, not joint space. The reward deliberately allows the arm to
+        # leave the retargeted joint angles -- that null-space freedom is the
+        # point of tracking a palm pose rather than six joints -- so the old
+        # 0.35 rad joint threshold would have ended episodes the reward was
+        # perfectly happy with.
+        #
+        # The error is the RMS over all four palm keypoints, so it catches a
+        # palm that is in the right place but turned the wrong way.
+        #
+        # Calibrated rather than guessed. Perturbing the retargeted arm pose so
+        # that exactly one joint sits at the old 0.35 rad limit moves the palm
+        # keypoints by a median of 0.213 m (p25 0.156, p75 0.277). So 0.20 m
+        # reproduces roughly the old criterion's strictness, holding the
+        # early-termination curriculum constant while changing its definition.
+        # The 0.12 m first written here sat at the 12th percentile and would
+        # have terminated episodes far sooner than any run before it.
+        palm_keypoint_threshold_m = 0.20
         hand_position_threshold_rad = 1.35
         # End an episode when the physical cube remains farther than this
         # Euclidean center distance from the demonstrated cube target.

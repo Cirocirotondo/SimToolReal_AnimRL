@@ -67,6 +67,33 @@ class DeterministicEvaluator:
         )
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(int(seed))
+        bank = getattr(self.env, "transform_bank", None)
+        if bank is not None:
+            transform_count = int(bank.transform_count)
+            # Evenly cover the bank for the fixed suite; use a second seeded
+            # cohort for the configured-RSI suite.  Both remain identical at
+            # every checkpoint.
+            self.fixed_transform_indices = torch.linspace(
+                0, transform_count - 1, self.env.num_envs,
+                device=self.env.device,
+            ).round().long()
+            self.uniform_transform_indices = torch.randint(
+                0, transform_count, (self.env.num_envs,),
+                device=self.env.device, generator=generator,
+            )
+            # Environment zero is the stable arm-action diagnostic requested
+            # for checkpoint-to-checkpoint comparisons.
+            identity = (
+                bank.translation[:, :2].square().sum(dim=1)
+                + (0.1 * bank.yaw_rad).square()
+            ).argmin()
+            self.fixed_transform_indices[0] = identity
+            if self.arm_action_plot_path is not None:
+                self.fixed_indices[0] = min(740, self.env.rsi_max_start_index)
+        else:
+            # Keep small unit-test/stub environments compatible.
+            self.fixed_transform_indices = None
+            self.uniform_transform_indices = None
         # Keep the historical "uniform" metric prefix for log compatibility,
         # but this cohort now follows the configured training RSI distribution.
         self.uniform_indices = sample_rsi_indices(
@@ -108,12 +135,25 @@ class DeterministicEvaluator:
                         self.arm_action_plot_path.parent, env_idx=0
                     )
                 if plotter is None:
-                    fixed = self._evaluate_suite(runner, self.fixed_indices)
+                    if self.fixed_transform_indices is None:
+                        fixed = self._evaluate_suite(runner, self.fixed_indices)
+                    else:
+                        fixed = self._evaluate_suite(
+                            runner, self.fixed_indices,
+                            self.fixed_transform_indices
+                        )
                 else:
                     fixed = self._evaluate_suite(
-                        runner, self.fixed_indices, plotter=plotter
+                        runner, self.fixed_indices,
+                        self.fixed_transform_indices, plotter=plotter
                     )
-                uniform = self._evaluate_suite(runner, self.uniform_indices)
+                if self.uniform_transform_indices is None:
+                    uniform = self._evaluate_suite(runner, self.uniform_indices)
+                else:
+                    uniform = self._evaluate_suite(
+                        runner, self.uniform_indices,
+                        self.uniform_transform_indices
+                    )
             finally:
                 runner.train_mode()
                 if pin_assist_scale is not None:
@@ -128,17 +168,22 @@ class DeterministicEvaluator:
         )
         return stats
 
-    def _reset_to_indices(self, indices):
+    def _reset_to_indices(self, indices, transform_indices=None):
         env_ids = torch.arange(
             self.env.num_envs, device=self.env.device, dtype=torch.long
         )
-        self.env.reset_idx(env_ids, indices)
+        if transform_indices is None:
+            self.env.reset_idx(env_ids, indices)
+        else:
+            self.env.reset_idx(env_ids, indices, transform_indices)
         self.env.gym.refresh_dof_state_tensor(self.env.sim)
         self.env.compute_observations()
         return self.env.get_observations()
 
-    def _evaluate_suite(self, runner, reference_indices, plotter=None):
-        observations = self._reset_to_indices(reference_indices)
+    def _evaluate_suite(
+        self, runner, reference_indices, transform_indices=None, plotter=None
+    ):
+        observations = self._reset_to_indices(reference_indices, transform_indices)
         plotter_active = plotter is not None
         if plotter_active:
             plotter.start_episode("episode_00", self.env)
@@ -150,6 +195,8 @@ class DeterministicEvaluator:
         )
         reward_sum = torch.zeros_like(episode_steps)
         position_reward_sum = torch.zeros_like(episode_steps)
+        palm_keypoint_reward_sum = torch.zeros_like(episode_steps)
+        fingertip_keypoint_reward_sum = torch.zeros_like(episode_steps)
         velocity_reward_sum = torch.zeros_like(episode_steps)
         action_rate_reward_sum = torch.zeros_like(episode_steps)
         hand_position_reward_sum = torch.zeros_like(episode_steps)
@@ -222,6 +269,12 @@ class DeterministicEvaluator:
                 episode_steps += active_float
                 reward_sum += rewards * active_float
                 position_reward_sum += infos["position_reward"] * active_float
+                palm_keypoint_reward_sum += (
+                    infos["palm_keypoint_reward"] * active_float
+                )
+                fingertip_keypoint_reward_sum += (
+                    infos["fingertip_keypoint_reward"] * active_float
+                )
                 velocity_reward_sum += infos["velocity_reward"] * active_float
                 action_rate_reward_sum += (
                     infos["action_rate_reward"] * active_float
@@ -303,6 +356,8 @@ class DeterministicEvaluator:
         # still active as a failed evaluation rather than silently ignoring it.
         early |= active
         lengths = episode_steps.clamp_min(1.0)
+        per_env_palm_keypoint_reward = palm_keypoint_reward_sum / lengths
+        per_env_fingertip_keypoint_reward = fingertip_keypoint_reward_sum / lengths
         per_env_position_reward = position_reward_sum / lengths
         per_env_hand_position_reward = hand_position_reward_sum / lengths
         per_env_object_position_reward = object_position_reward_sum / lengths
@@ -329,8 +384,14 @@ class DeterministicEvaluator:
             per_env_object_pose_score = torch.zeros_like(
                 per_env_object_position_reward
             )
+        # Score the checkpoint on what the policy is actually asked to do.
+        # These were the arm and hand JOINT Gaussians, which now carry weights
+        # of 0.06 and 0.05 against the keypoint terms' 0.80 and 0.48 -- so
+        # best_model.pt would have been selected by tracking the policy is
+        # deliberately not optimising for.
         mean_robot_position_reward = 0.5 * (
-            per_env_position_reward.mean() + per_env_hand_position_reward.mean()
+            per_env_palm_keypoint_reward.mean()
+            + per_env_fingertip_keypoint_reward.mean()
         )
         if object_pose_rewarded:
             mean_pose_score = 0.5 * (
@@ -340,6 +401,12 @@ class DeterministicEvaluator:
             mean_pose_score = mean_robot_position_reward
         return {
             "mean_reward": float((reward_sum / lengths).mean()),
+            "mean_palm_keypoint_reward": float(
+                per_env_palm_keypoint_reward.mean()
+            ),
+            "mean_fingertip_keypoint_reward": float(
+                per_env_fingertip_keypoint_reward.mean()
+            ),
             "mean_position_reward": float(per_env_position_reward.mean()),
             "mean_velocity_reward": float(
                 (velocity_reward_sum / lengths).mean()

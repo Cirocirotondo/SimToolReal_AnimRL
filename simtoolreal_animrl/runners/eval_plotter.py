@@ -185,11 +185,11 @@ class EvaluationPlotter:
         self._proximity_std_m = float(env.proximity_std_m)
         self._proximity_weight = float(env.proximity_weight)
         enabled = bool(env.cfg.termination.enabled)
-        self._position_threshold = (
-            float(env.cfg.termination.arm_position_threshold_rad)
-            if enabled
-            else None
-        )
+        # The arm no longer terminates on joint error, so there is no radian
+        # threshold to draw beside the joint-error trace. The criterion is the
+        # palm keypoint RMS in metres, which lives on its own axis; drawing the
+        # old line here would label a limit that no longer exists.
+        self._position_threshold = None
         self._hand_position_threshold = (
             float(env.cfg.termination.hand_position_threshold_rad)
             if enabled

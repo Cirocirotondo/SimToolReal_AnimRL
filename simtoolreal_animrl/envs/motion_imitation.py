@@ -46,6 +46,30 @@ from simtoolreal_animrl.envs.object_assist import (
 )
 from simtoolreal_animrl.envs.proximity import fingertip_cuboid_proximity
 from simtoolreal_animrl.envs.rsi import resolve_rsi_settings, sample_rsi_indices
+from simtoolreal_animrl.envs.cuboid_symmetry import (
+    apply_cuboid_symmetry,
+    canonicalize_cuboid_orientation,
+    cuboid_rotation_symmetries,
+)
+from simtoolreal_animrl.envs.keypoints import (
+    hand_keypoints,
+    keypoint_gaussian,
+    keypoint_tracking_error,
+    keypoints_in_object_frame,
+    split_palm_and_fingertips,
+)
+from simtoolreal_animrl.envs.rotations import (
+    normalize_canonical_quaternion as _normalize_canonical_quaternion,
+    quat_conjugate as _quat_conjugate,
+    quat_multiply as _quat_multiply,
+    quat_rotate as _quat_rotate,
+    quat_rotate_inverse as _quat_rotate_inverse,
+    quat_to_rotation_6d,
+)
+from simtoolreal_animrl.envs.transform_bank import (
+    TransformBank,
+    nearest_transform_indices,
+)
 
 
 # The fixed wrist -> mount -> base -> palm chain is collapsed while loading the
@@ -74,42 +98,6 @@ FINGERTIP_OFFSETS = (
     (0.0, 0.0, 0.0255),
     (0.0, 0.0, 0.0363),
 )
-
-
-def _quat_conjugate(quaternion: torch.Tensor) -> torch.Tensor:
-    return torch.cat((-quaternion[..., :3], quaternion[..., 3:4]), dim=-1)
-
-
-def _quat_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    """Hamilton product for xyzw quaternions."""
-    left_xyz, left_w = left[..., :3], left[..., 3:4]
-    right_xyz, right_w = right[..., :3], right[..., 3:4]
-    xyz = (
-        left_w * right_xyz
-        + right_w * left_xyz
-        + torch.cross(left_xyz, right_xyz, dim=-1)
-    )
-    w = left_w * right_w - (left_xyz * right_xyz).sum(dim=-1, keepdim=True)
-    return torch.cat((xyz, w), dim=-1)
-
-
-def _quat_rotate(quaternion: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
-    """Rotate a vector by a unit xyzw quaternion without constructing matrices."""
-    quaternion_xyz = quaternion[..., :3]
-    uv = torch.cross(quaternion_xyz, vector, dim=-1)
-    uuv = torch.cross(quaternion_xyz, uv, dim=-1)
-    return vector + 2.0 * (quaternion[..., 3:4] * uv + uuv)
-
-
-def _quat_rotate_inverse(
-    quaternion: torch.Tensor, vector: torch.Tensor
-) -> torch.Tensor:
-    return _quat_rotate(_quat_conjugate(quaternion), vector)
-
-
-def _normalize_canonical_quaternion(quaternion: torch.Tensor) -> torch.Tensor:
-    quaternion = torch.nn.functional.normalize(quaternion, dim=-1)
-    return torch.where(quaternion[..., 3:4] < 0.0, -quaternion, quaternion)
 
 
 class MotionImitationEnv:
@@ -413,6 +401,7 @@ class MotionImitationEnv:
                     self.reference.sample_count
                 )
             )
+        self._load_transform_bank()
         (
             self.rsi_distribution,
             self.rsi_max_start_index,
@@ -471,6 +460,50 @@ class MotionImitationEnv:
         self._acquire_tensors()
         self._allocate_buffers()
         self.reset()
+
+    def _load_transform_bank(self) -> None:
+        """Load the retargeted reference clips this run draws episodes from.
+
+        The bank is an offline artefact rather than a startup step: solving the
+        inverse kinematics for hundreds of transforms takes minutes, and a
+        transform has to be proven feasible over the clip's *whole* length
+        before any episode is allowed to start inside it. Building it separately
+        also keeps ``pytorch_kinematics`` out of the training process.
+        """
+        randomization = self.cfg.object_randomization
+        bank_path = ROOT_DIR / str(randomization.bank_path)
+        if not bank_path.is_file():
+            raise FileNotFoundError(
+                "No transform bank at {}. Build one first:\n"
+                "    PYTHONPATH=. python scripts/build_transform_bank.py "
+                "--output {}".format(bank_path, bank_path)
+            )
+        bank = TransformBank.load(bank_path)
+        if bank.sample_count != self.reference.sample_count:
+            raise ValueError(
+                "The transform bank has {} frames but the demonstration has "
+                "{}. The bank was built from a different clip.".format(
+                    bank.sample_count, self.reference.sample_count
+                )
+            )
+        lever_arm = float(self.cfg.rewards.palm_lever_arm_m)
+        if bank.reference_keypoints.shape[-2:] != (9, 3):
+            raise ValueError("The transform bank carries malformed keypoints")
+        self.transform_bank = bank.to(device=self.device, dtype=torch.float32)
+        self.palm_lever_arm_m = lever_arm
+        print(
+            "Transform bank: {} transforms, {:.1f}% of sampled transforms were "
+            "feasible".format(
+                self.transform_bank.transform_count,
+                100.0 * self.transform_bank.acceptance,
+            )
+        )
+
+        # The cuboid's own symmetries, derived from its extents rather than
+        # typed: eight for a bar with two equal sides. See envs/cuboid_symmetry.
+        self.cuboid_symmetries = cuboid_rotation_symmetries(
+            [0.5 * float(value) for value in self.cfg.object.size_m]
+        ).to(device=self.device, dtype=torch.float32)
 
     def _create_sim(self):
         params = gymapi.SimParams()
@@ -1242,6 +1275,19 @@ class MotionImitationEnv:
             self.num_envs, dtype=torch.long, device=self.device
         )
         self.reference_index = torch.zeros_like(self.episode_length_buf)
+        # Which transform of the scene this episode is playing, and which of the
+        # cuboid's symmetry relabellings its frame was resolved to. Both are
+        # drawn once at reset and held: the symmetry choice in particular must
+        # not be recomputed per step, because the bar turns while it is lifted
+        # and a re-choice can flip the reference frame mid-grasp.
+        self.transform_index = torch.zeros_like(self.episode_length_buf)
+        self.episode_translation = torch.zeros(
+            self.num_envs, 3, dtype=torch.float32, device=self.device
+        )
+        self.episode_yaw_rad = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.symmetry_index = torch.zeros_like(self.episode_length_buf)
         self.arm_violation_steps = torch.zeros_like(self.episode_length_buf)
         self.hand_violation_steps = torch.zeros_like(self.episode_length_buf)
         self.object_violation_steps = torch.zeros_like(self.episode_length_buf)
@@ -1276,6 +1322,10 @@ class MotionImitationEnv:
             )
             for name in (
                 "reward",
+                "palm_keypoint_reward",
+                "fingertip_keypoint_reward",
+                "palm_keypoint_error_m",
+                "fingertip_keypoint_error_m",
                 "position_reward",
                 "velocity_reward",
                 "action_rate_reward",
@@ -1349,6 +1399,54 @@ class MotionImitationEnv:
             fingertip_orientations, self.fingertip_offsets
         )
 
+    def _palm_pose_world(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The palm frame in world coordinates, from the wrist plus a fixed offset.
+
+        Isaac Gym collapses the fixed joints between ``wrist_3_link`` and the
+        palm, so the palm is not a body it reports; the offset is re-applied
+        here exactly as the MuJoCo runner does.
+        """
+        wrist = self.rigid_body_state[:, self.wrist_body_index]
+        wrist_orientation = _normalize_canonical_quaternion(wrist[:, 3:7])
+        palm_position_world = wrist[:, 0:3] + _quat_rotate(
+            wrist_orientation, self.palm_position_in_wrist
+        )
+        palm_orientation_world = _normalize_canonical_quaternion(
+            _quat_multiply(wrist_orientation, self.palm_orientation_in_wrist)
+        )
+        return palm_position_world, palm_orientation_world
+
+    def canonical_cube_orientation(self) -> torch.Tensor:
+        """The cuboid's orientation in the labelling the demonstration used.
+
+        Applies the symmetry element chosen at reset. Choosing here instead,
+        every step, is a bug: the bar turns as it is lifted, and re-choosing was
+        measured to flip the representative partway through the motion, moving
+        the reference frame 0.35 m in the middle of the grasp.
+        """
+        return apply_cuboid_symmetry(
+            _normalize_canonical_quaternion(self.cube_orientation),
+            self.cuboid_symmetries,
+            self.symmetry_index,
+        )
+
+    def _hand_keypoints_cube_frame(self) -> torch.Tensor:
+        """``(num_envs, 9, 3)`` hand keypoints measured from the cuboid.
+
+        Anchored on the cuboid's *measured* pose, not on the reference one, so
+        the term still points the right way when the bar has been nudged.
+        """
+        palm_position_world, palm_orientation_world = self._palm_pose_world()
+        keypoints = hand_keypoints(
+            palm_position_world,
+            palm_orientation_world,
+            self._fingertip_positions_world(),
+            self.palm_lever_arm_m,
+        )
+        return keypoints_in_object_frame(
+            keypoints, self.cube_position, self.canonical_cube_orientation()
+        )
+
     def _task_space_observation_components(self) -> Tuple[torch.Tensor, ...]:
         """Return the five task-space blocks appended to the old 79D.
 
@@ -1356,19 +1454,7 @@ class MotionImitationEnv:
         positions and cube pose are expressed relative to the palm frame. Cube
         and palm velocities are deliberately absent from this 108D experiment.
         """
-        wrist = self.rigid_body_state[:, self.wrist_body_index]
-        wrist_position = wrist[:, 0:3]
-        wrist_orientation = _normalize_canonical_quaternion(wrist[:, 3:7])
-
-        palm_offset_world = _quat_rotate(
-            wrist_orientation, self.palm_position_in_wrist
-        )
-        palm_position_world = wrist_position + palm_offset_world
-        palm_orientation_world = _normalize_canonical_quaternion(
-            _quat_multiply(
-                wrist_orientation, self.palm_orientation_in_wrist
-            )
-        )
+        palm_position_world, palm_orientation_world = self._palm_pose_world()
         if self.critic_force_observation_dim:
             # Cached here, where the palm frame is already computed, and
             # consumed by compute_observations below.
@@ -1396,7 +1482,7 @@ class MotionImitationEnv:
         cube_orientation_palm = _normalize_canonical_quaternion(
             _quat_multiply(
                 _quat_conjugate(palm_orientation_world),
-                _normalize_canonical_quaternion(self.cube_orientation),
+                self.canonical_cube_orientation(),
             )
         )
 
@@ -1405,11 +1491,17 @@ class MotionImitationEnv:
             palm_orientation_world.unsqueeze(1).expand(-1, 5, -1),
             fingertip_positions_world - palm_position_world.unsqueeze(1),
         ).reshape(self.num_envs, 15)
+        # Both rotations go out as the continuous 6D representation rather than
+        # as quaternions. A quaternion is a double cover, so q and -q are the
+        # same rotation and the w >= 0 canonicalisation only moves the
+        # discontinuity to w == 0 rather than removing it. That seam is a real
+        # cost here: yaw is randomised over 112 degrees and the bar turns while
+        # it is lifted, so the network would meet it often.
         components = (
             palm_position_robot,
-            palm_orientation_robot,
+            quat_to_rotation_6d(palm_orientation_robot),
             fingertip_positions_palm,
-            cube_orientation_palm,
+            quat_to_rotation_6d(cube_orientation_palm),
             cube_center_palm,
         )
         if not self.contact_observation_enabled:
@@ -1471,8 +1563,12 @@ class MotionImitationEnv:
     ) -> None:
         destination[:, self.demo_to_asset_tensor] = values
 
-    def _cube_reference_root_states(self, sample) -> torch.Tensor:
-        """Convert recorded UR-base object state to Isaac Gym world state."""
+    def _cube_reference_root_states(
+        self, sample, env_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Convert a bank track to the episode's exact continuous transform."""
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
         position = (
             self.robot_base_position
             + sample.cube_pose[:, :3] * self.world_axis_sign
@@ -1483,12 +1579,50 @@ class MotionImitationEnv:
         quaternion_world = torch.nn.functional.normalize(
             quaternion_world, dim=1
         )
+        bank_yaw = self.transform_bank.yaw_rad[self.transform_index[env_ids]]
+        bank_translation = self.transform_bank.translation[
+            self.transform_index[env_ids]
+        ]
+        delta_yaw = self.episode_yaw_rad[env_ids] - bank_yaw
+        half = 0.5 * delta_yaw
+        delta_quaternion = torch.stack(
+            (
+                torch.zeros_like(half),
+                torch.zeros_like(half),
+                torch.sin(half),
+                torch.cos(half),
+            ),
+            dim=1,
+        )
+        # At frame zero the cuboid centre is the transform pivot, so the bank
+        # centre differs from the demo centre by exactly bank_translation.
+        bank_start_sample = self.transform_bank.sample(
+            self.transform_index[env_ids], torch.zeros_like(env_ids)
+        )
+        bank_start_position = (
+            self.robot_base_position
+            + bank_start_sample.cube_pose[:, :3] * self.world_axis_sign
+        )
+        actual_start_position = (
+            bank_start_position - bank_translation
+            + self.episode_translation[env_ids]
+        )
+        position = actual_start_position + _quat_rotate(
+            delta_quaternion, position - bank_start_position
+        )
+        quaternion_world = _quat_multiply(delta_quaternion, quaternion_world)
+        linear_velocity = _quat_rotate(
+            delta_quaternion, sample.cube_linear_velocity * self.world_axis_sign
+        )
+        angular_velocity = _quat_rotate(
+            delta_quaternion, sample.cube_angular_velocity * self.world_axis_sign
+        )
         return torch.cat(
             (
                 position,
                 quaternion_world,
-                sample.cube_linear_velocity * self.world_axis_sign,
-                sample.cube_angular_velocity * self.world_axis_sign,
+                linear_velocity,
+                angular_velocity,
             ),
             dim=1,
         )
@@ -1503,7 +1637,7 @@ class MotionImitationEnv:
         """
         cube_actor_ids = self.cube_actor_indices[env_ids].contiguous()
         self.root_state_all[cube_actor_ids.long()] = (
-            self._cube_reference_root_states(sample)
+            self._cube_reference_root_states(sample, env_ids)
         )
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
@@ -1666,17 +1800,68 @@ class MotionImitationEnv:
         next_indices = (self.reference_index + 1).clamp(
             max=self.reference.last_index
         )
-        target = self.reference.sample(next_indices).q
+        target = self.transform_bank.sample(self.transform_index, next_indices).q
         return self.positions_to_actions(target), target
 
     def reset_idx(
         self,
         env_ids: torch.Tensor,
         reference_indices: Optional[torch.Tensor] = None,
+        transform_indices: Optional[torch.Tensor] = None,
     ) -> None:
         if env_ids.numel() == 0:
             return
         env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        if transform_indices is None:
+            randomization = self.cfg.object_randomization
+            count = env_ids.numel()
+            x = torch.empty(count, device=self.device).uniform_(
+                float(randomization.translation_x_min_m),
+                float(randomization.translation_x_max_m),
+            )
+            y = torch.empty(count, device=self.device).uniform_(
+                float(randomization.translation_y_min_m),
+                float(randomization.translation_y_max_m),
+            )
+            yaw = torch.empty(count, device=self.device).uniform_(
+                math.radians(float(randomization.yaw_min_deg)),
+                math.radians(float(randomization.yaw_max_deg)),
+            )
+            episode_translation = torch.stack(
+                (x, y, torch.zeros_like(x)), dim=1
+            )
+
+            transform_indices = nearest_transform_indices(
+                episode_translation,
+                yaw,
+                self.transform_bank.translation,
+                self.transform_bank.yaw_rad,
+                float(randomization.nearest_yaw_lever_arm_m),
+            )
+            self.episode_translation[env_ids] = episode_translation
+            self.episode_yaw_rad[env_ids] = yaw
+        else:
+            # Explicit transforms exist so an evaluator can sweep the envelope
+            # deterministically -- a success rate that averages over a randomly
+            # drawn set of poses hides where the envelope gives out.
+            transform_indices = transform_indices.to(
+                device=self.device, dtype=torch.long
+            )
+            if transform_indices.ndim == 0:
+                transform_indices = transform_indices.repeat(env_ids.numel())
+            if transform_indices.shape != (env_ids.numel(),):
+                raise ValueError("transform_indices has the wrong shape")
+            if torch.any(transform_indices < 0) or torch.any(
+                transform_indices >= self.transform_bank.transform_count
+            ):
+                raise ValueError("Transform index outside the bank")
+            # Explicit evaluator/debug selections replay the exact bank pose.
+            self.episode_translation[env_ids] = (
+                self.transform_bank.translation[transform_indices]
+            )
+            self.episode_yaw_rad[env_ids] = (
+                self.transform_bank.yaw_rad[transform_indices]
+            )
         if reference_indices is None:
             reference_indices = sample_rsi_indices(
                 env_ids.numel(),
@@ -1705,8 +1890,9 @@ class MotionImitationEnv:
                     "RSI indices must lie in [0, {}]".format(max_start)
                 )
 
-        sample = self.reference.sample(reference_indices)
+        sample = self.transform_bank.sample(transform_indices, reference_indices)
         self.reference_index[env_ids] = reference_indices
+        self.transform_index[env_ids] = transform_indices
         self.episode_length_buf[env_ids] = 0
         self.arm_violation_steps[env_ids] = 0
         self.hand_violation_steps[env_ids] = 0
@@ -1756,6 +1942,22 @@ class MotionImitationEnv:
             actor_ids = torch.cat((actor_ids, self.ghost_actor_indices[env_ids]))
         self._upload_dof_state(actor_ids)
         self._reset_cube_from_reference(env_ids, sample)
+        # Resolve the cuboid's frame ambiguity once, towards the pose this
+        # episode was reset to, and hold the choice for the episode. In
+        # simulation the cuboid is placed at exactly the reference pose, so this
+        # selects the identity and changes nothing; it is insurance for a real
+        # pose estimate, which is free to return any of the eight relabellings
+        # of a bar that never moved.
+        reference_root = self._cube_reference_root_states(sample, env_ids)
+        _, chosen_symmetry = canonicalize_cuboid_orientation(
+            _normalize_canonical_quaternion(self.cube_orientation[env_ids]),
+            self.cuboid_symmetries,
+            _normalize_canonical_quaternion(reference_root[:, 3:7]),
+            return_index=True,
+        )
+        self.symmetry_index[env_ids] = chosen_symmetry.to(
+            dtype=self.symmetry_index.dtype
+        )
         reset_object_height = self.cube_position[env_ids, 2]
         self.episode_initial_object_com_height_m[env_ids] = reset_object_height
         self.episode_peak_object_com_height_m[env_ids] = reset_object_height
@@ -1860,7 +2062,9 @@ class MotionImitationEnv:
             self.critic_obs_buf.copy_(torch.cat(parts, dim=1))
 
     def _compute_reward_and_errors(self) -> Dict[str, torch.Tensor]:
-        reference = self.reference.sample(self.reference_index)
+        reference = self.transform_bank.sample(
+            self.transform_index, self.reference_index
+        )
         reference_arm_q = reference.q[:, : len(ARM_JOINT_NAMES)]
         reference_arm_dq = reference.dq[:, : len(ARM_JOINT_NAMES)]
         reference_hand_q = reference.q[:, len(ARM_JOINT_NAMES):]
@@ -1872,7 +2076,9 @@ class MotionImitationEnv:
         action_delta = self.actions - self.previous_actions
         reference_action_delta = self.demonstration_action_delta(reference.dq)
         action_delta_error = action_delta - reference_action_delta
-        arm_action_delta_error = action_delta_error[:, : len(ARM_JOINT_NAMES)]
+        # The arm term is pure command smoothness.  Its retargeted motion can
+        # legitimately have a different action delta from the demonstration.
+        arm_action_delta_error = action_delta[:, : len(ARM_JOINT_NAMES)]
         hand_action_delta_error = action_delta_error[:, len(ARM_JOINT_NAMES):]
 
         # Arm and hand keep separate Gaussians: averaging one MSE over all 26
@@ -1980,6 +2186,41 @@ class MotionImitationEnv:
             self.proximity_std_m,
             proximity_active,
         )
+
+        # The object-centric terms. The hand is nine points -- the palm origin,
+        # three more at a lever arm along its axes, and the five fingertips --
+        # and the reward is how far they are from where the demonstration put
+        # them *in the cuboid's frame*. Move the bar and the target moves with
+        # it, which is the whole generalisation.
+        #
+        # The reference is looked up by frame alone: expressed in the cuboid's
+        # frame it does not depend on which transform this episode is playing,
+        # because a rigid motion of the whole scene cancels between hand and
+        # bar. tests/test_retarget.py asserts that.
+        #
+        # Palm and fingertips keep separate Gaussians for the same reason the
+        # arm and hand joints do: averaged into one term, five fingertips
+        # outvote four palm points and the approach stops being paid for.
+        keypoints_cube_frame = self._hand_keypoints_cube_frame()
+        reference_keypoints = self.transform_bank.keypoints_at(self.reference_index)
+        actual_palm, actual_fingertips = split_palm_and_fingertips(
+            keypoints_cube_frame
+        )
+        reference_palm, reference_fingertips = split_palm_and_fingertips(
+            reference_keypoints
+        )
+        palm_keypoint_mse = keypoint_tracking_error(actual_palm, reference_palm)
+        fingertip_keypoint_mse = keypoint_tracking_error(
+            actual_fingertips, reference_fingertips
+        )
+        palm_keypoint_error_m = palm_keypoint_mse.clamp_min(0.0).sqrt()
+        fingertip_keypoint_error_m = fingertip_keypoint_mse.clamp_min(0.0).sqrt()
+        palm_keypoint_reward = keypoint_gaussian(
+            palm_keypoint_mse, rewards_cfg.palm_keypoint_std_m
+        )
+        fingertip_keypoint_reward = keypoint_gaussian(
+            fingertip_keypoint_mse, rewards_cfg.fingertip_keypoint_std_m
+        )
         if self.contact_enabled:
             (
                 fingertip_contact_reward,
@@ -2004,7 +2245,16 @@ class MotionImitationEnv:
                 (self.num_envs, len(FINGERTIP_BODY_NAMES))
             )
         self.rew_buf.copy_(
-            float(rewards_cfg.position_arm_weight) * position_reward
+            float(rewards_cfg.palm_keypoint_weight) * palm_keypoint_reward
+            + float(rewards_cfg.fingertip_keypoint_weight)
+            * fingertip_keypoint_reward
+            # The joint-space terms survive at a small weight. Their job is no
+            # longer tracking: a 6-DOF arm has a null space for a given palm
+            # pose and several IK branches, and each finger has four joints
+            # serving a three-dimensional fingertip target. Without them the
+            # policy is free to fill those five spare finger degrees of freedom
+            # and the arm's elbow with whatever else the reward likes.
+            + float(rewards_cfg.position_arm_weight) * position_reward
             + float(rewards_cfg.velocity_arm_weight) * velocity_reward
             + float(rewards_cfg.action_rate_arm_weight) * action_rate_reward
             + float(rewards_cfg.position_hand_weight) * hand_position_reward
@@ -2022,6 +2272,10 @@ class MotionImitationEnv:
             + self.contact_shaping_weight * fingertip_contact_reward
         )
         return {
+            "palm_keypoint_error_m": palm_keypoint_error_m,
+            "fingertip_keypoint_error_m": fingertip_keypoint_error_m,
+            "palm_keypoint_reward": palm_keypoint_reward,
+            "fingertip_keypoint_reward": fingertip_keypoint_reward,
             "q_error": arm_q_error,
             "dq_error": arm_dq_error,
             "hand_q_error": hand_q_error,
@@ -2064,9 +2318,20 @@ class MotionImitationEnv:
             "fingertip_force_n": fingertip_force_n,
         }
 
-    def threshold_violation(self, q_error: torch.Tensor) -> torch.Tensor:
-        return q_error.abs().amax(dim=1) > float(
-            self.cfg.termination.arm_position_threshold_rad
+    def threshold_violation(self, palm_keypoint_error_m: torch.Tensor) -> torch.Tensor:
+        """Has the palm left the neighbourhood of where the reference puts it?
+
+        In task space, not joint space. The reward deliberately lets the arm
+        leave the retargeted joint angles -- that null-space freedom is the
+        point of tracking a palm pose instead of six joints -- so a joint-error
+        threshold would end episodes the reward is perfectly happy with.
+
+        The error is the RMS over all four palm keypoints, so a palm in the
+        right place but turned the wrong way still trips it; thresholding the
+        origin alone would miss a pure orientation failure entirely.
+        """
+        return palm_keypoint_error_m > float(
+            self.cfg.termination.palm_keypoint_threshold_m
         )
 
     def hand_threshold_violation(self, hand_q_error: torch.Tensor) -> torch.Tensor:
@@ -2083,7 +2348,7 @@ class MotionImitationEnv:
 
     def _compute_termination(
         self,
-        q_error: torch.Tensor,
+        palm_keypoint_error_m: torch.Tensor,
         hand_q_error: torch.Tensor,
         object_position_error_m: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2091,7 +2356,7 @@ class MotionImitationEnv:
         # inside one threshold clears only that source's count, regardless of
         # what the other tracking errors are doing.
         if bool(self.cfg.termination.enabled):
-            self.arm_violation = self.threshold_violation(q_error)
+            self.arm_violation = self.threshold_violation(palm_keypoint_error_m)
             self.hand_violation = self.hand_threshold_violation(hand_q_error)
             if bool(self.cfg.termination.object_position_enabled):
                 self.object_violation = self.object_threshold_violation(
@@ -2151,6 +2416,13 @@ class MotionImitationEnv:
             )
         )
         self.episode_sums["reward"] += self.rew_buf
+        for name in (
+            "palm_keypoint_reward",
+            "fingertip_keypoint_reward",
+            "palm_keypoint_error_m",
+            "fingertip_keypoint_error_m",
+        ):
+            self.episode_sums[name] += metrics[name]
         self.episode_sums["position_reward"] += metrics["position_reward"]
         self.episode_sums["velocity_reward"] += metrics["velocity_reward"]
         self.episode_sums["action_rate_reward"] += metrics["action_rate_reward"]
@@ -2223,6 +2495,21 @@ class MotionImitationEnv:
         summary = {
             "return": self.episode_sums["reward"][done].mean(),
             "length": lengths.mean(),
+            # The object-centric tracking terms, per step of the episodes that
+            # ended. These are the two numbers that say whether the policy is
+            # reproducing the demonstrated motion relative to the bar.
+            "palm_keypoint_reward": (
+                self.episode_sums["palm_keypoint_reward"][done] / lengths
+            ).mean(),
+            "fingertip_keypoint_reward": (
+                self.episode_sums["fingertip_keypoint_reward"][done] / lengths
+            ).mean(),
+            "palm_keypoint_error_m": (
+                self.episode_sums["palm_keypoint_error_m"][done] / lengths
+            ).mean(),
+            "fingertip_keypoint_error_m": (
+                self.episode_sums["fingertip_keypoint_error_m"][done] / lengths
+            ).mean(),
             "early_termination_fraction": early[done].float().mean(),
             # Of the episodes that failed, which block was over threshold. The
             # two can both be true on the same step, so they need not sum to 1.
@@ -2283,7 +2570,9 @@ class MotionImitationEnv:
         next_indices = (self.reference_index + 1).clamp(
             max=self.reference.last_index
         )
-        next_reference = self.reference.sample(next_indices)
+        next_reference = self.transform_bank.sample(
+            self.transform_index, next_indices
+        )
         self._write_demo_order_to_asset(
             self.position_targets_asset, complete_target_q
         )
@@ -2327,7 +2616,7 @@ class MotionImitationEnv:
         metrics = self._compute_reward_and_errors()
         self._accumulate_episode_metrics(metrics)
         done, early, timeout = self._compute_termination(
-            metrics["q_error"],
+            metrics["palm_keypoint_error_m"],
             metrics["hand_q_error"],
             metrics["object_position_error_m"],
         )
@@ -2362,6 +2651,11 @@ class MotionImitationEnv:
             "rms_hand_position_error": metrics["hand_position_mse"].sqrt(),
             "rms_hand_velocity_error": metrics["hand_velocity_mse"].sqrt(),
             "rms_hand_action_rate": metrics["hand_action_rate_mse"].sqrt(),
+            # The object-centric terms the evaluator scores checkpoints on.
+            "palm_keypoint_reward": metrics["palm_keypoint_reward"],
+            "fingertip_keypoint_reward": metrics["fingertip_keypoint_reward"],
+            "palm_keypoint_error_m": metrics["palm_keypoint_error_m"],
+            "fingertip_keypoint_error_m": metrics["fingertip_keypoint_error_m"],
             "position_reward": metrics["position_reward"],
             "velocity_reward": metrics["velocity_reward"],
             "action_rate_reward": metrics["action_rate_reward"],
