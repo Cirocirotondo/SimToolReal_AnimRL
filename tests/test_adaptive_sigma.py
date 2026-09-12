@@ -105,6 +105,45 @@ class AdaptiveSigmaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             AdaptiveSigma(initial=0.1, floor=0.01, decay=1.0)
 
+    def test_the_ladder_survives_a_save_and_resume(self):
+        """A resumed run must not be handed back the width it started from.
+
+        Rebuilding the widths from the configuration is not a neutral restart:
+        the term jumps back to a sigma the policy has long passed, is pinned at
+        1 again, and stops paying for the tracking it was holding. Measured on
+        rot6d_adaptive, arm error went 0.044 -> 0.136 over the 1200 iterations
+        after a resume, with nothing else changed.
+        """
+        trained = AdaptiveSigma(initial=5.0, floor=0.0076)
+        for _ in range(50):
+            trained.update(0.04)
+        self.assertLess(trained.sigma, 0.25)
+
+        resumed = AdaptiveSigma(initial=5.0, floor=0.0076)
+        resumed.load_state(trained.state())
+        self.assertAlmostEqual(resumed.sigma, trained.sigma, places=12)
+        self.assertAlmostEqual(
+            resumed.mean_squared_error, trained.mean_squared_error, places=12
+        )
+        # The two now agree on the next width as well, which is the point.
+        self.assertAlmostEqual(
+            resumed.update(0.04), trained.update(0.04), places=12
+        )
+
+    def test_a_checkpoint_without_a_ladder_leaves_the_width_alone(self):
+        """Checkpoints predating the saved ladder must still resume."""
+        tracker = AdaptiveSigma(initial=0.20, floor=0.0076)
+        tracker.load_state(None)
+        self.assertEqual(tracker.sigma, 0.20)
+        tracker.load_state({"sigma": None, "mean_squared_error": None})
+        self.assertEqual(tracker.sigma, 0.20)
+        self.assertIsNone(tracker.mean_squared_error)
+
+    def test_a_restored_width_still_respects_the_floor(self):
+        tracker = AdaptiveSigma(initial=0.20, floor=0.05)
+        tracker.load_state({"sigma": 0.001, "mean_squared_error": 1e-6})
+        self.assertEqual(tracker.sigma, 0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

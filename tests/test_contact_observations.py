@@ -16,7 +16,7 @@ class ContactObservationConfigTest(unittest.TestCase):
         cfg = SimToolRealCfg()
         self.assertFalse(cfg.contact.observe_fingertip_forces)
         self.assertEqual(fingertip_force_observation_dim(cfg.contact), 0)
-        self.assertEqual(cfg.env.num_observations, 108)
+        self.assertEqual(cfg.env.num_observations, 112)
 
     def test_three_fingertips_add_nine_numbers(self):
         cfg = SimToolRealCfg()

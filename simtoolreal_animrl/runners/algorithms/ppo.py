@@ -1021,6 +1021,11 @@ class PPO:
             "value_dict": self.value.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "infos": infos,
+            # The adaptive reward widths are training state as much as the
+            # optimizer is: rebuilt from the configuration on resume, they hand
+            # the policy back the wide sigma it started from and the term stops
+            # paying for what it had already earned.
+            "adaptive_sigmas": self._adaptive_sigma_state(),
         }
         if self.normalize_observation:
             save_dict["actor_obs_normalizer"] = (
@@ -1031,14 +1036,33 @@ class PPO:
             )
         torch.save(save_dict, str(path))
 
-    def load(self, path, load_optimizer=False, load_normalizers=True):
-        """Resume all learned networks and, optionally, training state."""
+    def load(
+        self,
+        path,
+        load_optimizer=False,
+        load_normalizers=True,
+        load_value=True,
+    ):
+        """Resume all learned networks and, optionally, training state.
+
+        ``load_value=False`` keeps the actor and starts the critic fresh. That
+        is what makes a checkpoint usable after the critic's input width
+        changes -- turning on the asymmetric critic widens it by the fingertip
+        force block -- while the actor, which is the part that gets deployed, is
+        unaffected and worth carrying over. The optimizer is refused alongside
+        it, because its moments belong to parameters that no longer exist.
+        """
         loaded = self._read_checkpoint(path)
         self.policy.load_state_dict(loaded["policy_dict"])
-        self.value.load_state_dict(loaded["value_dict"])
+        if load_value:
+            self.value.load_state_dict(loaded["value_dict"])
+        elif load_optimizer:
+            raise ValueError(
+                "Resuming the optimizer needs the critic it was fitted to"
+            )
         if load_optimizer:
             self.optimizer.load_state_dict(loaded["optimizer_state_dict"])
-        self._load_normalizers(loaded, load_normalizers)
+        self._load_normalizers(loaded, load_normalizers, load_value)
         infos = loaded["infos"]
         if isinstance(infos, dict):
             self.total_timesteps = int(infos.get("total_timesteps", 0))
@@ -1052,8 +1076,26 @@ class PPO:
             self.best_evaluation_iteration = int(
                 infos.get("best_evaluation_iteration", -1)
             )
-            self._load_normalizer_counts(infos, load_normalizers)
+            self._load_normalizer_counts(infos, load_normalizers, load_value)
+        self._load_adaptive_sigma_state(loaded.get("adaptive_sigmas"))
         return infos
+
+    def _adaptive_sigma_state(self):
+        """The environment's reward-width ladders, or None when they are off."""
+        trackers = getattr(self.env, "adaptive_sigmas", None)
+        if not trackers:
+            return None
+        return {name: tracker.state() for name, tracker in trackers.items()}
+
+    def _load_adaptive_sigma_state(self, state):
+        """Restore the ladders. A checkpoint saved before this existed has none,
+        and then the widths simply start from the configuration as they did."""
+        trackers = getattr(self.env, "adaptive_sigmas", None)
+        if not trackers or not isinstance(state, dict):
+            return
+        for name, tracker in trackers.items():
+            if name in state:
+                tracker.load_state(state[name])
 
     def _read_checkpoint(self, path):
         try:
@@ -1064,23 +1106,28 @@ class PPO:
             # PyTorch versions predating ``weights_only`` remain supported.
             return torch.load(str(path), map_location=self.device)
 
-    def _load_normalizers(self, loaded, load_normalizers):
+    def _load_normalizers(self, loaded, load_normalizers, load_value=True):
+        # The critic's normalizer is as wide as the critic, so it is skipped
+        # for the same reason the critic is: it describes inputs that the
+        # widened critic no longer has. The actor's is untouched by that.
         if load_normalizers and self.normalize_observation:
             self.actor_obs_normalizer.load_state_dict(
                 loaded["actor_obs_normalizer"]
             )
-            self.critic_obs_normalizer.load_state_dict(
-                loaded["critic_obs_normalizer"]
-            )
+            if load_value:
+                self.critic_obs_normalizer.load_state_dict(
+                    loaded["critic_obs_normalizer"]
+                )
 
-    def _load_normalizer_counts(self, infos, load_normalizers):
+    def _load_normalizer_counts(self, infos, load_normalizers, load_value=True):
         if load_normalizers and self.normalize_observation:
             self.actor_obs_normalizer.count = int(
                 infos.get("actor_normalizer_count", 0)
             )
-            self.critic_obs_normalizer.count = int(
-                infos.get("critic_normalizer_count", 0)
-            )
+            if load_value:
+                self.critic_obs_normalizer.count = int(
+                    infos.get("critic_normalizer_count", 0)
+                )
 
     def get_inference_policy(self, device=None):
         self.eval_mode()

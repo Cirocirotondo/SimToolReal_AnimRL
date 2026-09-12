@@ -78,7 +78,14 @@ SERIES = [
     # with different reward sigmas.
     (
         "evaluation_fixed_mean_rms_action_rate",
-        "Action rate (vibration)",
+        "Arm action rate (vibration)",
+        "",
+        "down",
+    ),
+    # The hand is where the chatter starts: it twitches and the arm rings.
+    (
+        "evaluation_fixed_mean_rms_hand_action_rate",
+        "Hand action rate (vibration)",
         "",
         "down",
     ),

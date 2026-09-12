@@ -1,145 +1,147 @@
-"""Per-environment physical variation, for sim2sim and sim2real transfer.
+"""Training-time disturbances, so the policy is not tuned to one exact robot.
 
-Written after a measured failure: pg830_blind512_n256, the *roughest* policy
-trained here (rms action rate 2.53), transferred to MuJoCo well, while
-blind_quiet2 and adapt_sigma -- 25x and 47x smoother by the Isaac Gym metrics --
-transferred badly with the same PD gains in both simulators. The smooth policies
-grip at 1.6-2.9 N where the rough one uses 6.3 N, and they command 30-60% more
-drive deflection to do it. Fine distinctions like those are properties of one
-contact model, not of the task.
+The actuator, latency, observation, and reset vocabulary comes from
+``scripts/probe_robustness.py``. Physics-property variation and short external
+cube wrenches extend that measured baseline.
 
-So the smoothness was partly bought by fitting the simulator. Randomising the
-parameters the policy cannot observe removes that option: a policy cannot tune
-itself to a friction coefficient that changes every environment.
+Everything is drawn together rather than one axis per episode, so the policy
+learns combinations of errors rather than isolated perturbations.
 
-Sampling is per environment at creation, not per episode: Isaac Gym applies DOF
-and shape properties when an actor is built, and with hundreds of environments
-the population covers the range on every iteration anyway.
+Kept free of isaacgym so the draws can be tested without a simulator.
 """
 
-import numpy as np
+import math
+
+import torch
 
 
-class DomainRandomization:
-    """Samples one physical configuration per environment.
+# sigma_dq = sqrt(2) * control_hz * sigma_q is the cost of differentiating an
+# encoder once per control step, so the velocity noise is not a free parameter:
+# it follows from the position noise and the rate.
+def velocity_noise_for_position_noise(position_noise_rad, control_hz):
+    """The dq noise implied by differentiating a noisy q at ``control_hz``."""
+    return math.sqrt(2.0) * float(control_hz) * float(position_noise_rad)
 
-    Every range is multiplicative around 1.0 and a range of 0.0 disables that
-    parameter, so an unrandomised run reproduces the fixed values exactly.
+
+def log_uniform_scales(shape, log2_halfwidth, device, generator=None):
+    """Multiplicative factors uniform in log2 over ``+- log2_halfwidth``.
+
+    Drawn in log space so that halving and doubling a gain are equally likely;
+    a uniform draw on the linear scale would favour the stiff side.
     """
+    halfwidth = float(log2_halfwidth)
+    if halfwidth <= 0.0:
+        return torch.ones(shape, device=device)
+    exponent = (
+        torch.rand(shape, device=device, generator=generator) * 2.0 - 1.0
+    ) * halfwidth
+    return torch.pow(2.0, exponent)
 
-    def __init__(self, cfg, num_envs, seed=0):
-        self.enabled = bool(getattr(cfg, "enabled", False))
-        self.num_envs = int(num_envs)
-        self._rng = np.random.default_rng(int(seed))
-        self.ranges = {
-            "arm_stiffness": float(getattr(cfg, "arm_stiffness_range", 0.0)),
-            "arm_damping": float(getattr(cfg, "arm_damping_range", 0.0)),
-            "hand_stiffness": float(getattr(cfg, "hand_stiffness_range", 0.0)),
-            "hand_damping": float(getattr(cfg, "hand_damping_range", 0.0)),
-            "fingertip_friction": float(
-                getattr(cfg, "fingertip_friction_range", 0.0)
-            ),
-            "object_friction": float(getattr(cfg, "object_friction_range", 0.0)),
-            "object_mass": float(getattr(cfg, "object_mass_range", 0.0)),
-            "table_friction": float(getattr(cfg, "table_friction_range", 0.0)),
-            "robot_link_mass": float(getattr(cfg, "robot_link_mass_range", 0.0)),
-        }
-        self.robot_impulse_probability = float(
-            getattr(cfg, "robot_impulse_probability", 0.0)
+
+def random_vectors_in_ball(count, max_magnitude, device, generator=None):
+    """Sample isotropic 3D vectors with magnitudes uniform on ``[0, max]``."""
+    count = int(count)
+    maximum = float(max_magnitude)
+    if count < 0:
+        raise ValueError("count cannot be negative")
+    if not math.isfinite(maximum) or maximum < 0.0:
+        raise ValueError("max_magnitude must be finite and non-negative")
+    if count == 0 or maximum == 0.0:
+        return torch.zeros((count, 3), device=device)
+    directions = torch.randn((count, 3), device=device, generator=generator)
+    directions /= torch.linalg.vector_norm(
+        directions, dim=1, keepdim=True
+    ).clamp_min(1e-12)
+    magnitudes = torch.rand(
+        (count, 1), device=device, generator=generator
+    ) * maximum
+    return directions * magnitudes
+
+
+def _validated_range(cfg, name, *, strictly_positive=False, upper_limit=None):
+    values = getattr(cfg, name)
+    if len(values) != 2:
+        raise ValueError("domain_randomization.{} must contain two values".format(name))
+    lower, upper = (float(values[0]), float(values[1]))
+    if not math.isfinite(lower) or not math.isfinite(upper) or lower > upper:
+        raise ValueError(
+            "domain_randomization.{} must be a finite ordered range".format(name)
         )
-        self.robot_impulse_n = float(getattr(cfg, "robot_impulse_n", 0.0))
-        self.object_impulse_probability = float(
-            getattr(cfg, "object_impulse_probability", 0.0)
+    if (strictly_positive and lower <= 0.0) or (not strictly_positive and lower < 0.0):
+        qualifier = "positive" if strictly_positive else "non-negative"
+        raise ValueError(
+            "domain_randomization.{} must be {}".format(name, qualifier)
         )
-        self.object_impulse_n = float(getattr(cfg, "object_impulse_n", 0.0))
-        self.critic_observes_parameters = bool(
-            getattr(cfg, "critic_observes_parameters", False)
+    if upper_limit is not None and upper > upper_limit:
+        raise ValueError(
+            "domain_randomization.{} cannot exceed {}".format(name, upper_limit)
         )
-        self.obs_q_noise_rad = float(getattr(cfg, "obs_q_noise_rad", 0.0))
-        self.obs_dq_noise_rad_s = float(getattr(cfg, "obs_dq_noise_rad_s", 0.0))
-        self.obs_q_bias_rad = float(getattr(cfg, "obs_q_bias_rad", 0.0))
-        self.action_delay_max_steps = int(
-            getattr(cfg, "action_delay_max_steps", 0)
-        )
-        for name, value in self.ranges.items():
-            if value < 0.0 or value >= 1.0:
-                raise ValueError(
-                    "Randomisation range for {} must lie in [0, 1)".format(name)
+    return (lower, upper)
+
+
+def resolve_settings(cfg):
+    """Validate the configuration block and return it as a plain dict."""
+    if not bool(getattr(cfg, "enabled", False)):
+        return None
+    fields = (
+        "pd_log2_halfwidth",
+        "obs_q_noise_rad",
+        "obs_q_bias_rad",
+        "obs_dq_noise_rad_s",
+        "obs_target_noise_rad",
+        "init_q_offset_rad",
+        "init_dq_offset_rad_s",
+        "gravity_xy_max_m_s2",
+        "external_force_max_n",
+        "external_torque_max_nm",
+    )
+    settings = {}
+    for name in fields:
+        value = float(getattr(cfg, name))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "domain_randomization.{} must be finite and non-negative".format(
+                    name
                 )
-        self.samples = self._draw()
-
-    def _draw(self):
-        """One multiplier per environment per parameter."""
-        samples = {}
-        for name, spread in self.ranges.items():
-            if not self.enabled or spread <= 0.0:
-                samples[name] = np.ones(self.num_envs, dtype=np.float64)
-            else:
-                samples[name] = self._rng.uniform(
-                    1.0 - spread, 1.0 + spread, size=self.num_envs
-                )
-        return samples
-
-    def multiplier(self, name, env_index):
-        return float(self.samples[name][int(env_index)])
-
-    def privileged_row(self, env_index):
-        """The sampled multipliers, centred on zero, for the critic.
-
-        The critic is discarded at deployment, so telling it which environment
-        it is in costs the shipped policy nothing -- and without it the value
-        function sees identical observations from environments with different
-        friction and has to average over outcomes it cannot explain. That
-        unexplained variance lands in the advantages the actor learns from.
-        """
-        return np.array(
-            [self.samples[name][int(env_index)] - 1.0 for name in sorted(self.ranges)],
-            dtype=np.float32,
-        )
-
-    @property
-    def privileged_dim(self):
-        if not (self.enabled and self.critic_observes_parameters):
-            return 0
-        return len(self.ranges)
-
-    def privileged_table(self, device=None):
-        """All environments' multipliers as one (num_envs, dim) tensor."""
-        import torch
-
-        import numpy as np
-
-        if self.privileged_dim == 0:
-            return None
-        rows = np.stack(
-            [self.samples[name] - 1.0 for name in sorted(self.ranges)], axis=1
-        ).astype(np.float32)
-        return torch.as_tensor(rows, device=device)
-
-    @property
-    def observation_noise_enabled(self):
-        return self.enabled and (
-            self.obs_q_noise_rad > 0.0
-            or self.obs_dq_noise_rad_s > 0.0
-            or self.obs_q_bias_rad > 0.0
-        )
-
-    @property
-    def action_delay_steps(self):
-        return self.action_delay_max_steps if self.enabled else 0
-
-    @property
-    def impulses_enabled(self):
-        return self.enabled and (
-            (self.robot_impulse_probability > 0.0 and self.robot_impulse_n > 0.0)
-            or (
-                self.object_impulse_probability > 0.0
-                and self.object_impulse_n > 0.0
             )
+        settings[name] = value
+    delay = int(getattr(cfg, "action_delay_max_steps"))
+    if delay < 0:
+        raise ValueError(
+            "domain_randomization.action_delay_max_steps cannot be negative"
         )
-
-    def summary(self):
-        return {
-            name: (float(values.min()), float(values.max()))
-            for name, values in sorted(self.samples.items())
-        }
+    settings["action_delay_max_steps"] = delay
+    range_fields = (
+        ("object_mass_scale_range", True, None),
+        ("object_inertia_scale_range", True, None),
+        ("object_friction_range", False, None),
+        ("object_restitution_range", False, 1.0),
+        ("robot_friction_scale_range", True, None),
+        ("table_friction_range", False, None),
+        ("gravity_z_scale_range", True, None),
+    )
+    for name, strictly_positive, upper_limit in range_fields:
+        settings[name] = _validated_range(
+            cfg,
+            name,
+            strictly_positive=strictly_positive,
+            upper_limit=upper_limit,
+        )
+    probability = float(getattr(cfg, "external_wrench_probability_per_step"))
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise ValueError(
+            "domain_randomization.external_wrench_probability_per_step "
+            "must be in [0, 1]"
+        )
+    settings["external_wrench_probability_per_step"] = probability
+    duration = int(getattr(cfg, "external_wrench_duration_steps"))
+    if duration <= 0:
+        raise ValueError(
+            "domain_randomization.external_wrench_duration_steps must be positive"
+        )
+    settings["external_wrench_duration_steps"] = duration
+    if bool(getattr(cfg, "couple_velocity_noise_to_position_noise", True)):
+        settings["obs_dq_noise_rad_s"] = velocity_noise_for_position_noise(
+            settings["obs_q_noise_rad"], float(getattr(cfg, "control_hz", 60.0))
+        )
+    return settings

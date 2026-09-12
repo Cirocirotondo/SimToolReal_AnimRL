@@ -206,7 +206,7 @@ def object_assist_wrench(
     reference_root_state: torch.Tensor,
     settings: ObjectAssistSettings,
     scale: float,
-    mass_kg: float,
+    mass_kg,
     gravity: torch.Tensor,
     active: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -231,7 +231,14 @@ def object_assist_wrench(
         + settings.position_damping_ns_per_m * linear_velocity_error
     )
     if settings.gravity_compensation:
-        force = force - float(mass_kg) * gravity
+        mass = torch.as_tensor(mass_kg, dtype=position.dtype, device=position.device)
+        if mass.ndim == 1:
+            if mass.shape != position.shape[:1]:
+                raise ValueError("Expected one object mass per environment")
+            mass = mass.unsqueeze(-1)
+        elif mass.ndim != 0:
+            raise ValueError("Object mass must be scalar or one value per environment")
+        force = force - mass * gravity
     force = _clamp_vector_norm(force, settings.max_force_n) * gate
 
     if settings.torque_enabled:

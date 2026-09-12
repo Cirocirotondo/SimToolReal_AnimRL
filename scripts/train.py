@@ -147,13 +147,13 @@ def parse_args():
         help="Train on the blind observation vector (the configuration default).",
     )
     parser.add_argument(
-        "--domain-randomization",
+        "--resume-actor-only",
         action="store_true",
         help=(
-            "Vary PD gains, friction and object mass per environment. Added "
-            "after the roughest policy trained here transferred to MuJoCo "
-            "better than the smoothest ones: fine distinctions tuned to one "
-            "contact model do not survive a change of simulator."
+            "Carry over only the actor and the observation normalizers from "
+            "--resume, leaving the critic and optimizer fresh. Needed when the "
+            "critic's width changes, as --asymmetric-critic makes it, and the "
+            "actor is worth keeping anyway: it is the part that is deployed."
         ),
     )
     parser.add_argument(
@@ -399,43 +399,9 @@ def main():
         # contact reporting is on, so the flag carries its prerequisite with it.
         if args.contact_observations:
             env_cfg.contact.enabled = True
-    if args.domain_randomization:
-        env_cfg.domain_randomization.enabled = True
-        # Gains first: the transfer failure was a drive-dynamics failure, and
-        # the hand is where it lives. Friction and mass follow because a blind
-        # policy cannot sense either and must be robust to both open loop.
-        env_cfg.domain_randomization.hand_stiffness_range = 0.40
-        env_cfg.domain_randomization.hand_damping_range = 0.40
-        env_cfg.domain_randomization.arm_stiffness_range = 0.20
-        env_cfg.domain_randomization.arm_damping_range = 0.20
-        env_cfg.domain_randomization.fingertip_friction_range = 0.35
-        env_cfg.domain_randomization.object_friction_range = 0.35
-        env_cfg.domain_randomization.object_mass_range = 0.25
-        env_cfg.domain_randomization.table_friction_range = 0.35
-        env_cfg.domain_randomization.robot_link_mass_range = 0.15
-        # Roughly one push per environment per second at 60 Hz. The robot takes
-        # a real knock; the cube gets a nudge that needs correcting, not one
-        # that throws it out of the hand (0.2 kg, 1 N for one step ~ 0.08 m/s).
-        env_cfg.domain_randomization.robot_impulse_probability = 0.02
-        env_cfg.domain_randomization.robot_impulse_n = 12.0
-        env_cfg.domain_randomization.object_impulse_probability = 0.02
-        env_cfg.domain_randomization.object_impulse_n = 1.0
-        # Sensor realism, taken from the rot6d_dr config that produced a notably
-        # smooth policy elsewhere. Velocity noise is deliberately ~85x the
-        # position noise: hardware differentiates a quantised encoder, and that
-        # is where real noise lives.
-        env_cfg.domain_randomization.obs_q_noise_rad = 0.005
-        env_cfg.domain_randomization.obs_q_bias_rad = 0.005
-        env_cfg.domain_randomization.obs_dq_noise_rad_s = 0.4243
-        env_cfg.domain_randomization.action_delay_max_steps = 1
     if args.asymmetric_critic:
         env_cfg.contact.critic_observes_fingertip_forces = True
         env_cfg.contact.enabled = True
-        # A scratch run can also hand the critic the randomisation multipliers,
-        # which a warm start cannot: it widens the critic input past any saved
-        # value network. Only meaningful when randomisation is on.
-        if args.domain_randomization and args.resume is None:
-            env_cfg.domain_randomization.critic_observes_parameters = True
     # Applied last so an explicit --set always wins over the flags above.
     applied_overrides = apply_overrides(env_cfg, train_cfg, args.overrides)
     for path, value in applied_overrides.items():
@@ -487,8 +453,9 @@ def main():
             print("Loading checkpoint: {}".format(resume_path))
             checkpoint_infos = runner.load(
                 resume_path,
-                load_optimizer=True,
+                load_optimizer=not args.resume_actor_only,
                 load_normalizers=True,
+                load_value=not args.resume_actor_only,
             )
         start_iteration = resolve_start_iteration(args, checkpoint_infos)
         print(

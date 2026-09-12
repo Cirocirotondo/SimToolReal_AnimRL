@@ -5,103 +5,25 @@ from .base_config import BaseEnvCfg, BaseTrainCfg
 
 class SimToolRealCfg(BaseEnvCfg):
     class env(BaseEnvCfg.env):
-        num_envs = 4096
+        num_envs = 256
         # Match the 2026-08-28 no_object_reward reference run.
         episode_length = 360
         num_actions = 26
         # Existing 79D proprioception, followed by palm pose in the robot-base
-        # frame (3+4), five fingertip positions relative to the palm (15), and
-        # cube orientation/center relative to the palm (4+3).
-        num_observations = 108
+        # frame (3+6), five fingertip positions relative to the palm (15), and
+        # cube rotation/center relative to the palm (6+3). Both rotations use
+        # the continuous 6D matrix encoding: the canonicalized quaternion they
+        # replace negated all four components as the palm crossed w = 0, which
+        # is the step the policy answered with a 0.63 rad finger twitch.
+        num_observations = 112
         num_privileged_obs = None
         reference_state_initialization = True
-        # The reference run sampled uniformly from every valid start frame.
-        # The demonstration has indices 0..1107 and 1107 is reserved for the
-        # reference-end timeout, hence the inclusive maximum start is 1106.
-        reference_init_distribution = "uniform"
-        rsi_early_probability = 0.20 # used only when reference_init_distribution = "pregrasp_mixture"
-        # Perturbation applied to the reference pose at reset, in radians. The
-        # real arm can never be placed exactly on a demonstration frame, so a
-        # policy trained only on exact frames has never seen the states it will
-        # actually start from. It also blurs the RSI distribution's edges: the
-        # measured 54x jitter jump at reference frame 690 is a seam where a
-        # barely-trained approach meets a heavily-trained grasp, and noisy
-        # starts spread mass across that boundary instead of stacking it on one
-        # side. Zero reproduces every run so far.
-        rsi_position_noise_arm_rad = 0.0
-        rsi_position_noise_hand_rad = 0.0
-        # Velocities are differentiated encoder counts on hardware, never the
-        # exact values the demonstration carries.
-        rsi_velocity_noise_scale = 0.0
+        # Match grasp_asym_scratch: mix early starts with starts around the
+        # pregrasp segment, bounded before the object-manipulation phase.
+        reference_init_distribution = "pregrasp_mixture"
+        rsi_early_probability = 0.30 # used only when reference_init_distribution = "pregrasp_mixture"
         rsi_pregrasp_start_index = 740 # proximity reward starts from this demonstration index
-        rsi_max_start_index = 1106
-
-    class domain_randomization:
-        # Per-environment physical variation, sampled once at creation.
-        #
-        # Added after a measured transfer failure: pg830_blind512_n256, the
-        # ROUGHEST policy trained here, moved to MuJoCo well, while the 25x and
-        # 47x smoother blind_quiet2 and adapt_sigma failed there with matching
-        # PD gains in both simulators. The smooth policies grip at 1.6-2.9 N
-        # where the rough one uses 6.3 N; that margin is a property of one
-        # contact model, not of the task. A policy cannot fit a friction
-        # coefficient that differs in every environment.
-        #
-        # Each value is a fractional spread about the nominal: 0.4 means
-        # uniform in [0.6, 1.4]. Zero disables that parameter, and enabled =
-        # False reproduces every run so far.
-        enabled = False
-        arm_stiffness_range = 0.0
-        arm_damping_range = 0.0
-        hand_stiffness_range = 0.0
-        hand_damping_range = 0.0
-        fingertip_friction_range = 0.0
-        object_friction_range = 0.0
-        object_mass_range = 0.0
-        # Extra physical parameters, all multiplicative like the rest.
-        table_friction_range = 0.0
-        robot_link_mass_range = 0.0
-        # External impulses. Domain randomisation varies the world's parameters
-        # but leaves it deterministic -- nothing ever pushes the robot. A policy
-        # that has only been disturbed by its own actions has no recovery
-        # behaviour, and a real arm is knocked by cable drag while a real cube
-        # is nudged by an imperfect placement.
-        #
-        # Probability is per environment per control step, so 0.02 at 60 Hz is
-        # roughly one push per environment per second. Sparse on purpose: a
-        # continuous push is a force field the policy learns to lean against.
-        robot_impulse_probability = 0.0
-        robot_impulse_n = 0.0
-        # Deliberately light. The cube is 0.2 kg, so 1 N for one 60 Hz step is
-        # about 0.08 m/s -- enough to require a correction, not enough to throw
-        # the object out of the hand.
-        object_impulse_probability = 0.0
-        object_impulse_n = 0.0
-        # Feed the sampled multipliers to the critic. Only possible on a run
-        # trained from scratch: it widens the critic input, so no existing value
-        # network can be warm-started into it. Without this the value function
-        # sees identical observations from environments with different friction
-        # and must average over outcomes it cannot explain, and that unexplained
-        # variance lands in the advantages the actor learns from.
-        critic_observes_parameters = False
-        # Sensor realism. The policy reads exact joint angles and velocities
-        # here; hardware reads encoder counts and a differentiated velocity.
-        # Beyond robustness this suppresses chatter for a reason rather than by
-        # decree: a high-gain reactive policy amplifies measurement noise into
-        # action noise and is punished for it. Velocity takes the larger share
-        # because differentiating a quantised position is where real noise lives.
-        obs_q_noise_rad = 0.0
-        obs_dq_noise_rad_s = 0.0
-        # A constant per-joint offset standing in for an encoder zero error,
-        # drawn once per environment: a bias the policy could average away over
-        # a few steps would not be a bias.
-        obs_q_bias_rad = 0.0
-        # Control latency in whole control steps, drawn once per environment.
-        # A command issued now reaches a real joint later, so an aggressive
-        # corrector overshoots -- training with delay forces the low-gain
-        # behaviour that survives the transfer. Fixed per environment rather
-        # than per step, because per-step variation is jitter and averages out.
-        action_delay_max_steps = 0
+        rsi_max_start_index = 830
 
     class asset:
         file = "assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf"
@@ -231,14 +153,12 @@ class SimToolRealCfg(BaseEnvCfg):
         # raises the damping ratio d/(2 sqrt(kJ)) at the same time.
         arm_stiffness_scale = 1.0
         arm_damping_scale = 1.0
-        hand_stiffness_scale = 1.0
+        hand_stiffness_scale = 0.5
         hand_damping_scale = 1.0
 
     class contact:
-        # Optional GPU contact shaping for the three fingers used by the
-        # grasp.  When disabled, MotionImitationEnv keeps PhysX contact
-        # reporting at CC_NEVER and does not acquire/refresh its tensor.
-        enabled = False
+        # GPU contact reporting for the three fingers used by the grasp.
+        enabled = True
         # Isaac Gym ContactCollection value: 1 = CC_LAST_SUBSTEP and
         # 2 = CC_ALL_SUBSTEPS. LAST_SUBSTEP is the cheaper production default
         # for the stable contacts expected during a grasp.
@@ -265,13 +185,13 @@ class SimToolRealCfg(BaseEnvCfg):
         # in the critic because the critic is discarded at deployment, and a
         # value function that can see contact explains the returns a blind
         # actor cannot, which lowers the advantage noise the actor learns from.
-        critic_observes_fingertip_forces = False
+        critic_observes_fingertip_forces = True
         # The palm-frame force is divided by this before it reaches the policy,
         # so a firm grasp lands near unit scale instead of tens of newtons.
         observation_force_scale_n = 10.0
         # Symmetric per-component clip applied after that scaling. A collision
         # spike is worth several hundred newtons and would otherwise swamp the
-        # 108 inputs it sits beside.
+        # 112 inputs it sits beside.
         observation_clip = 5.0
 
     class rewards:
@@ -293,20 +213,16 @@ class SimToolRealCfg(BaseEnvCfg):
         position_hand_std_rad = 0.223607
         velocity_hand_std_rad_per_s = 1.0
         action_rate_hand_std = 5
-        # Adaptive widths. Off by default, so every existing run reproduces.
-        # When on, position_* and action_rate_* sigmas follow a slow average of
+        # Adaptive widths used by grasp_asym_scratch. Position_* and
+        # action_rate_* sigmas follow a slow average of
         # their own MSE and hold the term near adaptive_sigma_target_reward, so
         # it keeps a live gradient however good the policy gets. This is the
         # sharpening ladder done continuously: the fixed widths above stop
         # paying once the policy passes them, which is why mean_reward kept
         # rising while the deployment score fell after iteration 1500.
-        adaptive_sigma_enabled = False
+        adaptive_sigma_enabled = True
         adaptive_sigma_target_reward = 0.6
         adaptive_sigma_decay = 0.999
-        # How far a width may relax above its tightest value when the policy
-        # regresses. 1.0 pins it to the all-time best, which sounds strict but
-        # left adapt_sigma's arm term at ~0.06 reward for 1500 iterations with
-        # no gradient pointing back; 1.5 gives 0.29 there instead.
         adaptive_sigma_slack = 1.5
         # Floors, below which a term stops demanding improvement. Set at the
         # smoothest policy trained here (2026-08-26_sharpen_sigma), because
@@ -326,9 +242,74 @@ class SimToolRealCfg(BaseEnvCfg):
         object_orientation_std_rad = 0.5
 
         # Fingertip-object distance rewards
-        fingertip_object_distance_weight = 0 * 0.2 * object_scale
+        fingertip_object_distance_weight = 0.2 * object_scale
         fingertip_object_distance_std_m = 0.04
         fingertip_object_distance_names = ["thumb", "index", "middle"]
+
+    class domain_randomization:
+        """Disturbances applied during training.
+
+        The actuator, latency, observation, and reset magnitudes are the ones
+        scripts/probe_robustness.py measures. Physical-property variation and
+        short external cube wrenches extend that baseline. Everything is drawn
+        jointly rather than one axis per episode.
+
+        The defaults are its "realistic" column: PD gains uncertain to +-25%
+        per robot, one control step of command latency, a 5 mrad encoder with a
+        5 mrad fixed bias, and an RSI start 30 mrad and 0.5 rad/s off the
+        reference. The initial-state spread stays well under the 0.35 rad arm
+        termination threshold so it does not become self-inflicted failure.
+        """
+
+        enabled = True
+        # Per-robot position-drive gains, drawn once per environment at build
+        # time: 0.3219 is log2(1.25), so K and D each land within +-25%. Drawn
+        # independently, because a common factor leaves D/K fixed and the
+        # damping ratio is the part the policy actually feels.
+        pd_log2_halfwidth = 0.3219
+        # Command latency in control steps, drawn per episode over [0, max].
+        action_delay_max_steps = 1
+        # Encoder noise, resampled every step.
+        obs_q_noise_rad = 0.005
+        # A fixed offset per episode, which is what a miscalibrated zero is.
+        obs_q_bias_rad = 0.005
+        # Derived from obs_q_noise_rad below unless the coupling is turned off.
+        obs_dq_noise_rad_s = 0.4243
+        couple_velocity_noise_to_position_noise = True
+        control_hz = 60.0
+        # Noise on the previously-applied-target block of the observation.
+        obs_target_noise_rad = 0.0
+        # RSI start offsets, applied once at reset.
+        init_q_offset_rad = 0.030
+        init_dq_offset_rad_s = 0.5
+
+        # Per-environment object properties, sampled once when actors are
+        # created. Inertia receives one common scale so the cuboid keeps a
+        # physically valid principal-inertia tensor.
+        object_mass_scale_range = [0.8, 1.2]
+        object_inertia_scale_range = [0.8, 1.2]
+        object_friction_range = [0.35, 0.65]
+        object_restitution_range = [0.0, 0.10]
+        # Robot friction is a multiplier because the fingertips deliberately
+        # use a higher nominal coefficient than the arm. Table friction is an
+        # absolute coefficient.
+        robot_friction_scale_range = [0.8, 1.2]
+        table_friction_range = [0.4, 0.6]
+
+        # Isaac Gym gravity is simulator-wide rather than per-environment, so
+        # this is sampled once per training process. Z scales the configured
+        # gravity; X/Y model a small base tilt or gravity-vector calibration
+        # error in m/s^2.
+        gravity_z_scale_range = [0.97, 1.03]
+        gravity_xy_max_m_s2 = 0.15
+
+        # Occasional cube pushes. Each event has a random 3D direction and a
+        # magnitude sampled uniformly up to the configured maximum, then is
+        # held for six 60 Hz control steps (0.1 s).
+        external_wrench_probability_per_step = 0.002
+        external_wrench_duration_steps = 6
+        external_force_max_n = 1.0
+        external_torque_max_nm = 0.02
 
     class termination:
         enabled = True
@@ -337,7 +318,7 @@ class SimToolRealCfg(BaseEnvCfg):
         # End an episode when the physical cube remains farther than this
         # Euclidean center distance from the demonstrated cube target.
         object_position_enabled = True
-        object_position_threshold_m = 0.07
+        object_position_threshold_m = 0.11
         grace_steps = 5
 
 
@@ -346,5 +327,5 @@ class SimToolRealTrainCfg(BaseTrainCfg):
 
     class runner(BaseTrainCfg.runner):
         experiment_name = "simtoolreal"
-        run_name = "new_demo_lr5em5_ec1em3_lenenv360_numenv4096"
+        run_name = "grasp_asym_scratch"
         max_iterations = 9000

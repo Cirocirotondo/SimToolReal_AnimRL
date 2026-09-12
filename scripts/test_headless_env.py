@@ -228,8 +228,8 @@ def assert_observation_contract(env):
     import torch
 
     obs = env.get_observations()
-    if obs.shape != (env.num_envs, 108):
-        raise AssertionError("Expected 108D observations, got {}".format(obs.shape))
+    if obs.shape != (env.num_envs, 112):
+        raise AssertionError("Expected 112D observations, got {}".format(obs.shape))
 
     expected_phase = (
         env.reference_index.float() / float(env.reference.last_index)
@@ -246,12 +246,12 @@ def assert_observation_contract(env):
         dim=1,
     )
     if not bool(torch.allclose(obs, expected, rtol=0.0, atol=1e-6)):
-        raise AssertionError("The 108D observation blocks are inconsistent")
+        raise AssertionError("The 112D observation blocks are inconsistent")
 
     if not bool(((obs[:, :6] >= -1.0) & (obs[:, :6] <= 1.0)).all()):
         raise AssertionError("Normalized arm positions escaped [-1, 1]")
 
-    block_widths = (3, 4, 15, 4, 3)
+    block_widths = (3, 6, 15, 6, 3)
     if tuple(component.shape[1] for component in task_space) != block_widths:
         raise AssertionError("Task-space observation block widths are incorrect")
     fingertip_positions_palm = task_space[2].reshape(env.num_envs, 5, 3)
@@ -274,26 +274,40 @@ def assert_observation_contract(env):
         raise AssertionError(
             "Fingertip observations are not palm-relative positions"
         )
-    palm_quaternion = obs[:, 82:86]
-    cube_quaternion = obs[:, 101:105]
-    for name, quaternion in (
-        ("palm", palm_quaternion),
-        ("cube relative to palm", cube_quaternion),
+    # Both rotations are the 6D encoding: the first two columns of the rotation
+    # matrix. There is no sign convention left to check -- that cut at w = 0 is
+    # exactly what used to step the observation by 2.0 mid-approach -- so the
+    # invariant is instead that each pair really is orthonormal.
+    palm_rotation = obs[:, 82:88]
+    cube_rotation = obs[:, 103:109]
+    ones = torch.ones(env.num_envs, device=env.device)
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    for name, rotation in (
+        ("palm", palm_rotation),
+        ("cube relative to palm", cube_rotation),
     ):
+        first, second = rotation[:, :3], rotation[:, 3:]
+        for column, axis in ((first, "first"), (second, "second")):
+            if not bool(
+                torch.allclose(
+                    torch.linalg.vector_norm(column, dim=1),
+                    ones,
+                    rtol=0.0,
+                    atol=1e-5,
+                )
+            ):
+                raise AssertionError(
+                    "{} {} rotation column is not unit length".format(name, axis)
+                )
         if not bool(
-            torch.allclose(
-                torch.linalg.vector_norm(quaternion, dim=1),
-                torch.ones(env.num_envs, device=env.device),
-                rtol=0.0,
-                atol=1e-5,
-            )
+            torch.allclose((first * second).sum(dim=1), zeros, rtol=0.0, atol=1e-5)
         ):
-            raise AssertionError("{} quaternion is not normalized".format(name))
-        if not bool((quaternion[:, 3] >= 0.0).all()):
-            raise AssertionError("{} quaternion sign is not canonical".format(name))
+            raise AssertionError(
+                "{} rotation columns are not orthogonal".format(name)
+            )
 
     if not bool(torch.isfinite(obs).all()):
-        raise AssertionError("The 108D observation contains NaN or infinity")
+        raise AssertionError("The 112D observation contains NaN or infinity")
 
 
 def assert_reward_contract(env):
@@ -381,13 +395,20 @@ def assert_reward_contract(env):
         + float(r.position_hand_weight) * metrics["hand_position_reward"]
         + float(r.velocity_hand_weight) * metrics["hand_velocity_reward"]
         + float(r.action_rate_hand_weight) * metrics["hand_action_rate_reward"]
-        + float(r.object_position_weight) * metrics["object_position_reward"]
-        + float(r.object_orientation_weight)
-        * metrics["object_orientation_reward"]
-        + float(r.fingertip_object_distance_weight)
-        * metrics["fingertip_object_distance_reward"]
-        + float(env.contact_reward_per_finger)
-        * metrics["fingertip_contact_reward"]
+        # The object terms are gated, and the proximity and contact terms carry
+        # their own resolved weights: contact_shaping_weight is zero while
+        # contact.reward_enabled is false, where contact_reward_per_finger is
+        # still 0.05. Mirroring the configuration by hand instead of the env's
+        # resolved weights is what made this check disagree with the reward it
+        # is checking.
+        + env.object_reward_gate()
+        * (
+            float(r.object_position_weight) * metrics["object_position_reward"]
+            + float(r.object_orientation_weight)
+            * metrics["object_orientation_reward"]
+        )
+        + env.proximity_weight * metrics["fingertip_object_distance_reward"]
+        + env.contact_shaping_weight * metrics["fingertip_contact_reward"]
     )
     if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-7)):
         raise AssertionError("Reward does not match the configured weights")
