@@ -310,8 +310,12 @@ def main():
     else:
         env_cfg.object_assist.schedule = "constant"
         env_cfg.object_assist.initial_scale = float(args.object_assist_scale)
-    if int(env_cfg.env.num_observations) != 108:
-        raise ValueError("This evaluator requires the 108D observation contract")
+    # The deterministic replay is of the policy on the nominal robot; the
+    # disturbances it was trained against belong to training, and
+    # scripts/probe_robustness.py is what measures the policy under them.
+    env_cfg.domain_randomization.enabled = False
+    if int(env_cfg.env.num_observations) != 112:
+        raise ValueError("This evaluator requires the 112D observation contract")
     if int(env_cfg.env.num_actions) != 26:
         raise ValueError("This evaluator requires 26 AnimRL residual actions")
 

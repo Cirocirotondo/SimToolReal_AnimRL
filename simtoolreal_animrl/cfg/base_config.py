@@ -44,7 +44,7 @@ class BaseEnvCfg(ABCConfig):
             rest_offset = 0.0
             bounce_threshold_velocity = 0.2
             max_depenetration_velocity = 2.0
-            max_gpu_contact_pairs = 8 * 1024 * 1024
+            max_gpu_contact_pairs = 16 * 1024 * 1024
             default_buffer_size_multiplier = 25.0
             contact_collection = 0
 
@@ -70,7 +70,7 @@ class BaseEnvCfg(ABCConfig):
         enable_viewer = False
         camera_position = [-1.8,-2.0, 1.5] # [1.8, 2.0, 1.5]
         camera_lookat = [0.0, 0.6, 0.75]
-        training_camera_enabled = False
+        training_camera_enabled = True
         training_camera_env_index = 0
         training_camera_width = 640
         training_camera_height = 480
@@ -121,10 +121,10 @@ class BaseTrainCfg(ABCConfig):
         max_iterations = 3000
         normalize_observation = True
         save_interval = 100
-        # Opt-in: keeping this false preserves graphics_device_id=-1 and the
-        # existing no-graphics server path. A recording spans multiple PPO
-        # rollouts until it has collected duration * fps control frames.
-        record_video = False
+        # Match grasp_asym_scratch: record periodic training videos by default.
+        # A recording spans multiple PPO rollouts until it has collected
+        # duration * fps control frames.
+        record_video = True
         record_video_interval = 500
         record_video_duration_s = 10.0
         record_video_fps = 60

@@ -1,101 +1,121 @@
-"""Physical variation the policy cannot observe, so it cannot fit it."""
+"""The training-time disturbance draws, without a simulator."""
 
+import math
 import unittest
 
-import numpy as np
+import torch
 
-from simtoolreal_animrl.envs.domain_randomization import DomainRandomization
-
-
-class _Cfg:
-    def __init__(self, enabled=True, **kw):
-        self.enabled = enabled
-        self.arm_stiffness_range = kw.get("arm_stiffness_range", 0.0)
-        self.arm_damping_range = kw.get("arm_damping_range", 0.0)
-        self.hand_stiffness_range = kw.get("hand_stiffness_range", 0.0)
-        self.hand_damping_range = kw.get("hand_damping_range", 0.0)
-        self.fingertip_friction_range = kw.get("fingertip_friction_range", 0.0)
-        self.object_friction_range = kw.get("object_friction_range", 0.0)
-        self.object_mass_range = kw.get("object_mass_range", 0.0)
-        self.table_friction_range = kw.get("table_friction_range", 0.0)
-        self.robot_link_mass_range = kw.get("robot_link_mass_range", 0.0)
-        self.robot_impulse_probability = kw.get("robot_impulse_probability", 0.0)
-        self.robot_impulse_n = kw.get("robot_impulse_n", 0.0)
-        self.object_impulse_probability = kw.get("object_impulse_probability", 0.0)
-        self.object_impulse_n = kw.get("object_impulse_n", 0.0)
-        self.critic_observes_parameters = kw.get("critic_observes_parameters", False)
+from simtoolreal_animrl.cfg.simtoolreal_config import SimToolRealCfg
+from simtoolreal_animrl.envs.domain_randomization import (
+    log_uniform_scales,
+    random_vectors_in_ball,
+    resolve_settings,
+    velocity_noise_for_position_noise,
+)
 
 
 class DomainRandomizationTest(unittest.TestCase):
-    def test_disabled_reproduces_the_fixed_values_exactly(self):
-        dr = DomainRandomization(_Cfg(enabled=False, hand_stiffness_range=0.4), 64)
-        self.assertTrue(all(dr.multiplier("hand_stiffness", i) == 1.0
-                            for i in range(64)))
+    def test_it_is_enabled_by_default_to_match_grasp_asym_scratch(self):
+        self.assertIsNotNone(resolve_settings(SimToolRealCfg().domain_randomization))
 
-    def test_a_zero_range_leaves_that_parameter_alone(self):
-        dr = DomainRandomization(_Cfg(hand_stiffness_range=0.4), 64)
-        self.assertTrue(all(dr.multiplier("object_mass", i) == 1.0
-                            for i in range(64)))
-
-    def test_multipliers_stay_inside_the_requested_band(self):
-        dr = DomainRandomization(_Cfg(hand_stiffness_range=0.4), 4096)
-        values = dr.samples["hand_stiffness"]
-        self.assertGreaterEqual(values.min(), 0.6)
-        self.assertLessEqual(values.max(), 1.4)
-        self.assertAlmostEqual(values.mean(), 1.0, places=1)
-
-    def test_environments_differ_from_one_another(self):
-        """The whole point: a policy cannot tune itself to one friction."""
-        dr = DomainRandomization(_Cfg(object_friction_range=0.4), 256)
-        self.assertGreater(len(set(dr.samples["object_friction"].tolist())), 200)
-
-    def test_parameters_are_drawn_independently(self):
-        """Correlated draws would let one compensating ratio be learned."""
-        dr = DomainRandomization(
-            _Cfg(hand_stiffness_range=0.4, object_friction_range=0.4), 4096
+    def test_the_defaults_are_the_probe_realistic_column(self):
+        cfg = SimToolRealCfg().domain_randomization
+        cfg.enabled = True
+        settings = resolve_settings(cfg)
+        self.assertAlmostEqual(settings["obs_q_noise_rad"], 0.005)
+        self.assertAlmostEqual(settings["obs_q_bias_rad"], 0.005)
+        self.assertAlmostEqual(settings["init_q_offset_rad"], 0.030)
+        self.assertAlmostEqual(settings["init_dq_offset_rad_s"], 0.5)
+        self.assertEqual(settings["action_delay_max_steps"], 1)
+        self.assertEqual(settings["object_mass_scale_range"], (0.8, 1.2))
+        self.assertEqual(settings["object_inertia_scale_range"], (0.8, 1.2))
+        self.assertEqual(settings["object_friction_range"], (0.35, 0.65))
+        self.assertEqual(settings["object_restitution_range"], (0.0, 0.10))
+        self.assertEqual(settings["robot_friction_scale_range"], (0.8, 1.2))
+        self.assertEqual(settings["table_friction_range"], (0.4, 0.6))
+        self.assertEqual(settings["gravity_z_scale_range"], (0.97, 1.03))
+        self.assertAlmostEqual(settings["gravity_xy_max_m_s2"], 0.15)
+        self.assertAlmostEqual(
+            settings["external_wrench_probability_per_step"], 0.002
         )
-        r = np.corrcoef(dr.samples["hand_stiffness"], dr.samples["object_friction"])
-        self.assertLess(abs(r[0, 1]), 0.1)
+        self.assertEqual(settings["external_wrench_duration_steps"], 6)
+        self.assertAlmostEqual(settings["external_force_max_n"], 1.0)
+        self.assertAlmostEqual(settings["external_torque_max_nm"], 0.02)
+        # Well under the 0.35 rad arm termination threshold, or the condition
+        # degenerates into self-inflicted failure.
+        self.assertLess(settings["init_q_offset_rad"], 0.35 / 4.0)
 
-    def test_it_is_reproducible_from_the_seed(self):
-        a = DomainRandomization(_Cfg(object_mass_range=0.25), 128, seed=7)
-        b = DomainRandomization(_Cfg(object_mass_range=0.25), 128, seed=7)
-        np.testing.assert_allclose(a.samples["object_mass"], b.samples["object_mass"])
-
-    def test_an_out_of_bounds_range_is_rejected(self):
-        for bad in (-0.1, 1.0, 2.0):
-            with self.assertRaises(ValueError):
-                DomainRandomization(_Cfg(hand_stiffness_range=bad), 8)
-
-    def test_the_critic_row_is_centred_on_zero_and_one_per_parameter(self):
-        dr = DomainRandomization(_Cfg(hand_stiffness_range=0.4), 256)
-        row = dr.privileged_row(0)
-        self.assertEqual(row.shape, (9,))
-        self.assertEqual(dr.privileged_dim, 0)  # off unless the critic asks
-        rows = np.stack([dr.privileged_row(i) for i in range(256)])
-        self.assertAlmostEqual(float(rows.mean()), 0.0, places=1)
-
-    def test_a_disabled_randomisation_adds_no_critic_input(self):
-        dr = DomainRandomization(_Cfg(enabled=False), 8)
-        self.assertEqual(dr.privileged_dim, 0)
-
-    def test_the_critic_sees_the_parameters_only_when_asked(self):
-        off = DomainRandomization(_Cfg(hand_stiffness_range=0.4), 16)
-        on = DomainRandomization(
-            _Cfg(hand_stiffness_range=0.4, critic_observes_parameters=True), 16
+    def test_velocity_noise_follows_from_the_encoder_and_the_rate(self):
+        """sigma_dq is the cost of differentiating q once per control step."""
+        self.assertAlmostEqual(
+            velocity_noise_for_position_noise(0.005, 60.0), 0.42426, places=5
         )
-        self.assertEqual(off.privileged_dim, 0)
-        self.assertEqual(on.privileged_dim, 9)
-        self.assertEqual(tuple(on.privileged_table().shape), (16, 9))
-
-    def test_impulses_are_off_until_both_probability_and_size_are_set(self):
-        self.assertFalse(
-            DomainRandomization(_Cfg(robot_impulse_probability=0.02), 8).impulses_enabled
+        cfg = SimToolRealCfg().domain_randomization
+        cfg.enabled = True
+        cfg.obs_q_noise_rad = 0.020
+        settings = resolve_settings(cfg)
+        self.assertAlmostEqual(
+            settings["obs_dq_noise_rad_s"],
+            math.sqrt(2.0) * 60.0 * 0.020,
+            places=6,
         )
-        self.assertTrue(
-            DomainRandomization(
-                _Cfg(robot_impulse_probability=0.02, robot_impulse_n=8.0), 8
-            ).impulses_enabled
+
+    def test_the_coupling_can_be_turned_off(self):
+        cfg = SimToolRealCfg().domain_randomization
+        cfg.enabled = True
+        cfg.couple_velocity_noise_to_position_noise = False
+        cfg.obs_dq_noise_rad_s = 1.5
+        self.assertAlmostEqual(resolve_settings(cfg)["obs_dq_noise_rad_s"], 1.5)
+
+    def test_a_negative_magnitude_is_rejected_rather_than_silently_trained(self):
+        cfg = SimToolRealCfg().domain_randomization
+        cfg.enabled = True
+        cfg.obs_q_noise_rad = -0.001
+        with self.assertRaises(ValueError):
+            resolve_settings(cfg)
+        cfg.obs_q_noise_rad = 0.005
+        cfg.action_delay_max_steps = -1
+        with self.assertRaises(ValueError):
+            resolve_settings(cfg)
+
+    def test_zero_halfwidth_is_exactly_one_so_the_null_gate_holds(self):
+        scales = log_uniform_scales((64,), 0.0, torch.device("cpu"))
+        self.assertTrue(bool((scales == 1.0).all()))
+
+    def test_external_wrenches_are_isotropic_and_bounded(self):
+        generator = torch.Generator().manual_seed(12)
+        vectors = random_vectors_in_ball(
+            10000, 1.5, torch.device("cpu"), generator=generator
+        )
+        norms = torch.linalg.vector_norm(vectors, dim=1)
+        self.assertLessEqual(float(norms.max()), 1.5 + 1e-6)
+        self.assertLess(float(vectors.mean(dim=0).abs().max()), 0.03)
+
+    def test_invalid_physics_ranges_are_rejected(self):
+        cfg = SimToolRealCfg().domain_randomization
+        cfg.object_mass_scale_range = [1.2, 0.8]
+        with self.assertRaises(ValueError):
+            resolve_settings(cfg)
+        cfg.object_mass_scale_range = [0.8, 1.2]
+        cfg.object_restitution_range = [0.0, 1.1]
+        with self.assertRaises(ValueError):
+            resolve_settings(cfg)
+        cfg.object_restitution_range = [0.0, 0.1]
+        cfg.external_wrench_probability_per_step = 1.1
+        with self.assertRaises(ValueError):
+            resolve_settings(cfg)
+
+    def test_gains_land_inside_the_configured_band_symmetrically_in_log(self):
+        generator = torch.Generator().manual_seed(0)
+        scales = log_uniform_scales(
+            (200000,), 0.3219, torch.device("cpu"), generator=generator
+        )
+        self.assertGreaterEqual(float(scales.min()), 2.0 ** -0.3219 - 1e-6)
+        self.assertLessEqual(float(scales.max()), 2.0 ** 0.3219 + 1e-6)
+        # Symmetric in log space, which is the point of drawing there: halving
+        # and doubling a gain have to be equally likely.
+        self.assertAlmostEqual(
+            float(torch.log2(scales).mean()), 0.0, places=2
         )
 
 

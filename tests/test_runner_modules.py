@@ -362,6 +362,7 @@ class RunnerModulesTest(unittest.TestCase):
             "velocity_reward": ones,
             "action_rate_reward": ones,
             "rms_action_rate": torch.zeros(num_envs),
+            "rms_hand_action_rate": torch.zeros(num_envs),
             "hand_position_reward": 0.4 * ones,
             "hand_velocity_reward": ones,
             "hand_action_rate_reward": ones,

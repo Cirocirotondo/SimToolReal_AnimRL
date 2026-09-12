@@ -1,6 +1,6 @@
 # MuJoCo sim2sim
 
-This package runs the blind 108-observation, 26-action AnimRL policy in a
+This package runs the blind 112-observation, 26-action AnimRL policy in a
 standalone MuJoCo model of the UR5e, right DG5F hand, table, and cuboid. It does
 not import the sibling `simtoolreal` repository and it does not require Isaac
 Gym at runtime.

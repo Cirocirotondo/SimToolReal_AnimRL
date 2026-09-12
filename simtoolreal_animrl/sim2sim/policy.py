@@ -60,7 +60,7 @@ def load_saved_run(
     action_dim = int(saved["env_cfg"]["env"]["num_actions"])
     if observation_dim != BASE_OBSERVATION_DIM or action_dim != ACTION_DIM:
         raise ValueError(
-            "This MuJoCo runner requires the blind 108/26 contract, got {}/{}".format(
+            "This MuJoCo runner requires the blind 112/26 contract, got {}/{}".format(
                 observation_dim, action_dim
             )
         )

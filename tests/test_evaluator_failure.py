@@ -87,6 +87,60 @@ class EvaluatorFailureTest(unittest.TestCase):
         self.assertEqual(result, {"evaluation_score": 0.5})
         self.assertEqual(evaluator.consecutive_failures, 0)
 
+    def test_success_saves_a_full_phase_zero_plot_set_by_iteration(self):
+        with TemporaryDirectory() as workspace:
+            evaluator = self._evaluator(workspace)
+            commands = []
+
+            def complete(command, check=False):
+                del check
+                commands.append(command)
+                if Path(command[1]).name == "periodic_evaluate.py":
+                    output = Path(workspace) / ".periodic_evaluation_metrics.json"
+                    output.write_text(
+                        json.dumps({"evaluation_score": 0.5}), encoding="utf-8"
+                    )
+                return mock.Mock(returncode=0)
+
+            with mock.patch("subprocess.run", side_effect=complete):
+                result = evaluator(1500, _FakeRunner())
+
+        self.assertEqual(result, {"evaluation_score": 0.5})
+        self.assertEqual(len(commands), 2)
+        plot_command = commands[1]
+        self.assertEqual(Path(plot_command[1]).name, "evaluate.py")
+
+        def argument(name):
+            return plot_command[plot_command.index(name) + 1]
+
+        self.assertEqual(argument("--rsi-index"), "0")
+        self.assertEqual(argument("--num-envs"), "1")
+        self.assertEqual(
+            Path(argument("--plot-dir")),
+            Path(workspace) / "eval_plots" / "iteration_001500",
+        )
+        self.assertIn("--no-show-plots", plot_command)
+
+    def test_a_plot_failure_keeps_valid_evaluation_metrics(self):
+        with TemporaryDirectory() as workspace:
+            evaluator = self._evaluator(workspace)
+
+            def score_then_fail(command, check=False):
+                del check
+                if Path(command[1]).name == "periodic_evaluate.py":
+                    output = Path(workspace) / ".periodic_evaluation_metrics.json"
+                    output.write_text(
+                        json.dumps({"evaluation_score": 0.5}), encoding="utf-8"
+                    )
+                    return mock.Mock(returncode=0)
+                raise subprocess.CalledProcessError(1, command)
+
+            with mock.patch("subprocess.run", side_effect=score_then_fail):
+                result = evaluator(500, _FakeRunner())
+
+        self.assertEqual(result, {"evaluation_score": 0.5})
+        self.assertEqual(evaluator.consecutive_failures, 0)
+
     def test_the_temporary_checkpoint_is_removed_even_on_failure(self):
         """The finally clause still has to clean up after a crash."""
         with TemporaryDirectory() as workspace:

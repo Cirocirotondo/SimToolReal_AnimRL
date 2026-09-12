@@ -39,20 +39,9 @@ class AdaptiveSigma:
     the ladder never ends: sigma chases the policy down indefinitely and the
     term keeps demanding improvement in a dimension that no longer matters,
     which is how blind_sharp traded its grasp away for tracking it did not need.
-
-    ``slack`` is how far above its tightest value the width may relax when the
-    policy regresses. A width pinned to the all-time best sounds strict but is
-    self-defeating: adapt_sigma's arm width locked at 0.0268 while arm error
-    drifted 0.0318 -> 0.0747, so the term sat at almost zero reward for 1500
-    iterations and stopped providing a gradient at all -- the dead zone the
-    class exists to avoid, reached from the other side. Allowing a bounded
-    relaxation keeps the term informative during a regression while still
-    making the regression cost something.
     """
 
-    def __init__(
-        self, initial, floor, target_reward=0.6, decay=0.999, slack=1.5
-    ):
+    def __init__(self, initial, floor, target_reward=0.6, decay=0.999, slack=1.5):
         if float(floor) <= 0.0:
             raise ValueError("Adaptive sigma floor must be positive")
         if not 0.0 <= float(decay) < 1.0:
@@ -61,11 +50,11 @@ class AdaptiveSigma:
         self.floor = float(floor)
         self.target_reward = float(target_reward)
         self.decay = float(decay)
-        self.mean_squared_error = None
         if float(slack) < 1.0:
             raise ValueError("Adaptive sigma slack must be at least 1.0")
         self.slack = float(slack)
         self.tightest = float(initial)
+        self.mean_squared_error = None
 
     def update(self, batch_mean_squared_error):
         """Fold in one iteration's MSE and return the width to use next."""
@@ -82,11 +71,7 @@ class AdaptiveSigma:
         if target is not None:
             target = max(self.floor, target)
             self.tightest = min(self.tightest, target)
-            # Tighten freely; relax only up to slack x the tightest width ever
-            # reached, so a regression is expensive but still has a gradient
-            # pointing back.
-            self.sigma = min(target, self.tightest * self.slack)
-            self.sigma = max(self.floor, self.sigma)
+            self.sigma = max(self.floor, min(target, self.tightest * self.slack))
         return self.sigma
 
     def state(self):
@@ -95,3 +80,28 @@ class AdaptiveSigma:
             "tightest": self.tightest,
             "mean_squared_error": self.mean_squared_error,
         }
+
+    def load_state(self, state):
+        """Restore a ladder saved by ``state()``.
+
+        Without this a resumed run silently rebuilds every width from the
+        configuration, which hands the policy back the wide sigma it started
+        from. The term is then pinned at 1 again, stops paying, and the
+        tracking it was holding drifts -- measured on rot6d_adaptive, arm error
+        went 0.044 -> 0.136 over the 1200 iterations after a resume, with no
+        other change.
+        """
+        if not isinstance(state, dict):
+            return
+        sigma = state.get("sigma")
+        if sigma is not None and math.isfinite(float(sigma)):
+            self.sigma = max(self.floor, float(sigma))
+        tightest = state.get("tightest")
+        if tightest is not None and math.isfinite(float(tightest)):
+            self.tightest = max(self.floor, float(tightest))
+        else:
+            self.tightest = min(self.tightest, self.sigma)
+        mse = state.get("mean_squared_error")
+        self.mean_squared_error = (
+            None if mse is None or not math.isfinite(float(mse)) else float(mse)
+        )

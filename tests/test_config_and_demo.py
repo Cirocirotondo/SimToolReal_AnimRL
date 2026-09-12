@@ -11,20 +11,23 @@ class ConfigAndDemoTest(unittest.TestCase):
     def test_animrl_configuration_values(self):
         env_cfg = SimToolRealCfg()
         train_cfg = SimToolRealTrainCfg()
-        self.assertEqual(env_cfg.env.num_envs, 4096)
+        self.assertEqual(env_cfg.env.num_envs, 256)
         self.assertEqual(env_cfg.env.episode_length, 360)
-        self.assertEqual(env_cfg.env.num_observations, 108)
+        self.assertEqual(env_cfg.env.num_observations, 112)
         self.assertEqual(env_cfg.env.num_actions, 26)
-        self.assertEqual(env_cfg.env.reference_init_distribution, "uniform")
-        self.assertEqual(env_cfg.env.rsi_early_probability, 0.20)
+        self.assertEqual(
+            env_cfg.env.reference_init_distribution, "pregrasp_mixture"
+        )
+        self.assertEqual(env_cfg.env.rsi_early_probability, 0.30)
         self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 740)
-        self.assertEqual(env_cfg.env.rsi_max_start_index, 1106)
+        self.assertEqual(env_cfg.env.rsi_max_start_index, 830)
         self.assertEqual(
             env_cfg.control.action_parameterization, "animrl_residual"
         )
         self.assertEqual(env_cfg.control.scale_joint_target, 0.25)
         self.assertEqual(env_cfg.control.scale_hand_joint_target, 0.15)
         self.assertEqual(env_cfg.control.clip_joint_target, 100.0)
+        self.assertEqual(env_cfg.control.hand_stiffness_scale, 0.5)
         # The fingers are allowed to pass through each other, which is what
         # makes the step roughly twice as fast; see asset.self_collision.
         self.assertFalse(env_cfg.asset.self_collision)
@@ -62,22 +65,29 @@ class ConfigAndDemoTest(unittest.TestCase):
             env_cfg.rewards.fingertip_object_distance_names,
             ["thumb", "index", "middle"],
         )
-        self.assertFalse(env_cfg.contact.enabled)
+        self.assertTrue(env_cfg.contact.enabled)
+        self.assertTrue(env_cfg.contact.critic_observes_fingertip_forces)
+        self.assertTrue(env_cfg.rewards.adaptive_sigma_enabled)
+        self.assertTrue(env_cfg.domain_randomization.enabled)
         self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
         self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
         self.assertTrue(env_cfg.termination.object_position_enabled)
-        self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.07)
+        self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.11)
         self.assertTrue(env_cfg.termination.enabled)
         self.assertEqual(env_cfg.termination.arm_position_threshold_rad, 0.35)
         self.assertEqual(env_cfg.termination.hand_position_threshold_rad, 1.35)
         self.assertEqual(env_cfg.termination.grace_steps, 5)
         self.assertEqual(env_cfg.table.surface_below_robot_base_m, 0.035)
+        self.assertEqual(env_cfg.sim.physx.max_gpu_contact_pairs, 16 * 1024 * 1024)
+        self.assertTrue(env_cfg.viewer.training_camera_enabled)
         self.assertEqual(train_cfg.algorithm.num_learning_epochs, 5)
         self.assertEqual(train_cfg.algorithm.num_mini_batches, 4)
         self.assertEqual(train_cfg.algorithm.learning_rate, 0.5e-4)
         self.assertEqual(train_cfg.algorithm.entropy_coef, 0.001)
         self.assertEqual(train_cfg.policy.max_action_std, 3.0)
         self.assertEqual(train_cfg.algorithm.schedule, "fixed")
+        self.assertTrue(train_cfg.runner.record_video)
+        self.assertEqual(train_cfg.runner.evaluation_interval, 500)
 
     def test_processed_demonstration_contract(self):
         cfg = SimToolRealCfg()

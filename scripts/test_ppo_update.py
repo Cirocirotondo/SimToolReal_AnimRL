@@ -60,7 +60,7 @@ def main():
         if ppo.storage.observations.shape != (
             train_cfg.runner.num_steps_per_env,
             env.num_envs,
-            108,
+            112,
         ):
             raise AssertionError("Unexpected rollout observation shape")
         if ppo.storage.actions.shape[-1] != 26:

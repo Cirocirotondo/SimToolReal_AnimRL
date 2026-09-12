@@ -20,10 +20,8 @@ from simtoolreal_animrl.sim2sim.mujoco_sim import (
     MujocoSceneConfig,
 )
 from simtoolreal_animrl.sim2sim.observation import (
-    QuaternionContinuity,
     actions_to_position_targets,
     build_observation,
-    smoothstep01,
 )
 from simtoolreal_animrl.sim2sim.policy import (
     AnimRLInferencePolicy,
@@ -84,14 +82,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-kp", type=float, default=5.0)
     parser.add_argument("--hand-kv", type=float, default=0.25)
     parser.add_argument(
-        "--startup-ramp-seconds", type=float, default=1.0,
-        help="Smoothly ramp targets from the RSI pose (default: 1.0 s).",
-    )
-    parser.add_argument(
-        "--startup-policy-blend-seconds", type=float, default=1.0,
-        help="Blend from reference to learned actions at startup (default: 1.0 s).",
-    )
-    parser.add_argument(
         "--training-pd-gains",
         action="store_true",
         help=(
@@ -99,22 +89,6 @@ def parse_args() -> argparse.Namespace:
             "the adapt_sigma policy. This "
             "takes precedence over --arm-kp/--arm-kv/--hand-kp/--hand-kv."
         ),
-    )
-    parser.add_argument(
-        "--training-arm-pd-gains",
-        dest="training_arm_pd_gains",
-        action="store_true",
-        default=True,
-        help=(
-            "Use the per-joint Isaac Gym arm Kp/Kd used in training while "
-            "keeping the conservative scalar hand gains."
-        ),
-    )
-    parser.add_argument(
-        "--scalar-arm-pd-gains",
-        dest="training_arm_pd_gains",
-        action="store_false",
-        help="Use --arm-kp/--arm-kv instead of the training arm gains.",
     )
     parser.add_argument(
         "--contact-settle-seconds",
@@ -158,27 +132,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--no-realtime", action="store_true")
-    parser.add_argument(
-        "--continuous-quaternions",
-        action="store_true",
-        help=(
-            "Unwrap the two legacy 108-D quaternion signs against the "
-            "preceding observation."
-        ),
-    )
-    parser.add_argument(
-        "--continuous-quaternions-until-seconds",
-        type=float,
-        default=None,
-        help=(
-            "Apply sign unwrapping only before this absolute demonstration "
-            "time; requires --continuous-quaternions."
-        ),
-    )
-    parser.add_argument("--smooth-quaternion-transition", action="store_true")
-    parser.add_argument(
-        "--quaternion-transition-duration-seconds", type=float, default=1.0,
-    )
     parser.add_argument("--print-every", type=int, default=60)
     return parser.parse_args()
 
@@ -200,30 +153,6 @@ def main() -> None:
         raise ValueError("--contact-settle-seconds cannot be negative")
     if args.start_delay_seconds < 0.0:
         raise ValueError("--start-delay-seconds cannot be negative")
-    if args.startup_ramp_seconds < 0.0:
-        raise ValueError("--startup-ramp-seconds cannot be negative")
-    if args.startup_policy_blend_seconds < 0.0:
-        raise ValueError("--startup-policy-blend-seconds cannot be negative")
-    if (
-        args.continuous_quaternions_until_seconds is not None
-        and args.continuous_quaternions_until_seconds < 0.0
-    ):
-        raise ValueError("--continuous-quaternions-until-seconds cannot be negative")
-    if (
-        args.continuous_quaternions_until_seconds is not None
-        and not args.continuous_quaternions
-    ):
-        raise ValueError(
-            "--continuous-quaternions-until-seconds requires "
-            "--continuous-quaternions"
-        )
-    if args.smooth_quaternion_transition and args.continuous_quaternions:
-        raise ValueError(
-            "--smooth-quaternion-transition and --continuous-quaternions "
-            "are mutually exclusive"
-        )
-    if args.quaternion_transition_duration_seconds <= 0.0:
-        raise ValueError("--quaternion-transition-duration-seconds must be positive")
 
     run = load_saved_run(args.checkpoint, args.config)
     env_cfg = run.env_cfg
@@ -245,9 +174,6 @@ def main() -> None:
     if args.training_pd_gains:
         training_joint_kp = TRAINING_ARM_KP + TRAINING_HAND_KP
         training_joint_kd = TRAINING_ARM_KD + TRAINING_HAND_KD
-    elif args.training_arm_pd_gains:
-        training_joint_kp = TRAINING_ARM_KP + (args.hand_kp,) * 20
-        training_joint_kd = TRAINING_ARM_KD + (args.hand_kv,) * 20
     scene_config = MujocoSceneConfig.from_saved_config(
         run.repo_root,
         env_cfg,
@@ -298,22 +224,17 @@ def main() -> None:
         sim.set_reference_ghost(sample.q[0].numpy())
         sim.sync_viewer()
         previous_targets = sample.q[0].numpy().astype(np.float64)
-        startup_q = previous_targets.copy()
         previous_action = (previous_targets - defaults) / action_scales
         reference_index = start_index
         steps = 0
-        if args.training_pd_gains:
+        if scene_config.joint_kp is not None:
             pd_description = "hardcoded adapt_sigma training per-joint gains"
-        elif args.training_arm_pd_gains:
-            pd_description = (
-                "training per-joint arm gains, hand={}/{}"
-            ).format(args.hand_kp, args.hand_kv)
         else:
             pd_description = "arm={}/{}, hand={}/{}".format(
                 args.arm_kp, args.arm_kv, args.hand_kp, args.hand_kv
             )
         print(
-            "MuJoCo AnimRL sim2sim: checkpoint={}, observations/actions=108/26, "
+            "MuJoCo AnimRL sim2sim: checkpoint={}, observations/actions=112/26, "
             "RSI={}, control=60 Hz, physics={:.1f} Hz, viewer={}, "
             "PD {}".format(
                 run.checkpoint_path,
@@ -341,85 +262,19 @@ def main() -> None:
                 sim.sync_viewer()
                 time.sleep(min(0.01, max(0.0, deadline - time.perf_counter())))
 
-        quaternion_continuity = (
-            QuaternionContinuity()
-            if args.continuous_quaternions or args.smooth_quaternion_transition
-            else None
-        )
-        quaternion_transition_started_at = None
         while reference_index < reference.last_index and sim.viewer_is_running():
             if args.max_steps and steps >= args.max_steps:
                 break
             started = time.perf_counter()
             phase = reference_index / float(reference.last_index)
-            canonical_observation = build_observation(
+            observation = build_observation(
                 sim.get_state(),
                 previous_targets,
                 phase,
                 sim.joint_lower_limits,
                 sim.joint_upper_limits,
             )
-            continuity_active = (
-                quaternion_continuity is not None
-                and args.continuous_quaternions
-                and (
-                    args.continuous_quaternions_until_seconds is None
-                    or reference_index * control_dt
-                    < args.continuous_quaternions_until_seconds
-                )
-            )
-            observation = canonical_observation
-            if continuity_active:
-                observation = quaternion_continuity.apply(observation)
-            if args.smooth_quaternion_transition:
-                continuous_observation = quaternion_continuity.apply(
-                    canonical_observation
-                )
-                demo_seconds = reference_index * control_dt
-                if (
-                    quaternion_transition_started_at is None
-                    and any(quaternion_continuity.last_flipped)
-                ):
-                    quaternion_transition_started_at = demo_seconds
-                    print(
-                        "Quaternion action transition triggered at {:.3f} s".format(
-                            demo_seconds
-                        )
-                    )
-                progress = (
-                    0.0
-                    if quaternion_transition_started_at is None
-                    else (demo_seconds - quaternion_transition_started_at)
-                    / args.quaternion_transition_duration_seconds
-                )
-                canonical_weight = smoothstep01(progress)
-                if canonical_weight <= 0.0:
-                    actions = actor(continuous_observation)
-                elif canonical_weight >= 1.0:
-                    actions = actor(canonical_observation)
-                else:
-                    actions = (
-                        (1.0 - canonical_weight) * actor(continuous_observation)
-                        + canonical_weight * actor(canonical_observation)
-                    )
-            else:
-                actions = actor(observation)
-            if args.startup_policy_blend_seconds > 0.0:
-                startup_policy_progress = (
-                    steps * control_dt / args.startup_policy_blend_seconds
-                )
-                if startup_policy_progress < 1.0:
-                    current_reference = reference.sample(
-                        np_to_long_tensor(reference_index)
-                    )
-                    reference_actions = (
-                        current_reference.q[0].numpy() - defaults
-                    ) / action_scales
-                    policy_weight = smoothstep01(startup_policy_progress)
-                    actions = (
-                        (1.0 - policy_weight) * reference_actions
-                        + policy_weight * actions
-                    )
+            actions = actor(observation)
             targets = actions_to_position_targets(
                 actions,
                 defaults,
@@ -427,16 +282,6 @@ def main() -> None:
                 hand_scale=float(control_cfg["scale_hand_joint_target"]),
                 residual_clip=float(control_cfg["clip_joint_target"]),
             )
-            if args.startup_ramp_seconds > 0.0:
-                startup_progress = (
-                    (steps + 1) * control_dt / args.startup_ramp_seconds
-                )
-                if startup_progress < 1.0:
-                    startup_weight = smoothstep01(startup_progress)
-                    targets = (
-                        (1.0 - startup_weight) * startup_q
-                        + startup_weight * targets
-                    )
             next_reference = reference.sample(
                 np_to_long_tensor(reference_index + 1)
             )

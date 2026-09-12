@@ -57,6 +57,10 @@ def main():
     # This process stands up a second PhysX context beside the live training
     # one, so it takes only the contact-pair budget 64 environments can use.
     clamp_evaluation_physx(env_cfg.sim.physx)
+    # Evaluation reports the policy on the nominal robot, for the same reason
+    # it runs unassisted: a score that moves with each episode's gain draw and
+    # encoder noise cannot rank checkpoints against each other.
+    env_cfg.domain_randomization.enabled = False
     if float(args.object_assist_scale) <= 0.0:
         # Not merely scaled to zero: a disabled assist also skips the
         # per-rigid-body force buffers this process would never use.

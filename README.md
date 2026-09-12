@@ -38,11 +38,28 @@ configured early/pre-grasp RSI mixture, executes ideal AnimRL residual actions, 
 tracking, reward, early termination, object physics, collision filtering, and
 the Cartwheel-style reference-end timeout.
 
-The policy observation has 108 values. The first 79 are 26 normalized joint
+The policy observation has 112 values. The first 79 are 26 normalized joint
 positions, 26 previously applied physical joint targets, 26 joint velocities,
-and phase. They are followed by palm pose in the robot-base frame (7), the five
-fingertip positions relative to the palm center in the palm frame (15), cube
-orientation relative to the palm (4), and cube center relative to the palm (3).
+and phase. They are followed by palm pose in the robot-base frame (3 position +
+6 rotation), the five fingertip positions relative to the palm center in the
+palm frame (15), cube rotation relative to the palm (6), and cube center
+relative to the palm (3).
+
+Both rotations use the continuous 6D encoding -- the first two columns of the
+rotation matrix -- rather than a quaternion. The quaternion form was
+canonicalized to `w >= 0`, which cuts the double cover at `w = 0`: a palm
+rotating smoothly through that plane negated all four components at once,
+stepping the observation by 2.0 while nothing physical happened. A continuous
+network cannot answer that with a continuous output, and `blind_quiet2` did not
+-- it crossed `w = 0` mid-approach and replied with a 4.03 action-unit step on
+`rj_dg_3_4` (0.63 rad) out of a stream whose neighbouring steps moved by 0.009,
+then rang for thirty frames. The 6D encoding has no sign to choose and needs no
+history: `q` and `-q` give the same matrix. Measured on the same open-loop
+trajectory, the quaternion steps by 2.0000 at the crossing where the 6D encoding
+steps by 0.0039, in line with its 0.0039 neighbours. See
+`simtoolreal_animrl/envs/rotations.py` and `tests/test_rotation_6d.py`.
+
+The 112D vector is checkpoint-incompatible with the earlier 108D policies.
 The 26 actions use AnimRL's unbounded residual parameterization around the
 first pose of the demonstration, with separate arm and hand residual scales.
 
@@ -428,6 +445,12 @@ episodes penalized by subtracting their fraction from the mean position reward.
 This preserves a useful ranking while all early policies still fail, and makes
 any fully successful cohort outrank a fully failed one. Periodic
 `model_<iteration>.pt` checkpoints are retained independently.
+After every periodic evaluation, one additional deterministic environment
+plays the complete demonstration from reference sample zero with early
+termination disabled. Its raw trace and standard diagnostic figures are saved
+under `eval_plots/iteration_<iteration>/episode_00/`; for example, iteration
+1500 writes
+`eval_plots/iteration_001500/episode_00/arm_action_per_joint.png`.
 
 Override the evaluation cadence and size without editing configs:
 

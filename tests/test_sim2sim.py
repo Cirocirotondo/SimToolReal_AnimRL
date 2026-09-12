@@ -13,12 +13,12 @@ from simtoolreal_animrl.sim2sim.constants import (
     PALM_POSITION_IN_WRIST,
 )
 from simtoolreal_animrl.sim2sim.observation import (
-    QuaternionContinuity,
     actions_to_position_targets,
     build_observation,
     normalize_canonical_quaternion,
+    quat_conjugate_xyzw,
     quat_rotate_xyzw,
-    smoothstep01,
+    quaternion_to_rotation_6d,
 )
 from simtoolreal_animrl.sim2sim.policy import (
     AnimRLInferencePolicy,
@@ -37,34 +37,6 @@ EVALUATION = RUN_DIR / "eval_best_model.json"
 
 
 class Sim2SimMathTest(unittest.TestCase):
-    def test_smoothstep_is_clamped_and_has_expected_midpoint(self):
-        self.assertEqual(smoothstep01(-1.0), 0.0)
-        self.assertEqual(smoothstep01(0.0), 0.0)
-        self.assertEqual(smoothstep01(0.5), 0.5)
-        self.assertEqual(smoothstep01(1.0), 1.0)
-        self.assertEqual(smoothstep01(2.0), 1.0)
-
-    def test_quaternion_continuity_unwraps_both_blocks_independently(self):
-        continuity = QuaternionContinuity()
-        first = np.zeros(BASE_OBSERVATION_DIM, dtype=np.float32)
-        first[82:86] = (0.1, 0.2, 0.3, 0.9)
-        first[101:105] = (0.4, -0.2, 0.1, 0.8)
-        first[82:86] /= np.linalg.norm(first[82:86])
-        first[101:105] /= np.linalg.norm(first[101:105])
-        np.testing.assert_array_equal(continuity.apply(first), first)
-
-        second = first.copy()
-        second[82:86] *= -1.0
-        result = continuity.apply(second)
-        np.testing.assert_allclose(result[82:86], first[82:86])
-        np.testing.assert_allclose(result[101:105], first[101:105])
-        self.assertAlmostEqual(float(np.linalg.norm(result[82:86])), 1.0, places=6)
-        self.assertAlmostEqual(float(np.linalg.norm(result[101:105])), 1.0, places=6)
-
-    def test_quaternion_continuity_rejects_wrong_observation_size(self):
-        with self.assertRaises(ValueError):
-            QuaternionContinuity().apply(np.zeros(107, dtype=np.float32))
-
     def test_quaternion_rotation_and_canonical_sign(self):
         half_sqrt = np.sqrt(0.5)
         quarter_turn_z = np.asarray((0.0, 0.0, half_sqrt, half_sqrt))
@@ -89,7 +61,7 @@ class Sim2SimMathTest(unittest.TestCase):
         np.testing.assert_allclose(targets[:6], defaults[:6] + 0.25)
         np.testing.assert_allclose(targets[6:], defaults[6:] + 0.15)
 
-    def test_observation_has_the_saved_108_dimension_layout(self):
+    def test_observation_has_the_saved_112_dimension_layout(self):
         lower = -np.ones(ACTION_DIM)
         upper = np.ones(ACTION_DIM)
         previous_targets = np.linspace(-0.4, 0.4, ACTION_DIM)
@@ -117,8 +89,20 @@ class Sim2SimMathTest(unittest.TestCase):
         np.testing.assert_allclose(observation[52:78], velocities)
         self.assertAlmostEqual(float(observation[78]), 0.25)
         np.testing.assert_allclose(observation[79:82], PALM_POSITION_IN_WRIST)
+        # Both rotations are the continuous 6D encoding, not the quaternion:
+        # 3 + 6 palm, 15 fingertips, 6 + 3 cube.
         np.testing.assert_allclose(
-            observation[82:86], PALM_ORIENTATION_IN_WRIST_XYZW
+            observation[82:88],
+            quaternion_to_rotation_6d(PALM_ORIENTATION_IN_WRIST_XYZW),
+            rtol=1e-6,
+        )
+        self.assertEqual(observation[88:103].size, 15)
+        np.testing.assert_allclose(
+            observation[103:109],
+            quaternion_to_rotation_6d(
+                quat_conjugate_xyzw(PALM_ORIENTATION_IN_WRIST_XYZW)
+            ),
+            rtol=1e-6,
         )
         self.assertTrue(np.isfinite(observation).all())
 
@@ -168,7 +152,7 @@ class Sim2SimMathTest(unittest.TestCase):
 class SavedBlindCheckpointTest(unittest.TestCase):
     def test_saved_contract_is_blind_108_by_26(self):
         run = load_saved_run(CHECKPOINT, CONFIG)
-        self.assertEqual(run.env_cfg["env"]["num_observations"], 108)
+        self.assertEqual(run.env_cfg["env"]["num_observations"], 112)
         self.assertEqual(run.env_cfg["env"]["num_actions"], 26)
         self.assertFalse(run.env_cfg["contact"]["observe_fingertip_forces"])
         self.assertFalse(run.env_cfg["object_assist"]["enabled"])
@@ -385,7 +369,7 @@ class MujocoBackendTest(unittest.TestCase):
                 simulation.joint_lower_limits,
                 simulation.joint_upper_limits,
             )
-            self.assertEqual(observation.shape, (108,))
+            self.assertEqual(observation.shape, (112,))
             simulation.set_position_targets(sample.q[0].numpy())
             simulation.step_for(1.0 / 60.0)
             stepped = simulation.get_state()

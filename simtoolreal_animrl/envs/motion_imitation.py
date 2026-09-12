@@ -22,14 +22,6 @@ from simtoolreal_animrl.envs.controller import (
     validate_joint_order,
 )
 from simtoolreal_animrl.envs.adaptive_sigma import AdaptiveSigma
-from simtoolreal_animrl.envs.rsi_noise import perturb_reference_pose
-from simtoolreal_animrl.envs.sensing import (
-    ActionDelay,
-    add_observation_noise,
-    sample_position_bias,
-)
-from simtoolreal_animrl.envs.disturbance import sample_impulses
-from simtoolreal_animrl.envs.domain_randomization import DomainRandomization
 from simtoolreal_animrl.envs.contact import (
     fingertip_contact_diagnostics,
     fingertip_force_norms,
@@ -46,6 +38,15 @@ from simtoolreal_animrl.envs.object_assist import (
 )
 from simtoolreal_animrl.envs.proximity import fingertip_cuboid_proximity
 from simtoolreal_animrl.envs.rsi import resolve_rsi_settings, sample_rsi_indices
+from simtoolreal_animrl.envs.domain_randomization import (
+    log_uniform_scales,
+    random_vectors_in_ball,
+    resolve_settings as resolve_domain_randomization,
+)
+from simtoolreal_animrl.envs.rotations import (
+    normalize_canonical_quaternion as _normalize_canonical_quaternion,
+    quaternion_to_rotation_6d as _quaternion_to_rotation_6d,
+)
 
 
 # The fixed wrist -> mount -> base -> palm chain is collapsed while loading the
@@ -107,11 +108,6 @@ def _quat_rotate_inverse(
     return _quat_rotate(_quat_conjugate(quaternion), vector)
 
 
-def _normalize_canonical_quaternion(quaternion: torch.Tensor) -> torch.Tensor:
-    quaternion = torch.nn.functional.normalize(quaternion, dim=-1)
-    return torch.where(quaternion[..., 3:4] < 0.0, -quaternion, quaternion)
-
-
 class MotionImitationEnv:
     """AnimRL-compatible environment API without an RL algorithm dependency."""
 
@@ -134,13 +130,6 @@ class MotionImitationEnv:
             self.cfg.env.num_envs = int(num_envs_override)
 
         self.num_envs = int(self.cfg.env.num_envs)
-        # Built here rather than in _create_envs because the critic's width is
-        # computed before the environments exist, and both need the same draw.
-        self.domain_randomization = DomainRandomization(
-            getattr(self.cfg, "domain_randomization", object()),
-            self.num_envs,
-            seed=int(getattr(self.cfg, "seed", 0) or 0),
-        )
         self.num_obs = int(self.cfg.env.num_observations)
         self.num_privileged_obs = self.cfg.env.num_privileged_obs
         self.num_actions = int(self.cfg.env.num_actions)
@@ -285,6 +274,19 @@ class MotionImitationEnv:
                         getattr(rewards_cfg_init, "adaptive_sigma_slack", 1.5)
                     ),
                 )
+        self.domain_randomization = resolve_domain_randomization(
+            getattr(self.cfg, "domain_randomization", None)
+        )
+        self.external_wrench_enabled = bool(
+            self.domain_randomization is not None
+            and self.domain_randomization[
+                "external_wrench_probability_per_step"
+            ] > 0.0
+            and (
+                self.domain_randomization["external_force_max_n"] > 0.0
+                or self.domain_randomization["external_torque_max_nm"] > 0.0
+            )
+        )
         self.contact_observation_dim = fingertip_force_observation_dim(
             self.cfg.contact
         )
@@ -301,25 +303,15 @@ class MotionImitationEnv:
             )
             else 0
         )
-        # Randomisation multipliers the critic may also read. Scratch runs only:
-        # this widens the critic input, so no existing value network fits.
-        self.critic_parameter_dim = self.domain_randomization.privileged_dim
-        # The tensor itself is built in _allocate_buffers, once self.device
-        # exists; only the width is needed this early.
-        self.critic_parameter_table = None
-        if self.critic_force_observation_dim or self.critic_parameter_dim:
-            if self.critic_force_observation_dim and not bool(
-                getattr(self.cfg.contact, "enabled", False)
-            ):
+        if self.critic_force_observation_dim:
+            if not bool(getattr(self.cfg.contact, "enabled", False)):
                 raise ValueError(
                     "critic_observes_fingertip_forces requires contact.enabled: "
                     "the net contact force tensor is only wrapped when contact "
                     "reporting is on"
                 )
             self.num_privileged_obs = (
-                self.num_obs
-                + self.critic_force_observation_dim
-                + self.critic_parameter_dim
+                self.num_obs + self.critic_force_observation_dim
             )
         self.proximity_fingertip_names = tuple(
             str(name).strip().lower()
@@ -477,7 +469,16 @@ class MotionImitationEnv:
         params.dt = float(self.cfg.sim.dt)
         params.substeps = int(self.cfg.sim.substeps)
         params.up_axis = gymapi.UP_AXIS_Z
-        params.gravity = gymapi.Vec3(*[float(v) for v in self.cfg.sim.gravity])
+        gravity = np.asarray(self.cfg.sim.gravity, dtype=np.float64).copy()
+        if self.domain_randomization is not None:
+            generator = np.random.RandomState(int(self.cfg.seed) + 7919)
+            xy_max = self.domain_randomization["gravity_xy_max_m_s2"]
+            gravity[:2] += generator.uniform(-xy_max, xy_max, size=2)
+            gravity[2] *= generator.uniform(
+                *self.domain_randomization["gravity_z_scale_range"]
+            )
+        self.sim_gravity = gravity.astype(np.float32)
+        params.gravity = gymapi.Vec3(*[float(v) for v in self.sim_gravity])
         params.use_gpu_pipeline = bool(self.cfg.sim.use_gpu_pipeline)
 
         physx = self.cfg.sim.physx
@@ -759,18 +760,52 @@ class MotionImitationEnv:
         transform.r = gymapi.Quat(*[float(v) for v in pose_xyzw[3:7]])
         return transform
 
-    def _set_cube_body_properties(self, env, actor: int, env_index: int = 0) -> None:
+    @staticmethod
+    def _sample_uniform_range(generator, bounds) -> float:
+        return float(generator.uniform(float(bounds[0]), float(bounds[1])))
+
+    def _actor_randomization_generator(self, env_index: int, salt: int):
+        seed = (
+            int(self.cfg.seed) * 100003
+            + int(env_index) * 1009
+            + int(salt)
+        ) % (2 ** 31)
+        return np.random.RandomState(seed)
+
+    def _scale_actor_friction(self, env, actor: int, scale: float) -> None:
+        properties = self.gym.get_actor_rigid_shape_properties(env, actor)
+        for shape in properties:
+            shape.friction *= float(scale)
+        self.gym.set_actor_rigid_shape_properties(env, actor, properties)
+
+    def _set_actor_friction_and_restitution(
+        self, env, actor: int, friction: float, restitution: float = None
+    ) -> None:
+        properties = self.gym.get_actor_rigid_shape_properties(env, actor)
+        for shape in properties:
+            shape.friction = float(friction)
+            if restitution is not None:
+                shape.restitution = float(restitution)
+        self.gym.set_actor_rigid_shape_properties(env, actor, properties)
+
+    def _set_cube_body_properties(self, env, actor: int, env_index: int) -> float:
         properties = self.gym.get_actor_rigid_body_properties(env, actor)
-        # Mass and inertia scale together: a heavier cube of the same size and
-        # material has proportionally larger inertia, and scaling mass alone
-        # would produce an object with no physical counterpart.
-        mass_scale = self.domain_randomization.multiplier("object_mass", env_index)
-        properties[0].mass = float(self.cfg.object.mass_kg) * mass_scale
-        inertia = [float(v) * mass_scale for v in self.cfg.object.inertia_kg_m2]
+        mass = float(self.cfg.object.mass_kg)
+        inertia = np.asarray(self.cfg.object.inertia_kg_m2, dtype=np.float64)
+        if self.domain_randomization is not None:
+            generator = self._actor_randomization_generator(env_index, 2027)
+            mass *= self._sample_uniform_range(
+                generator, self.domain_randomization["object_mass_scale_range"]
+            )
+            inertia *= self._sample_uniform_range(
+                generator, self.domain_randomization["object_inertia_scale_range"]
+            )
+        properties[0].mass = mass
         properties[0].inertia.x = gymapi.Vec3(inertia[0], 0.0, 0.0)
         properties[0].inertia.y = gymapi.Vec3(0.0, inertia[1], 0.0)
         properties[0].inertia.z = gymapi.Vec3(0.0, 0.0, inertia[2])
         self.gym.set_actor_rigid_body_properties(env, actor, properties, False)
+        return mass
 
     def _create_envs(self) -> None:
         spacing = float(self.cfg.env.env_spacing)
@@ -810,14 +845,11 @@ class MotionImitationEnv:
         self.ghost_handles = []
         self.cube_handles = []
         self.table_handles = []
+        self.cube_masses_kg = []
         actor_indices = []
         ghost_actor_indices = []
         cube_actor_indices = []
         table_actor_indices = []
-        if self.domain_randomization.enabled:
-            print("Domain randomisation active:")
-            for name, (low, high) in self.domain_randomization.summary().items():
-                print("  {:<20s} x[{:.3f}, {:.3f}]".format(name, low, high))
         for env_index in range(self.num_envs):
             env = self.gym.create_env(self.sim, lower, upper, per_row)
             if env is None:
@@ -851,7 +883,7 @@ class MotionImitationEnv:
             if actor < 0:
                 raise RuntimeError("Failed to create robot actor {}".format(env_index))
             self.gym.set_actor_dof_properties(
-                env, actor, self._randomized_pd_properties(env_index)
+                env, actor, self._robot_pd_properties(env_index)
             )
             if self.reference_ghost_enabled:
                 # A collision group of its own keeps the ghost from touching the
@@ -877,6 +909,16 @@ class MotionImitationEnv:
                     self.gym.get_actor_index(env, ghost, gymapi.DOMAIN_SIM)
                 )
             self.gym.end_aggregate(env)
+            if self.domain_randomization is not None:
+                generator = self._actor_randomization_generator(env_index, 3011)
+                self._scale_actor_friction(
+                    env,
+                    actor,
+                    self._sample_uniform_range(
+                        generator,
+                        self.domain_randomization["robot_friction_scale_range"],
+                    ),
+                )
 
             cube = self.gym.create_actor(
                 env,
@@ -889,9 +931,23 @@ class MotionImitationEnv:
             )
             if cube < 0:
                 raise RuntimeError("Failed to create cuboid actor {}".format(env_index))
-            self._set_cube_body_properties(env, cube, env_index)
-            self._randomize_shape_friction(env, cube, "object_friction", env_index)
-            self._randomize_shape_friction(env, actor, "fingertip_friction", env_index)
+            self.cube_masses_kg.append(
+                self._set_cube_body_properties(env, cube, env_index)
+            )
+            if self.domain_randomization is not None:
+                generator = self._actor_randomization_generator(env_index, 4001)
+                self._set_actor_friction_and_restitution(
+                    env,
+                    cube,
+                    self._sample_uniform_range(
+                        generator,
+                        self.domain_randomization["object_friction_range"],
+                    ),
+                    self._sample_uniform_range(
+                        generator,
+                        self.domain_randomization["object_restitution_range"],
+                    ),
+                )
             self.gym.set_rigid_body_color(
                 env,
                 cube,
@@ -911,6 +967,16 @@ class MotionImitationEnv:
             )
             if table < 0:
                 raise RuntimeError("Failed to create table actor {}".format(env_index))
+            if self.domain_randomization is not None:
+                generator = self._actor_randomization_generator(env_index, 5003)
+                self._set_actor_friction_and_restitution(
+                    env,
+                    table,
+                    self._sample_uniform_range(
+                        generator,
+                        self.domain_randomization["table_friction_range"],
+                    ),
+                )
             self.gym.set_rigid_body_color(
                 env,
                 table,
@@ -944,6 +1010,9 @@ class MotionImitationEnv:
         )
         self.table_actor_indices = torch.as_tensor(
             table_actor_indices, dtype=torch.int32, device=self.device
+        )
+        self.cube_masses_kg = torch.as_tensor(
+            self.cube_masses_kg, dtype=torch.float32, device=self.device
         )
 
     def _resolve_observation_body_indices(self) -> None:
@@ -992,15 +1061,6 @@ class MotionImitationEnv:
         )
         if self.cube_body_index < 0:
             raise ValueError("The cuboid rigid body was not found")
-        self.cube_body_index_tensor = torch.tensor(
-            [self.cube_body_index], dtype=torch.long, device=self.device
-        )
-        # Impulses land on the robot's own links, never the cube's body or the
-        # table's, so a "robot" disturbance cannot secretly push the object.
-        robot_bodies = self.gym.get_actor_rigid_body_count(env, actor)
-        self.robot_body_indices = torch.arange(
-            robot_bodies, dtype=torch.long, device=self.device
-        )
 
     def _paint_ghost(self, env, ghost) -> None:
         color = gymapi.Vec3(
@@ -1173,13 +1233,13 @@ class MotionImitationEnv:
         ) / 2.0
         # Isaac Gym takes one force and one torque per rigid body in the whole
         # simulation, so the buffers cover every body and stay zero outside the
-        # cube column. They are only allocated when the assist can ever be on.
+        # cube column. Allocate them when assist or random pushes can be active.
         self.rigid_body_forces = None
         self.rigid_body_torques = None
         self.gravity_vector = torch.tensor(
-            self.cfg.sim.gravity, dtype=torch.float32, device=self.device
+            self.sim_gravity, dtype=torch.float32, device=self.device
         )
-        if self.object_assist_enabled or self.domain_randomization.impulses_enabled:
+        if self.object_assist_enabled or self.external_wrench_enabled:
             self.rigid_body_forces = torch.zeros(
                 (self.num_envs * rigid_bodies_per_env, 3),
                 dtype=torch.float32,
@@ -1192,6 +1252,13 @@ class MotionImitationEnv:
             self.cube_body_torques = self.rigid_body_torques.view(
                 self.num_envs, rigid_bodies_per_env, 3
             )[:, self.cube_body_index]
+        self.external_force_n = torch.zeros(
+            (self.num_envs, 3), dtype=torch.float32, device=self.device
+        )
+        self.external_torque_nm = torch.zeros_like(self.external_force_n)
+        self.external_wrench_steps_remaining = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
@@ -1209,28 +1276,10 @@ class MotionImitationEnv:
                 dtype=torch.float32,
                 device=self.device,
             )
-            if (self.critic_force_observation_dim or self.critic_parameter_dim)
+            if self.critic_force_observation_dim
             else None
         )
         self._critic_force_features = None
-        self.action_delay = ActionDelay(
-            self.num_envs,
-            self.num_actions,
-            self.domain_randomization.action_delay_steps,
-            self.device,
-        )
-        self.observation_position_bias = sample_position_bias(
-            self.num_envs,
-            self.num_actions,
-            self.domain_randomization.obs_q_bias_rad
-            if self.domain_randomization.enabled
-            else 0.0,
-            self.device,
-        )
-        if self.critic_parameter_dim:
-            self.critic_parameter_table = (
-                self.domain_randomization.privileged_table(device=self.device)
-            )
         self.rew_buf = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
@@ -1270,6 +1319,20 @@ class MotionImitationEnv:
         )
         # a_{t-1} for the action-rate regularization term.
         self.previous_actions = torch.zeros_like(self.actions)
+        # Domain-randomization state. Allocated unconditionally so every code
+        # path can read them; they stay zero and unused when it is disabled.
+        self.observation_q_bias = torch.zeros_like(self.actions)
+        self.action_delay_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.action_history = None
+        if self.domain_randomization is not None:
+            max_delay = self.domain_randomization["action_delay_max_steps"]
+            if max_delay > 0:
+                self.action_history = torch.zeros(
+                    (max_delay + 1, self.num_envs, self.num_actions),
+                    device=self.device,
+                )
         self.episode_sums = {
             name: torch.zeros(
                 self.num_envs, dtype=torch.float32, device=self.device
@@ -1354,7 +1417,11 @@ class MotionImitationEnv:
 
         Palm pose is expressed in the robot actor-base frame. Fingertip
         positions and cube pose are expressed relative to the palm frame. Cube
-        and palm velocities are deliberately absent from this 108D experiment.
+        and palm velocities are deliberately absent from this 112D experiment.
+
+        Both rotations are carried as the 6D matrix encoding rather than as
+        quaternions; see ``_quaternion_to_rotation_6d`` for why the quaternion
+        form put a step discontinuity in the middle of the approach.
         """
         wrist = self.rigid_body_state[:, self.wrist_body_index]
         wrist_position = wrist[:, 0:3]
@@ -1383,7 +1450,7 @@ class MotionImitationEnv:
         palm_position_robot = _quat_rotate_inverse(
             robot_orientation_world, palm_position_world - robot_position_world
         )
-        palm_orientation_robot = _normalize_canonical_quaternion(
+        palm_rotation_robot = _quaternion_to_rotation_6d(
             _quat_multiply(
                 _quat_conjugate(robot_orientation_world), palm_orientation_world
             )
@@ -1393,10 +1460,10 @@ class MotionImitationEnv:
         cube_center_palm = _quat_rotate_inverse(
             palm_orientation_world, cube_displacement_world
         )
-        cube_orientation_palm = _normalize_canonical_quaternion(
+        cube_rotation_palm = _quaternion_to_rotation_6d(
             _quat_multiply(
                 _quat_conjugate(palm_orientation_world),
-                _normalize_canonical_quaternion(self.cube_orientation),
+                self.cube_orientation,
             )
         )
 
@@ -1407,9 +1474,9 @@ class MotionImitationEnv:
         ).reshape(self.num_envs, 15)
         components = (
             palm_position_robot,
-            palm_orientation_robot,
+            palm_rotation_robot,
             fingertip_positions_palm,
-            cube_orientation_palm,
+            cube_rotation_palm,
             cube_center_palm,
         )
         if not self.contact_observation_enabled:
@@ -1556,7 +1623,7 @@ class MotionImitationEnv:
             self._cube_reference_root_states(reference),
             self.object_assist_settings,
             self.object_assist_scale,
-            float(self.cfg.object.mass_kg),
+            self.cube_masses_kg,
             self.gravity_vector,
             active,
         )
@@ -1569,46 +1636,40 @@ class MotionImitationEnv:
             torch.linalg.vector_norm(torque, dim=1)
         )
 
-    def _apply_disturbances(self) -> None:
-        """Add this step's random impulses into the force buffer.
-
-        Written into the same buffer the object assist uses, so both reach
-        PhysX through one apply call. Additive rather than overwriting: with
-        the assist on, a disturbance should perturb the assisted cube, not
-        replace the assist.
-        """
-        randomization = self.domain_randomization
-        if not randomization.impulses_enabled or self.rigid_body_forces is None:
+    def _compute_external_wrench(self) -> None:
+        """Advance and add episodic random cube pushes to the wrench buffers."""
+        if not self.external_wrench_enabled:
             return
-        bodies = self.rigid_body_forces.shape[0] // self.num_envs
-        view = self.rigid_body_forces.view(self.num_envs, bodies, 3)
-        if (
-            randomization.robot_impulse_probability > 0.0
-            and randomization.robot_impulse_n > 0.0
-        ):
-            view += sample_impulses(
-                self.num_envs,
-                bodies,
-                randomization.robot_impulse_probability,
-                randomization.robot_impulse_n,
+        inactive = self.external_wrench_steps_remaining <= 0
+        trigger = inactive & (
+            torch.rand(self.num_envs, device=self.device)
+            < self.domain_randomization["external_wrench_probability_per_step"]
+        )
+        trigger_ids = torch.nonzero(trigger, as_tuple=False).squeeze(-1)
+        if trigger_ids.numel() > 0:
+            count = trigger_ids.numel()
+            self.external_force_n[trigger_ids] = random_vectors_in_ball(
+                count,
+                self.domain_randomization["external_force_max_n"],
                 self.device,
-                body_indices=self.robot_body_indices,
             )
-        if (
-            randomization.object_impulse_probability > 0.0
-            and randomization.object_impulse_n > 0.0
-        ):
-            view += sample_impulses(
-                self.num_envs,
-                bodies,
-                randomization.object_impulse_probability,
-                randomization.object_impulse_n,
+            self.external_torque_nm[trigger_ids] = random_vectors_in_ball(
+                count,
+                self.domain_randomization["external_torque_max_nm"],
                 self.device,
-                body_indices=self.cube_body_index_tensor,
             )
+            self.external_wrench_steps_remaining[trigger_ids] = (
+                self.domain_randomization["external_wrench_duration_steps"]
+            )
+        active = self.external_wrench_steps_remaining > 0
+        self.external_force_n[~active] = 0.0
+        self.external_torque_nm[~active] = 0.0
+        self.cube_body_forces.add_(self.external_force_n)
+        self.cube_body_torques.add_(self.external_torque_nm)
+        self.external_wrench_steps_remaining[active] -= 1
 
-    def _push_object_assist(self) -> None:
-        """Queue the buffered wrench for the next ``simulate`` call.
+    def _push_cube_wrench(self) -> None:
+        """Queue the combined assist and disturbance wrench for ``simulate``.
 
         PhysX consumes applied forces once per simulation step, so with a
         decimation above one the same zero-order-hold wrench is queued again
@@ -1716,31 +1777,17 @@ class MotionImitationEnv:
         if hasattr(self, "episode_sums"):
             for values in self.episode_sums.values():
                 values[env_ids] = 0.0
-        reset_q, reset_dq = perturb_reference_pose(
-            sample.q,
-            sample.dq,
-            len(ARM_JOINT_NAMES),
-            self.cfg.env.rsi_position_noise_arm_rad,
-            self.cfg.env.rsi_position_noise_hand_rad,
-            self.cfg.env.rsi_velocity_noise_scale,
-            lower_limits=self.joint_lower_limits,
-            upper_limits=self.joint_upper_limits,
-        )
         if hasattr(self, "previous_actions"):
-            # Seed a_{t-1} with the action that reproduces the pose the robot
-            # is ACTUALLY reset to, noise included. Seeding it from the clean
-            # reference would charge the first step an action-rate penalty for
-            # the perturbation itself, taxing the randomisation.
-            reset_action = self.positions_to_actions(reset_q)
+            # Seed a_{t-1} with the action that reproduces the RSI pose instead
+            # of zero, so the first step of an episode is not charged an
+            # action-rate penalty for the reset discontinuity.
+            reset_action = self.positions_to_actions(sample.q)
             self.actions[env_ids] = reset_action
             self.previous_actions[env_ids] = reset_action
-            # Seed the delay line with the reset pose, so a delayed environment
-            # is not commanded to the previous episode's last target.
-            self.action_delay.reset(env_ids, reset_action)
 
         state_subset = self.dof_state[env_ids]
-        state_subset[:, self.demo_to_asset_tensor, 0] = reset_q
-        state_subset[:, self.demo_to_asset_tensor, 1] = reset_dq
+        state_subset[:, self.demo_to_asset_tensor, 0] = sample.q
+        state_subset[:, self.demo_to_asset_tensor, 1] = sample.dq
         self.dof_state[env_ids] = state_subset
         self.position_targets_asset[
             env_ids.unsqueeze(1), self.demo_to_asset_tensor.unsqueeze(0)
@@ -1755,6 +1802,8 @@ class MotionImitationEnv:
         if self.reference_ghost_enabled:
             actor_ids = torch.cat((actor_ids, self.ghost_actor_indices[env_ids]))
         self._upload_dof_state(actor_ids)
+        self._resample_domain_randomization(env_ids)
+        self._offset_initial_state(env_ids)
         self._reset_cube_from_reference(env_ids, sample)
         reset_object_height = self.cube_position[env_ids, 2]
         self.episode_initial_object_com_height_m[env_ids] = reset_object_height
@@ -1782,6 +1831,146 @@ class MotionImitationEnv:
         subset[:, self.demo_to_asset_tensor, 1] = dq
         self.ghost_dof_state[env_ids] = subset
 
+    def _robot_pd_properties(self, env_index):
+        """This robot's drive gains: the nominal ones, or its own draw.
+
+        Drawn once per environment rather than per episode because
+        set_actor_dof_properties is a per-actor CPU call; resampling it on every
+        reset would cost more than the randomization is worth. The population of
+        environments therefore *is* the gain distribution.
+        """
+        if self.domain_randomization is None:
+            return self.pd_properties
+        halfwidth = self.domain_randomization["pd_log2_halfwidth"]
+        if halfwidth <= 0.0:
+            return self.pd_properties
+        properties = np.copy(self.pd_properties)
+        count = len(properties["stiffness"])
+        # Independent draws: a common factor leaves D/K, and so the damping
+        # ratio, exactly where it started.
+        generator = np.random.RandomState(
+            (int(self.cfg.seed) * 100003 + int(env_index)) % (2 ** 31)
+        )
+        for field in ("stiffness", "damping"):
+            exponent = generator.uniform(-halfwidth, halfwidth, size=count)
+            properties[field] = properties[field] * np.power(2.0, exponent)
+        return properties
+
+    def _resample_domain_randomization(self, env_ids: torch.Tensor) -> None:
+        """Draw episode-level sensor/latency state and clear stale pushes."""
+        if self.domain_randomization is None:
+            return
+        count = env_ids.numel()
+        bias = self.domain_randomization["obs_q_bias_rad"]
+        if bias > 0.0:
+            self.observation_q_bias[env_ids] = (
+                torch.randn(
+                    (count, self.num_actions), device=self.device
+                )
+                * bias
+            )
+        max_delay = self.domain_randomization["action_delay_max_steps"]
+        if max_delay > 0:
+            self.action_delay_steps[env_ids] = torch.randint(
+                0,
+                max_delay + 1,
+                (count,),
+                dtype=torch.long,
+                device=self.device,
+            )
+        if self.action_history is not None:
+            # A fresh episode has no past commands to be late with.
+            self.action_history[:, env_ids] = self.actions[env_ids]
+        self.external_force_n[env_ids] = 0.0
+        self.external_torque_nm[env_ids] = 0.0
+        self.external_wrench_steps_remaining[env_ids] = 0
+
+    def _offset_initial_state(self, env_ids: torch.Tensor) -> None:
+        """Start the episode near the reference sample rather than exactly on it.
+
+        Read-modify-write of the whole buffer followed by one indexed upload:
+        Isaac Gym keeps only the last indexed DOF-state write of a frame, so a
+        partial write here would discard the reset seeding above it.
+        """
+        if self.domain_randomization is None:
+            return
+        q_offset = self.domain_randomization["init_q_offset_rad"]
+        dq_offset = self.domain_randomization["init_dq_offset_rad_s"]
+        if q_offset <= 0.0 and dq_offset <= 0.0:
+            return
+        order = self.demo_to_asset_tensor
+        count = env_ids.numel()
+        subset = self.dof_state[env_ids]
+        if q_offset > 0.0:
+            positions = subset[:, order, 0] + torch.randn(
+                (count, self.num_actions), device=self.device
+            ) * q_offset
+            subset[:, order, 0] = torch.clamp(
+                positions, self.joint_lower_limits, self.joint_upper_limits
+            )
+        if dq_offset > 0.0:
+            subset[:, order, 1] += torch.randn(
+                (count, self.num_actions), device=self.device
+            ) * dq_offset
+        self.dof_state[env_ids] = subset
+        self._upload_dof_state(self.actor_indices[env_ids])
+
+    def _delayed_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """The command the robot receives, which may be an older one."""
+        if self.action_history is None:
+            return actions
+        # Shifted in place. torch.roll would rebind the attribute to a fresh
+        # tensor, and one allocated inside PPO's torch.inference_mode() cannot
+        # be written in place afterwards by reset_idx -- the same trap the
+        # actions buffer above is copied rather than rebound to avoid.
+        if self.action_history.shape[0] > 1:
+            self.action_history[1:].copy_(self.action_history[:-1].clone())
+        self.action_history[0].copy_(actions)
+        return self.action_history.gather(
+            0,
+            self.action_delay_steps.view(1, -1, 1).expand(
+                1, self.num_envs, self.num_actions
+            ),
+        ).squeeze(0)
+
+    def _perturb_observation(self) -> None:
+        """Add encoder noise to the proprioception block of obs_buf.
+
+        Positions are re-derived through normalize_positions rather than
+        scaled in normalized space: the rad-to-normalized factor varies about
+        twelvefold across these joints, and going through it also reproduces
+        the clamp the environment applies.
+        """
+        if self.domain_randomization is None:
+            return
+        settings = self.domain_randomization
+        joints = self.num_actions
+        q_noise = settings["obs_q_noise_rad"]
+        if q_noise > 0.0 or settings["obs_q_bias_rad"] > 0.0:
+            measured = self.q + self.observation_q_bias
+            if q_noise > 0.0:
+                measured = measured + torch.randn_like(measured) * q_noise
+            self.obs_buf[:, :joints] = self.normalize_positions(measured)
+        target_noise = settings["obs_target_noise_rad"]
+        if target_noise > 0.0:
+            self.obs_buf[:, joints : 2 * joints] += (
+                torch.randn_like(self.obs_buf[:, joints : 2 * joints])
+                * target_noise
+            )
+        dq_noise = settings["obs_dq_noise_rad_s"]
+        if dq_noise > 0.0:
+            self.obs_buf[:, 2 * joints : 3 * joints] += (
+                torch.randn_like(self.obs_buf[:, 2 * joints : 3 * joints])
+                * dq_noise
+            )
+
+    def _all_reset_actor_indices(self) -> torch.Tensor:
+        """Every actor whose DOF state reset() writes: the robots and ghosts."""
+        actor_ids = self.actor_indices
+        if self.reference_ghost_enabled:
+            actor_ids = torch.cat((actor_ids, self.ghost_actor_indices))
+        return actor_ids
+
     def _upload_dof_state(self, actor_ids) -> None:
         """Push DOF state for the given actors.
 
@@ -1808,6 +1997,42 @@ class MotionImitationEnv:
                 device=self.device,
             )
         self.reset_idx(env_ids, indices)
+        # PhysX only recomputes body transforms inside simulate(): writing the
+        # DOF state does not push it through forward kinematics, and refreshing
+        # the tensor first would hand back the poses from before the reset. That
+        # is not hypothetical -- measured on this environment, the palm block of
+        # the first observation came back bit-identical to the pre-reset pose
+        # and wrong by 2.14 against the truth one step later, while the joint
+        # block was already the RSI pose. The policy was being asked to act on a
+        # state that does not exist, which is what produced the 5.97 action-unit
+        # opening command on the arm and 11.9 on the hand.
+        #
+        # The settling step is taken with the velocities zeroed and restored
+        # afterwards. Left in, the demonstration's own joint velocities integrate
+        # for one dt while the PD damping fights them, and the episode starts
+        # 0.021 rad and 1.86 rad/s away from the reference sample it is supposed
+        # to start exactly on -- trading a stale palm for a corrupted RSI state.
+        # With them zeroed the pose cannot drift (the robot has gravity
+        # disabled), so the transforms come back for the pose actually reset to.
+        # The cube is restored the same way and for the same reason: it does
+        # have gravity, so the settling step would otherwise leave it 1.6 away
+        # from the object state the reference sample prescribes.
+        reset_dof_state = self.dof_state_all.clone()
+        reset_root_state = self.root_state_all.clone()
+        self.dof_state_all[..., 1] = 0.0
+        self._upload_dof_state(self._all_reset_actor_indices())
+        self.gym.simulate(self.sim)
+        self.gym.fetch_results(self.sim, True)
+        self.dof_state_all.copy_(reset_dof_state)
+        self.root_state_all.copy_(reset_root_state)
+        self._upload_dof_state(self._all_reset_actor_indices())
+        cube_actor_ids = self.cube_actor_indices.contiguous()
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_state_all),
+            gymtorch.unwrap_tensor(cube_actor_ids),
+            cube_actor_ids.numel(),
+        )
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
@@ -1822,42 +2047,30 @@ class MotionImitationEnv:
         phase = (
             self.reference_index.float() / float(self.reference.last_index)
         ).unsqueeze(1)
-        measured_q, measured_dq = self.q, self.dq
-        if self.domain_randomization.observation_noise_enabled:
-            measured_q, measured_dq = add_observation_noise(
-                self.q,
-                self.dq,
-                self.domain_randomization.obs_q_noise_rad,
-                self.domain_randomization.obs_dq_noise_rad_s,
-                self.domain_randomization.obs_q_bias_rad,
-                bias=self.observation_position_bias,
-            )
         self.obs_buf.copy_(
             torch.cat(
                 (
-                    self.normalize_positions(measured_q),
+                    self.normalize_positions(self.q),
                     self.previous_targets,
-                    measured_dq,
+                    self.dq,
                     phase,
                     *self._task_space_observation_components(),
                 ),
                 dim=1,
             )
         )
+        self._perturb_observation()
         if self.obs_buf.shape != (self.num_envs, self.num_obs):
             raise RuntimeError("Observation shape does not match configuration")
         if self.critic_obs_buf is not None:
-            parts = [self.obs_buf]
-            if self.critic_force_observation_dim:
-                if self._critic_force_features is None:
-                    raise RuntimeError(
-                        "Privileged critic observation requested but the "
-                        "fingertip forces were never computed"
-                    )
-                parts.append(self._critic_force_features)
-            if self.critic_parameter_table is not None:
-                parts.append(self.critic_parameter_table)
-            self.critic_obs_buf.copy_(torch.cat(parts, dim=1))
+            if self._critic_force_features is None:
+                raise RuntimeError(
+                    "Privileged critic observation requested but the fingertip "
+                    "forces were never computed"
+                )
+            self.critic_obs_buf.copy_(
+                torch.cat((self.obs_buf, self._critic_force_features), dim=1)
+            )
 
     def _compute_reward_and_errors(self) -> Dict[str, torch.Tensor]:
         reference = self.reference.sample(self.reference_index)
@@ -2028,6 +2241,18 @@ class MotionImitationEnv:
             "hand_dq_error": hand_dq_error,
             "position_mse": position_mse,
             "velocity_mse": velocity_mse,
+            "adaptive_sigma_position_arm": torch.full_like(
+                position_mse, position_arm_std
+            ),
+            "adaptive_sigma_position_hand": torch.full_like(
+                position_mse, position_hand_std
+            ),
+            "adaptive_sigma_action_rate_arm": torch.full_like(
+                position_mse, action_rate_arm_std
+            ),
+            "adaptive_sigma_action_rate_hand": torch.full_like(
+                position_mse, action_rate_hand_std
+            ),
             "action_rate_mse": action_rate_mse,
             "hand_position_mse": hand_position_mse,
             "hand_velocity_mse": hand_velocity_mse,
@@ -2276,10 +2501,9 @@ class MotionImitationEnv:
         # torch.inference_mode(), and an inference tensor cannot be updated
         # in place later by reset_idx().
         self.actions.copy_(actions.to(device=self.device, dtype=torch.float32))
-        # The robot receives a possibly older command; self.actions keeps this
-        # step's, so the action-rate reward still judges what the policy asked
-        # for rather than what the delayed path delivered.
-        complete_target_q = self.scale_actions(self.action_delay(self.actions))
+        # The reward's action-rate term still sees the commanded a_t; latency
+        # belongs to the robot, not to what the policy is judged on.
+        complete_target_q = self.scale_actions(self._delayed_actions(self.actions))
         next_indices = (self.reference_index + 1).clamp(
             max=self.reference.last_index
         )
@@ -2298,20 +2522,18 @@ class MotionImitationEnv:
         )
         # The helper wrench is computed from the pre-physics cube state against
         # the same reference sample the position targets chase.
+        if self.rigid_body_forces is not None:
+            self.rigid_body_forces.zero_()
+            self.rigid_body_torques.zero_()
         if self.object_assist_enabled:
             self._compute_object_assist(next_reference)
+        if self.external_wrench_enabled:
+            self._compute_external_wrench()
 
         # Physics Step
-        if self.domain_randomization.impulses_enabled:
-            if not self.object_assist_enabled:
-                # Nothing else writes this buffer, so clear last step's impulse
-                # before adding this one; otherwise pushes would accumulate into
-                # a sustained load.
-                self.rigid_body_forces.zero_()
-            self._apply_disturbances()
         for _ in range(int(self.cfg.control.decimation)):
-            if self.object_assist_enabled or self.domain_randomization.impulses_enabled:
-                self._push_object_assist()
+            if self.rigid_body_forces is not None:
+                self._push_cube_wrench()
             self.gym.simulate(self.sim)
         self.gym.fetch_results(self.sim, True)
         self.gym.refresh_dof_state_tensor(self.sim)
@@ -2411,6 +2633,15 @@ class MotionImitationEnv:
                 done, early, horizon_timeout, reference_end
             )
             self.reset_idx(reset_ids)
+            # The settling step reset() performs is deliberately absent here.
+            # simulate() advances every environment, not the subset that just
+            # reset, so calling it would give the still-running episodes an
+            # extra physics step their action and reference index never asked
+            # for. The task-space block of an auto-reset environment therefore
+            # stays one step stale, exactly as it did before this was
+            # understood; closing that needs the palm taken from forward
+            # kinematics of the DOF state, the way the hardware path in
+            # simtoolreal_animrl/sim2sim/observation.py already builds it.
         self.compute_observations()
         self.extras = extras
         return self.obs_buf, self.critic_obs_buf, rewards, dones, extras
@@ -2420,44 +2651,6 @@ class MotionImitationEnv:
 
     def get_privileged_observations(self):
         return self.critic_obs_buf
-
-    def _randomize_shape_friction(self, env, actor, key, env_index) -> None:
-        """Scale one actor's contact friction for this environment."""
-        if not self.domain_randomization.enabled:
-            return
-        scale = self.domain_randomization.multiplier(key, env_index)
-        if scale == 1.0:
-            return
-        shapes = self.gym.get_actor_rigid_shape_properties(env, actor)
-        for shape in shapes:
-            shape.friction = float(shape.friction) * scale
-        self.gym.set_actor_rigid_shape_properties(env, actor, shapes)
-
-    def _randomized_pd_properties(self, env_index):
-        """This environment's drive gains, or the shared ones when off.
-
-        Isaac Gym applies DOF properties when the actor is built, so the gains
-        are fixed per environment for the run. With hundreds of environments the
-        population covers the range on every iteration, which is what the policy
-        actually experiences.
-        """
-        randomization = self.domain_randomization
-        if not randomization.enabled:
-            return self.pd_properties
-        properties = np.copy(self.pd_properties)
-        arm_indices = self.demo_to_asset[: len(ARM_JOINT_NAMES)]
-        hand_indices = self.demo_to_asset[len(ARM_JOINT_NAMES):]
-        for indices, stiffness_key, damping_key in (
-            (arm_indices, "arm_stiffness", "arm_damping"),
-            (hand_indices, "hand_stiffness", "hand_damping"),
-        ):
-            properties["stiffness"][indices] *= randomization.multiplier(
-                stiffness_key, env_index
-            )
-            properties["damping"][indices] *= randomization.multiplier(
-                damping_key, env_index
-            )
-        return properties
 
     def pd_gain_summary(self) -> Dict[str, np.ndarray]:
         stiffness = np.asarray(self.pd_properties["stiffness"], dtype=np.float64)
