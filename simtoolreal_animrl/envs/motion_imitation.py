@@ -22,6 +22,11 @@ from simtoolreal_animrl.envs.controller import (
     validate_joint_order,
 )
 from simtoolreal_animrl.envs.adaptive_sigma import AdaptiveSigma
+from simtoolreal_animrl.envs.operational_space import (
+    damped_least_squares_step,
+    saturate_direction_preserving,
+    transfer_jacobian,
+)
 from simtoolreal_animrl.envs.rsi_noise import perturb_reference_pose
 from simtoolreal_animrl.envs.sensing import (
     ActionDelay,
@@ -139,17 +144,30 @@ class MotionImitationEnv:
                 "The policy drives every joint and requires exactly {} "
                 "actions".format(len(JOINT_NAMES))
             )
-        if self.cfg.control.action_parameterization != "animrl_residual":
-            raise ValueError("Only the AnimRL residual action contract is supported")
-        self.action_scale = float(self.cfg.control.scale_joint_target)
+        if self.cfg.control.action_parameterization != "operational_space_arm":
+            raise ValueError(
+                "Only the operational-space arm contract is supported. The arm's "
+                "six actions are an end-effector twist [dx, dy, dz, wx, wy, wz]; "
+                "the joint-space 'animrl_residual' arm path was removed, so a "
+                "config or checkpoint from before that change cannot be run"
+            )
         self.hand_action_scale = float(self.cfg.control.scale_hand_joint_target)
         self.action_target_clip = float(self.cfg.control.clip_joint_target)
+        self.arm_translation_speed = float(
+            self.cfg.control.arm_translation_speed_m_per_s
+        )
+        self.arm_rotation_speed = float(self.cfg.control.arm_rotation_speed_rad_per_s)
+        self.ik_damping = float(self.cfg.control.ik_damping)
+        self.ik_max_joint_delta = float(self.cfg.control.ik_max_joint_delta_rad)
         if (
-            self.action_scale <= 0.0
-            or self.hand_action_scale <= 0.0
+            self.hand_action_scale <= 0.0
             or self.action_target_clip <= 0.0
+            or self.arm_translation_speed <= 0.0
+            or self.arm_rotation_speed <= 0.0
+            or self.ik_damping <= 0.0
+            or self.ik_max_joint_delta <= 0.0
         ):
-            raise ValueError("AnimRL action scales and target clip must be positive")
+            raise ValueError("Action scales, clips and IK parameters must be positive")
         self.contact_enabled = bool(self.cfg.contact.enabled)
         self.contact_collection = int(self.cfg.contact.collection)
         self.contact_force_threshold_n = float(
@@ -244,24 +262,19 @@ class MotionImitationEnv:
             decay = float(rewards_cfg_init.adaptive_sigma_decay)
             for name, initial, floor in (
                 (
-                    "position_arm",
-                    rewards_cfg_init.position_arm_std_rad,
-                    rewards_cfg_init.adaptive_sigma_position_arm_floor,
-                ),
-                (
                     "position_hand",
                     rewards_cfg_init.position_hand_std_rad,
                     rewards_cfg_init.adaptive_sigma_position_hand_floor,
                 ),
                 (
-                    "action_rate_arm",
-                    rewards_cfg_init.action_rate_arm_std,
-                    rewards_cfg_init.adaptive_sigma_action_rate_arm_floor,
+                    "ee_action_rate",
+                    rewards_cfg_init.ee_action_rate_std,
+                    rewards_cfg_init.adaptive_sigma_ee_action_rate_floor,
                 ),
                 (
-                    "action_rate_hand",
-                    rewards_cfg_init.action_rate_hand_std,
-                    rewards_cfg_init.adaptive_sigma_action_rate_hand_floor,
+                    "hand_action_rate",
+                    rewards_cfg_init.hand_action_rate_std,
+                    rewards_cfg_init.adaptive_sigma_hand_action_rate_floor,
                 ),
             ):
                 self.adaptive_sigmas[name] = AdaptiveSigma(
@@ -626,31 +639,19 @@ class MotionImitationEnv:
             raise ValueError("Default hand pose must contain exactly 20 angles")
         self.default_positions = torch.cat((default_arm, default_hand))
         self.default_arm_positions = self.default_positions[: len(ARM_JOINT_NAMES)]
+        self.default_hand_positions = self.default_positions[len(ARM_JOINT_NAMES):]
         if torch.any(self.default_positions < self.joint_lower_limits) or torch.any(
             self.default_positions > self.joint_upper_limits
         ):
             raise ValueError("Default pose exceeds the URDF position limits")
-        # One scale per joint, so the arm and hand residuals keep their own
-        # resolution while the action stays a single flat vector.
-        self.action_scales = torch.cat(
-            (
-                torch.full(
-                    (len(ARM_JOINT_NAMES),),
-                    self.action_scale,
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-                torch.full(
-                    (len(HAND_JOINT_NAMES),),
-                    self.hand_action_scale,
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-            )
-        )
         self.demo_to_asset_tensor = torch.as_tensor(
             self.demo_to_asset, dtype=torch.long, device=self.device
         )
+        # The Jacobian's columns are in ASSET order, which demo_to_asset is a
+        # genuine permutation of -- so the arm's six columns have to be selected
+        # by index. Slicing the first six, as one would with a joint vector in
+        # demonstration order, silently picks the wrong joints.
+        self.arm_asset_columns = self.demo_to_asset_tensor[: len(ARM_JOINT_NAMES)]
 
         q = self.reference.q
         if torch.any(q < self.joint_lower_limits - 1e-6) or torch.any(
@@ -1198,6 +1199,9 @@ class MotionImitationEnv:
         self.world_axis_sign = torch.tensor(
             [-1.0, -1.0, 1.0], dtype=torch.float32, device=self.device
         )
+        self.world_up = torch.tensor(
+            [0.0, 0.0, 1.0], dtype=torch.float32, device=self.device
+        ).expand(self.num_envs, -1)
         self.robot_base_position = torch.tensor(
             self.cfg.init_state.pos, dtype=torch.float32, device=self.device
         )
@@ -1225,11 +1229,96 @@ class MotionImitationEnv:
             self.cube_body_torques = self.rigid_body_torques.view(
                 self.num_envs, rigid_bodies_per_env, 3
             )[:, self.cube_body_index]
+        self.robot_jacobian = gymtorch.wrap_tensor(
+            self.gym.acquire_jacobian_tensor(self.sim, "robot")
+        )
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_jacobian_tensors(self.sim)
         if self.contact_enabled:
             self.gym.refresh_net_contact_force_tensor(self.sim)
+        self._resolve_jacobian_index()
+
+    def _resolve_jacobian_index(self) -> None:
+        """Find the Jacobian's row for the wrist, and check what it is built on.
+
+        Every assumption the task-space controller rests on is cheap to test once
+        and expensive to debug later, so they are all tested here: that the base
+        is fixed, that the base is unrotated, and that the wrist index resolved
+        against the rigid-body tensor also addresses the Jacobian.
+        """
+        shape = tuple(self.robot_jacobian.shape)
+        if len(shape) != 4 or shape[0] != self.num_envs or shape[2] != 6:
+            raise ValueError(
+                "Unexpected robot Jacobian shape {}".format(shape)
+            )
+        # A floating base would add six columns here, and would also break the
+        # claim below that a world-frame Jacobian is a base-frame one.
+        if shape[3] != len(JOINT_NAMES):
+            raise ValueError(
+                "The Jacobian has {} columns for {} DOFs, so the robot asset is "
+                "not fixed-base; operational-space control needs "
+                "asset.fix_base_link".format(shape[3], len(JOINT_NAMES))
+            )
+        # self.wrist_body_index was resolved with DOMAIN_ENV, but the Jacobian is
+        # indexed per actor. They agree only while the robot leads its envs.
+        actor_wrist = self.gym.find_actor_rigid_body_index(
+            self.envs[0],
+            self.robot_handles[0],
+            PALM_PARENT_BODY_NAME,
+            gymapi.DOMAIN_ACTOR,
+        )
+        if int(actor_wrist) != int(self.wrist_body_index):
+            raise ValueError(
+                "The robot is not the leading actor in its environment, so the "
+                "rigid-body and Jacobian body indices disagree"
+            )
+        # Isaac Gym drops the immovable base link from a fixed-base actor's
+        # Jacobian, so its link axis is one shorter than the rigid-body tensor's.
+        # Derive which convention is in force rather than assuming either.
+        robot_bodies = self.gym.get_actor_rigid_body_count(
+            self.envs[0], self.robot_handles[0]
+        )
+        if shape[1] == robot_bodies:
+            self.arm_ee_jacobian_index = int(self.wrist_body_index)
+        elif shape[1] == robot_bodies - 1:
+            self.arm_ee_jacobian_index = int(self.wrist_body_index) - 1
+        else:
+            raise ValueError(
+                "The Jacobian has {} links against the actor's {} rigid "
+                "bodies; neither convention applies".format(shape[1], robot_bodies)
+            )
+        if not 0 <= self.arm_ee_jacobian_index < shape[1]:
+            raise ValueError(
+                "Resolved Jacobian link index {} is out of range".format(
+                    self.arm_ee_jacobian_index
+                )
+            )
+        # The point the reported Jacobian is taken at. Read from the asset rather
+        # than assumed zero: nothing randomizes the robot's inertial properties,
+        # so one read covers every environment.
+        wrist_com = self.gym.get_actor_rigid_body_properties(
+            self.envs[0], self.robot_handles[0]
+        )[int(self.wrist_body_index)].com
+        self.wrist_com_in_link = torch.tensor(
+            [wrist_com.x, wrist_com.y, wrist_com.z],
+            dtype=torch.float32,
+            device=self.device,
+        ).expand(self.num_envs, -1)
+        # The controller commands a world-frame twist and inverts a world-frame
+        # Jacobian, and calls the result a base-frame command. That identity only
+        # holds while the base is unrotated.
+        root_orientation = self.robot_root_state[:, 3:7]
+        identity = torch.tensor(
+            [0.0, 0.0, 0.0, 1.0], dtype=torch.float32, device=self.device
+        ).expand_as(root_orientation)
+        if not torch.allclose(root_orientation.abs(), identity.abs(), atol=1e-5):
+            raise ValueError(
+                "Operational-space control assumes the robot base is unrotated "
+                "in world, so that the world-frame Jacobian is also the "
+                "base-frame Jacobian"
+            )
 
     def _allocate_buffers(self) -> None:
         self.obs_buf = torch.zeros(
@@ -1316,6 +1405,34 @@ class MotionImitationEnv:
         )
         # a_{t-1} for the action-rate regularization term.
         self.previous_actions = torch.zeros_like(self.actions)
+        # What the in-loop IK was asked for, what it delivered, and what it gave
+        # up in between. The residual is the feasibility trace; the clipped flag
+        # is how often the per-joint clamp bound.
+        twist_shape = (self.num_envs, 6)
+        self.requested_twist = torch.zeros(
+            twist_shape, dtype=torch.float32, device=self.device
+        )
+        self.achieved_twist = torch.zeros_like(self.requested_twist)
+        self.applied_arm_q_delta = torch.zeros_like(self.requested_twist)
+        self.ik_residual_norm = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self.arm_joint_delta_norm = torch.zeros_like(self.ik_residual_norm)
+        self.arm_joint_delta_clipped = torch.zeros_like(self.ik_residual_norm)
+        # The arm cannot seed a_{t-1} to "the action that holds this pose" the way
+        # the hand can, so the first step after a reset is exempted from the EE
+        # action-rate penalty. See reset_idx.
+        self.suppress_ee_action_rate = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        # The targets command_targets last applied. The arm's mapping is an
+        # integrator, so a diagnostic consumer has to read this rather than call
+        # the mapping again.
+        self._last_command_targets = torch.zeros(
+            (self.num_envs, self.num_actions),
+            dtype=torch.float32,
+            device=self.device,
+        )
         self.episode_sums = {
             name: torch.zeros(
                 self.num_envs, dtype=torch.float32, device=self.device
@@ -1326,9 +1443,14 @@ class MotionImitationEnv:
                 "fingertip_keypoint_reward",
                 "palm_keypoint_error_m",
                 "fingertip_keypoint_error_m",
-                "position_reward",
-                "velocity_reward",
-                "action_rate_reward",
+                "palm_tilt_reward",
+                "palm_tilt_error_rad",
+                "ee_action_rate_reward",
+                "arm_joint_rate_reward",
+                "ik_residual_reward",
+                "ik_residual_norm",
+                "arm_joint_delta_norm",
+                "arm_joint_delta_clipped",
                 "hand_position_reward",
                 "hand_velocity_reward",
                 "hand_action_rate_reward",
@@ -1338,7 +1460,8 @@ class MotionImitationEnv:
                 "fingertip_object_distance_m",
                 "rms_position_error",
                 "rms_velocity_error",
-                "rms_action_rate",
+                "rms_ee_action_rate",
+                "rms_arm_joint_rate",
                 "rms_hand_position_error",
                 "rms_hand_velocity_error",
                 "rms_hand_action_rate",
@@ -1416,6 +1539,101 @@ class MotionImitationEnv:
         )
         return palm_position_world, palm_orientation_world
 
+    def _palm_jacobian_arm(self) -> torch.Tensor:
+        """``(num_envs, 6, 6)`` world-frame palm Jacobian over the six arm DOFs.
+
+        Isaac Gym reports ``wrist_3_link``, because the fixed wrist -> mount ->
+        palm chain is collapsed when the asset loads. The palm is moved onto it
+        by the same reconstruction :meth:`_palm_pose_world` uses for the pose,
+        which is what makes the policy's ``dx`` move the frame the keypoint
+        reward is measured at rather than one 73.8 mm behind it.
+        """
+        jacobian = self.robot_jacobian[:, self.arm_ee_jacobian_index]
+        wrist = self.rigid_body_state[:, self.wrist_body_index]
+        wrist_orientation = _normalize_canonical_quaternion(wrist[:, 3:7])
+        # From the CENTRE OF MASS, not the link origin. Isaac Gym reports a
+        # body's Jacobian at its centre of mass, and collapsing the hand
+        # assembly into wrist_3_link puts that 4.8 cm up the link's own z. Using
+        # the link origin leaves the angular rows exactly right and the linear
+        # rows wrong by that lever arm, so the arm still moves smoothly while
+        # every rotation command drags the palm about 5 cm per radian.
+        offset_world = _quat_rotate(
+            wrist_orientation, self.palm_position_in_wrist - self.wrist_com_in_link
+        )
+        palm_jacobian = transfer_jacobian(jacobian, offset_world)
+        return palm_jacobian[:, :, self.arm_asset_columns]
+
+    def _operational_space_arm_targets(
+        self, arm_actions: torch.Tensor
+    ) -> torch.Tensor:
+        """Six arm joint targets from a base-frame end-effector twist command.
+
+        The delta accumulates onto the previous *target* and is never re-anchored
+        to the measured pose. That is deliberate: the command is free to run ahead
+        of the robot, so drive error builds and the arm can press against the
+        cuboid's weight instead of going slack the moment it is loaded. The drift
+        this allows is the feasibility signal -- a twist the arm cannot follow
+        opens a gap between the commanded palm and the real one, and the keypoint
+        tracking reward charges for the gap without anyone having to price it.
+        """
+        # Saturated by magnitude, not clipped per component, and the two halves
+        # separately because metres and radians do not share a norm. Clipping
+        # each component at +/-1 instead made the policy's whole range past the
+        # rail a dead zone: the action stopped reaching the environment, so the
+        # advantage went flat there and nothing pulled the mean back -- measured
+        # drifting to |a| = 14 with 46% of arm components pinned. Prior runs here
+        # show why that was self-inflicted: the joint-space scheme set its own
+        # clip so wide it never bound, and the policy routinely used |a| ~ 20.
+        max_translation = self.arm_translation_speed * self.dt
+        max_rotation = self.arm_rotation_speed * self.dt
+        desired_twist = torch.cat(
+            (
+                saturate_direction_preserving(
+                    arm_actions[:, 0:3] * max_translation, max_translation
+                ),
+                # A first-order axis-angle increment, packed straight into the
+                # twist rather than composed as a quaternion. At 1 rad/s that is
+                # 16.7 mrad per step, where the two agree to under 1e-6 rad.
+                saturate_direction_preserving(
+                    arm_actions[:, 3:6] * max_rotation, max_rotation
+                ),
+            ),
+            dim=1,
+        )
+
+        jacobian = self._palm_jacobian_arm()
+        q_delta = damped_least_squares_step(
+            jacobian, desired_twist, self.ik_damping
+        )
+
+        unclipped_q_delta = q_delta
+        # Per joint, not a norm rescale. Clamping this way distorts the commanded
+        # direction as well as its magnitude, which is accepted: the distortion
+        # lands in the residual below and in a real palm tracking gap, and that
+        # is a truer picture of what the arm did than a direction-preserving
+        # rescale would give.
+        q_delta = q_delta.clamp(-self.ik_max_joint_delta, self.ik_max_joint_delta)
+        previous = self.previous_arm_targets
+        targets = (previous + q_delta).clamp(
+            self.arm_lower_limits, self.arm_upper_limits
+        )
+        applied_q_delta = targets - previous
+
+        achieved_twist = torch.bmm(
+            jacobian, applied_q_delta.unsqueeze(-1)
+        ).squeeze(-1)
+        self.requested_twist.copy_(desired_twist)
+        self.achieved_twist.copy_(achieved_twist)
+        self.applied_arm_q_delta.copy_(applied_q_delta)
+        self.ik_residual_norm.copy_((desired_twist - achieved_twist).norm(dim=-1))
+        self.arm_joint_delta_norm.copy_(applied_q_delta.norm(dim=-1))
+        self.arm_joint_delta_clipped.copy_(
+            (unclipped_q_delta.abs() > self.ik_max_joint_delta)
+            .any(dim=-1)
+            .to(dtype=torch.float32)
+        )
+        return targets
+
     def canonical_cube_orientation(self) -> torch.Tensor:
         """The cuboid's orientation in the labelling the demonstration used.
 
@@ -1446,6 +1664,18 @@ class MotionImitationEnv:
         return keypoints_in_object_frame(
             keypoints, self.cube_position, self.canonical_cube_orientation()
         )
+
+    def _palm_tilt(self) -> torch.Tensor:
+        """``(num_envs, 3)`` gravity direction in the palm frame.
+
+        The palm's pitch and roll with its yaw discarded, which is what makes it
+        comparable against one per-frame reference table however the episode's
+        bar was turned. World and base axes coincide here -- the base is asserted
+        unrotated in _resolve_jacobian_index -- so the world vertical is usable
+        directly.
+        """
+        _, palm_orientation_world = self._palm_pose_world()
+        return _quat_rotate_inverse(palm_orientation_world, self.world_up)
 
     def _task_space_observation_components(self) -> Tuple[torch.Tensor, ...]:
         """Return the five task-space blocks appended to the old 79D.
@@ -1755,12 +1985,62 @@ class MotionImitationEnv:
             gymapi.ENV_SPACE,
         )
 
-    def scale_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Apply AnimRL's unbounded residual-action target mapping."""
-        residual = (actions * self.action_scales).clamp(
+    def scale_hand_actions(self, hand_actions: torch.Tensor) -> torch.Tensor:
+        """Apply the unbounded residual-action mapping to the twenty hand joints."""
+        residual = (hand_actions * self.hand_action_scale).clamp(
             -self.action_target_clip, self.action_target_clip
         )
-        return self.default_positions + residual
+        return self.default_hand_positions + residual
+
+    def saturated_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Which action components ask for more than the contract will pass on.
+
+        The two halves saturate on different things -- the arm's twist is capped
+        by magnitude per half, so all three components of a saturated half are
+        reported together, while a hand residual binds only once scaled past
+        ``clip_joint_target`` -- so the definition lives here instead of being
+        spelled out again in each runner that counts it.
+        """
+        arm = actions[:, : len(ARM_JOINT_NAMES)]
+        translation_saturated = arm[:, 0:3].norm(dim=1, keepdim=True) > 1.0
+        rotation_saturated = arm[:, 3:6].norm(dim=1, keepdim=True) > 1.0
+        hand = (
+            actions[:, len(ARM_JOINT_NAMES):].abs() * self.hand_action_scale
+            > self.action_target_clip
+        )
+        return torch.cat(
+            (
+                translation_saturated.expand(-1, 3),
+                rotation_saturated.expand(-1, 3),
+                hand,
+            ),
+            dim=1,
+        )
+
+    def command_targets(self, actions: torch.Tensor) -> torch.Tensor:
+        """The full 26-joint position target for one control step.
+
+        Unlike the joint-space mapping this replaces, it is **stateful**: the arm
+        half integrates onto the previous target and reads the current Jacobian.
+        Call it exactly once per step, before the targets are written -- calling
+        it twice would integrate the same command twice. Nothing may reconstruct
+        a target by calling it again after the fact, which is why the result is
+        cached here for the evaluation plotter.
+        """
+        targets = torch.cat(
+            (
+                self._operational_space_arm_targets(
+                    actions[:, : len(ARM_JOINT_NAMES)]
+                ),
+                self.scale_hand_actions(actions[:, len(ARM_JOINT_NAMES):]),
+            ),
+            dim=1,
+        )
+        # Copied into the owned buffer rather than rebound: PPO collects inside
+        # torch.inference_mode(), and rebinding would leave an inference tensor
+        # behind for later readers.
+        self._last_command_targets.copy_(targets)
+        return targets
 
     def normalize_positions(self, positions: torch.Tensor) -> torch.Tensor:
         """Normalize physical joint positions only for the observation vector."""
@@ -1779,35 +2059,101 @@ class MotionImitationEnv:
             - 1.0
         ).clamp(-1.0, 1.0)
 
-    def positions_to_actions(self, positions: torch.Tensor) -> torch.Tensor:
-        """Invert the AnimRL residual mapping for ideal reference playback."""
-        return (positions - self.default_positions) / self.action_scales
+    def positions_to_hand_actions(self, hand_positions: torch.Tensor) -> torch.Tensor:
+        """Invert the hand's residual mapping for ideal reference playback.
 
-    def demonstration_action_delta(
+        Hand-only: the arm's mapping runs through a damped, clamped, saturating
+        IK onto an accumulator and has no closed-form inverse. See
+        :meth:`next_reference_action` for what replaces it.
+        """
+        return (hand_positions - self.default_hand_positions) / self.hand_action_scale
+
+    def demonstration_hand_action_delta(
         self, reference_velocity: torch.Tensor
     ) -> torch.Tensor:
-        """Convert ``dq_ref * dt`` from joint space to residual-action space.
+        """Convert the hand's ``dq_ref * dt`` into residual-action space.
 
-        Policy actions are dimensionless residuals with
-        ``q_target = q_default + action_scale * action``. Consequently a
-        demonstrated joint displacement must be divided by each joint's action
-        scale before it can be compared with ``a_t - a_{t-1}``.
+        Hand actions are dimensionless residuals with
+        ``q_target = q_default + hand_action_scale * action``, so a demonstrated
+        joint displacement must be divided by that scale before it can be
+        compared with ``a_t - a_{t-1}``.
         """
-        return reference_velocity * self.dt / self.action_scales
+        return (
+            reference_velocity[:, len(ARM_JOINT_NAMES):]
+            * self.dt
+            / self.hand_action_scale
+        )
+
+    @property
+    def _palm_kinematics(self):
+        """URDF kinematics for the reference-playback harnesses only.
+
+        float64 on the CPU, and it pulls in ``pytorch_kinematics``, so it is built
+        on first use and must never be touched from :meth:`step`. Training never
+        reaches it.
+        """
+        if getattr(self, "_palm_kinematics_cache", None) is None:
+            from simtoolreal_animrl.envs.retarget import PalmKinematics
+
+            self._palm_kinematics_cache = PalmKinematics(
+                ROOT_DIR / self.cfg.asset.file, device="cpu"
+            )
+        return self._palm_kinematics_cache
 
     def next_reference_action(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the ideal 26-joint action and the complete next pose."""
+        """Return the ideal 26-action command and the complete next pose.
+
+        The hand half still inverts its residual mapping. The arm half cannot:
+        its ideal action is the twist carrying the palm pose of the *current
+        accumulated target* onto the palm pose of the next reference, scaled by
+        the same speeds :meth:`_operational_space_arm_targets` divides them by.
+        Forward kinematics runs on the target rather than on the measured joints
+        because the target is what the integrator advances.
+        """
+        from simtoolreal_animrl.envs.retarget import pose_error
+
         next_indices = (self.reference_index + 1).clamp(
             max=self.reference.last_index
         )
         target = self.transform_bank.sample(self.transform_index, next_indices).q
-        return self.positions_to_actions(target), target
+        kinematics = self._palm_kinematics
+        current_pose = kinematics.palm_matrices(
+            self.previous_arm_targets.double().cpu()
+        )
+        target_pose = kinematics.palm_matrices(
+            target[:, : len(ARM_JOINT_NAMES)].double().cpu()
+        )
+        twist = pose_error(current_pose, target_pose).to(
+            dtype=torch.float32, device=self.device
+        )
+        arm_action = torch.cat(
+            (
+                twist[:, :3] / (self.arm_translation_speed * self.dt),
+                twist[:, 3:] / (self.arm_rotation_speed * self.dt),
+            ),
+            dim=1,
+        )
+        # Saturated the same way the controller will saturate it, so the action
+        # this hands back is one the controller can actually carry out.
+        arm_action = torch.cat(
+            (
+                saturate_direction_preserving(arm_action[:, 0:3], 1.0),
+                saturate_direction_preserving(arm_action[:, 3:6], 1.0),
+            ),
+            dim=1,
+        )
+        hand_action = self.positions_to_hand_actions(
+            target[:, len(ARM_JOINT_NAMES):]
+        )
+        return torch.cat((arm_action, hand_action), dim=1), target
 
     def reset_idx(
         self,
         env_ids: torch.Tensor,
         reference_indices: Optional[torch.Tensor] = None,
         transform_indices: Optional[torch.Tensor] = None,
+        episode_translation: Optional[torch.Tensor] = None,
+        episode_yaw_rad: Optional[torch.Tensor] = None,
     ) -> None:
         if env_ids.numel() == 0:
             return
@@ -1815,21 +2161,49 @@ class MotionImitationEnv:
         if transform_indices is None:
             randomization = self.cfg.object_randomization
             count = env_ids.numel()
-            x = torch.empty(count, device=self.device).uniform_(
-                float(randomization.translation_x_min_m),
-                float(randomization.translation_x_max_m),
-            )
-            y = torch.empty(count, device=self.device).uniform_(
-                float(randomization.translation_y_min_m),
-                float(randomization.translation_y_max_m),
-            )
-            yaw = torch.empty(count, device=self.device).uniform_(
-                math.radians(float(randomization.yaw_min_deg)),
-                math.radians(float(randomization.yaw_max_deg)),
-            )
-            episode_translation = torch.stack(
-                (x, y, torch.zeros_like(x)), dim=1
-            )
+            if (episode_translation is None) != (episode_yaw_rad is None):
+                raise ValueError(
+                    "episode_translation and episode_yaw_rad must be given together"
+                )
+            if episode_translation is None:
+                x = torch.empty(count, device=self.device).uniform_(
+                    float(randomization.translation_x_min_m),
+                    float(randomization.translation_x_max_m),
+                )
+                y = torch.empty(count, device=self.device).uniform_(
+                    float(randomization.translation_y_min_m),
+                    float(randomization.translation_y_max_m),
+                )
+                yaw = torch.empty(count, device=self.device).uniform_(
+                    math.radians(float(randomization.yaw_min_deg)),
+                    math.radians(float(randomization.yaw_max_deg)),
+                )
+                episode_translation = torch.stack(
+                    (x, y, torch.zeros_like(x)), dim=1
+                )
+            else:
+                # A caller-chosen continuous placement, resolved to a bank
+                # reference exactly as the uniform sampler is: the cuboid uses
+                # the requested transform while the arm reference comes from
+                # its nearest bank entry. An interactive evaluator therefore
+                # sees the same approximation training does, not a different
+                # one.
+                episode_translation = episode_translation.to(
+                    device=self.device, dtype=self.episode_translation.dtype
+                )
+                yaw = episode_yaw_rad.to(
+                    device=self.device, dtype=self.episode_yaw_rad.dtype
+                )
+                if episode_translation.ndim == 1:
+                    episode_translation = episode_translation.unsqueeze(0).repeat(
+                        count, 1
+                    )
+                if yaw.ndim == 0:
+                    yaw = yaw.repeat(count)
+                if episode_translation.shape != (count, 3):
+                    raise ValueError("episode_translation has the wrong shape")
+                if yaw.shape != (count,):
+                    raise ValueError("episode_yaw_rad has the wrong shape")
 
             transform_indices = nearest_transform_indices(
                 episode_translation,
@@ -1841,6 +2215,10 @@ class MotionImitationEnv:
             self.episode_translation[env_ids] = episode_translation
             self.episode_yaw_rad[env_ids] = yaw
         else:
+            if episode_translation is not None or episode_yaw_rad is not None:
+                raise ValueError(
+                    "transform_indices and episode_translation are alternatives"
+                )
             # Explicit transforms exist so an evaluator can sweep the envelope
             # deterministically -- a success rate that averages over a randomly
             # drawn set of poses hides where the envelope gives out.
@@ -1917,12 +2295,35 @@ class MotionImitationEnv:
             # is ACTUALLY reset to, noise included. Seeding it from the clean
             # reference would charge the first step an action-rate penalty for
             # the perturbation itself, taxing the randomisation.
-            reset_action = self.positions_to_actions(reset_q)
+            #
+            # The arm seeds to zero instead: its command is an integrator now, and
+            # a zero twist is the only action that holds the pose the robot starts
+            # from whatever that pose is. But zero is "do not move", not "what the
+            # policy would have asked for", so unlike the hand it cannot absorb the
+            # perturbation -- the first step would otherwise be charged the full
+            # magnitude of the policy's first command. suppress_ee_action_rate
+            # exempts that one step.
+            reset_action = torch.zeros(
+                (env_ids.numel(), self.num_actions),
+                dtype=self.actions.dtype,
+                device=self.device,
+            )
+            reset_action[:, len(ARM_JOINT_NAMES):] = self.positions_to_hand_actions(
+                reset_q[:, len(ARM_JOINT_NAMES):]
+            )
             self.actions[env_ids] = reset_action
             self.previous_actions[env_ids] = reset_action
+            self.suppress_ee_action_rate[env_ids] = True
             # Seed the delay line with the reset pose, so a delayed environment
             # is not commanded to the previous episode's last target.
             self.action_delay.reset(env_ids, reset_action)
+            # Stale IK telemetry would otherwise describe the previous episode.
+            self.requested_twist[env_ids] = 0.0
+            self.achieved_twist[env_ids] = 0.0
+            self.applied_arm_q_delta[env_ids] = 0.0
+            self.ik_residual_norm[env_ids] = 0.0
+            self.arm_joint_delta_norm[env_ids] = 0.0
+            self.arm_joint_delta_clipped[env_ids] = 0.0
 
         state_subset = self.dof_state[env_ids]
         state_subset[:, self.demo_to_asset_tensor, 0] = reset_q
@@ -1969,6 +2370,10 @@ class MotionImitationEnv:
         # evaluator's direct reset_idx() both return the newly reset palm and
         # fingertip poses on their very first observation.
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        # Beside the rigid-body refresh, always: the palm Jacobian is built from
+        # the wrist quaternion in that tensor, so the two must describe the same
+        # configuration or the point transfer is applied with a stale rotation.
+        self.gym.refresh_jacobian_tensors(self.sim)
 
     def _write_ghost_state(self, env_ids, q, dq) -> None:
         """Fill the ghost rows of the DOF-state buffer; the caller uploads.
@@ -1999,7 +2404,12 @@ class MotionImitationEnv:
             actor_ids.numel(),
         )
 
-    def reset(self, reference_index: Optional[int] = None) -> torch.Tensor:
+    def reset(
+        self,
+        reference_index: Optional[int] = None,
+        translation_xy: Optional[Tuple[float, float]] = None,
+        yaw_rad: Optional[float] = None,
+    ) -> torch.Tensor:
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         indices = None
         if reference_index is not None:
@@ -2009,10 +2419,28 @@ class MotionImitationEnv:
                 dtype=torch.long,
                 device=self.device,
             )
-        self.reset_idx(env_ids, indices)
+        translation = None
+        yaw = None
+        if translation_xy is not None or yaw_rad is not None:
+            if translation_xy is None or yaw_rad is None:
+                raise ValueError("translation_xy and yaw_rad must be given together")
+            translation = torch.tensor(
+                (float(translation_xy[0]), float(translation_xy[1]), 0.0),
+                device=self.device,
+            ).unsqueeze(0).repeat(self.num_envs, 1)
+            yaw = torch.full(
+                (self.num_envs,), float(yaw_rad), device=self.device
+            )
+        self.reset_idx(
+            env_ids,
+            indices,
+            episode_translation=translation,
+            episode_yaw_rad=yaw,
+        )
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_jacobian_tensors(self.sim)
         if self.contact_enabled:
             # Otherwise the first observation of the episode would carry the
             # forces from just before the reset.
@@ -2074,20 +2502,46 @@ class MotionImitationEnv:
         hand_q_error = self.hand_q - reference_hand_q
         hand_dq_error = self.hand_dq - reference_hand_dq
         action_delta = self.actions - self.previous_actions
-        reference_action_delta = self.demonstration_action_delta(reference.dq)
-        action_delta_error = action_delta - reference_action_delta
-        # The arm term is pure command smoothness.  Its retargeted motion can
-        # legitimately have a different action delta from the demonstration.
-        arm_action_delta_error = action_delta[:, : len(ARM_JOINT_NAMES)]
-        hand_action_delta_error = action_delta_error[:, len(ARM_JOINT_NAMES):]
+        hand_action_delta_error = (
+            action_delta[:, len(ARM_JOINT_NAMES):]
+            - self.demonstration_hand_action_delta(reference.dq)
+        )
+        # The arm term is pure command smoothness: the EE twist the policy asked
+        # for, changing step to step. Unlike the hand it is not compared against
+        # the demonstration, whose retargeted motion can legitimately want a
+        # different command. Exempt the first step of an episode, where a_{t-1}
+        # is the seeded zero rather than a command the policy chose.
+        # step() clears the flag once the reward has been computed, so that this
+        # stays free of side effects and can be called twice for the same state.
+        ee_action_delta = torch.where(
+            self.suppress_ee_action_rate.unsqueeze(1),
+            torch.zeros_like(action_delta[:, : len(ARM_JOINT_NAMES)]),
+            action_delta[:, : len(ARM_JOINT_NAMES)],
+        )
 
         # Arm and hand keep separate Gaussians: averaging one MSE over all 26
         # joints would let the 20 hand joints outvote the 6 arm joints in a
         # single term and dilute the gradient each block needs.
+        # Pitch and roll of the palm against the demonstration, yaw excluded.
+        # Squared chord distance between the two unit vectors rather than the
+        # angle between them: it equals the angle squared to second order and
+        # has a finite derivative at zero, where arccos does not.
+        palm_tilt = self._palm_tilt()
+        reference_palm_tilt = self.transform_bank.palm_tilt_at(self.reference_index)
+        palm_tilt_mse = (palm_tilt - reference_palm_tilt).square().sum(dim=1)
+        palm_tilt_error_rad = torch.arccos(
+            (palm_tilt * reference_palm_tilt).sum(dim=1).clamp(-1.0, 1.0)
+        )
+
         rewards_cfg = self.cfg.rewards
+        # Kept as diagnostics only. Nothing rewards arm joint tracking now, so
+        # this reads as null-space drift: how far the arm has wandered from the
+        # reference configuration while still reaching the commanded palm pose.
         position_mse = arm_q_error.square().mean(dim=1)
         velocity_mse = arm_dq_error.square().mean(dim=1)
-        action_rate_mse = arm_action_delta_error.square().mean(dim=1)
+        ee_action_rate_mse = ee_action_delta.square().mean(dim=1)
+        arm_joint_rate_mse = self.applied_arm_q_delta.square().mean(dim=1)
+        ik_residual_mse = self.ik_residual_norm.square()
         hand_position_mse = hand_q_error.square().mean(dim=1)
         hand_velocity_mse = hand_dq_error.square().mean(dim=1)
         hand_action_rate_mse = hand_action_delta_error.square().mean(dim=1)
@@ -2127,25 +2581,25 @@ class MotionImitationEnv:
                 return float(configured)
             return tracker.update(float(mse.mean().item()))
 
-        position_arm_std = width(
-            "position_arm", rewards_cfg.position_arm_std_rad, position_mse
-        )
         position_hand_std = width(
             "position_hand", rewards_cfg.position_hand_std_rad, hand_position_mse
         )
-        action_rate_arm_std = width(
-            "action_rate_arm", rewards_cfg.action_rate_arm_std, action_rate_mse
+        ee_action_rate_std = width(
+            "ee_action_rate", rewards_cfg.ee_action_rate_std, ee_action_rate_mse
         )
-        action_rate_hand_std = width(
-            "action_rate_hand",
-            rewards_cfg.action_rate_hand_std,
+        hand_action_rate_std = width(
+            "hand_action_rate",
+            rewards_cfg.hand_action_rate_std,
             hand_action_rate_mse,
         )
-        position_reward = gaussian(position_mse, position_arm_std)
-        velocity_reward = gaussian(
-            velocity_mse, rewards_cfg.velocity_arm_std_rad_per_s
+        palm_tilt_reward = gaussian(palm_tilt_mse, rewards_cfg.palm_tilt_std_rad)
+        ee_action_rate_reward = gaussian(ee_action_rate_mse, ee_action_rate_std)
+        arm_joint_rate_reward = gaussian(
+            arm_joint_rate_mse, rewards_cfg.arm_joint_rate_std_rad
         )
-        action_rate_reward = gaussian(action_rate_mse, action_rate_arm_std)
+        ik_residual_reward = gaussian(
+            ik_residual_mse, rewards_cfg.ik_residual_std
+        )
         hand_position_reward = gaussian(
             hand_position_mse, position_hand_std
         )
@@ -2153,7 +2607,7 @@ class MotionImitationEnv:
             hand_velocity_mse, rewards_cfg.velocity_hand_std_rad_per_s
         )
         hand_action_rate_reward = gaussian(
-            hand_action_rate_mse, action_rate_hand_std
+            hand_action_rate_mse, hand_action_rate_std
         )
         object_position_reward = gaussian(
             object_position_error_m.square(),
@@ -2238,28 +2692,36 @@ class MotionImitationEnv:
                 self.net_contact_forces, self.fingertip_body_indices
             )
         else:
-            fingertip_contact_reward = torch.zeros_like(position_reward)
-            fingertip_contact_fraction = torch.zeros_like(position_reward)
-            mean_fingertip_contact_force_n = torch.zeros_like(position_reward)
-            fingertip_force_n = position_reward.new_zeros(
+            fingertip_contact_reward = torch.zeros_like(palm_keypoint_reward)
+            fingertip_contact_fraction = torch.zeros_like(palm_keypoint_reward)
+            mean_fingertip_contact_force_n = torch.zeros_like(palm_keypoint_reward)
+            fingertip_force_n = palm_keypoint_reward.new_zeros(
                 (self.num_envs, len(FINGERTIP_BODY_NAMES))
             )
         self.rew_buf.copy_(
             float(rewards_cfg.palm_keypoint_weight) * palm_keypoint_reward
             + float(rewards_cfg.fingertip_keypoint_weight)
             * fingertip_keypoint_reward
-            # The joint-space terms survive at a small weight. Their job is no
-            # longer tracking: a 6-DOF arm has a null space for a given palm
-            # pose and several IK branches, and each finger has four joints
-            # serving a three-dimensional fingertip target. Without them the
-            # policy is free to fill those five spare finger degrees of freedom
-            # and the arm's elbow with whatever else the reward likes.
-            + float(rewards_cfg.position_arm_weight) * position_reward
-            + float(rewards_cfg.velocity_arm_weight) * velocity_reward
-            + float(rewards_cfg.action_rate_arm_weight) * action_rate_reward
+            # The only term that sees the palm's absolute pose. Everything else
+            # is measured either in the cube's frame or on the cube itself, and
+            # is therefore satisfied by a hand that turns the cube up on its
+            # wrist instead of carrying it.
+            + float(rewards_cfg.palm_tilt_weight) * palm_tilt_reward
+            # One regularizer on each side of the IK: the twist the policy asked
+            # for, and the joint delta the solver emitted for it. The arm's
+            # joint-space *tracking* terms are gone -- they only survived as
+            # null-space selection, and the accumulating solver settles that
+            # structurally by deforming continuously from the reset pose rather
+            # than jumping IK branches.
+            + float(rewards_cfg.ee_action_rate_weight) * ee_action_rate_reward
+            + float(rewards_cfg.arm_joint_rate_weight) * arm_joint_rate_reward
+            + float(rewards_cfg.ik_residual_weight) * ik_residual_reward
+            # The hand's joint terms stay: each finger has four joints serving a
+            # three-dimensional fingertip target, so five finger degrees of
+            # freedom are otherwise unconstrained.
             + float(rewards_cfg.position_hand_weight) * hand_position_reward
             + float(rewards_cfg.velocity_hand_weight) * hand_velocity_reward
-            + float(rewards_cfg.action_rate_hand_weight)
+            + float(rewards_cfg.hand_action_rate_weight)
             * hand_action_rate_reward
             + self.object_reward_gate()
             * (
@@ -2282,15 +2744,21 @@ class MotionImitationEnv:
             "hand_dq_error": hand_dq_error,
             "position_mse": position_mse,
             "velocity_mse": velocity_mse,
-            "action_rate_mse": action_rate_mse,
+            "ee_action_rate_mse": ee_action_rate_mse,
+            "arm_joint_rate_mse": arm_joint_rate_mse,
             "hand_position_mse": hand_position_mse,
             "hand_velocity_mse": hand_velocity_mse,
             "hand_action_rate_mse": hand_action_rate_mse,
-            "reference_action_delta": reference_action_delta,
-            "action_delta_error": action_delta_error,
-            "position_reward": position_reward,
-            "velocity_reward": velocity_reward,
-            "action_rate_reward": action_rate_reward,
+            "palm_tilt_reward": palm_tilt_reward,
+            "palm_tilt_error_rad": palm_tilt_error_rad,
+            "ee_action_rate_reward": ee_action_rate_reward,
+            "arm_joint_rate_reward": arm_joint_rate_reward,
+            "ik_residual_reward": ik_residual_reward,
+            "ik_residual_norm": self.ik_residual_norm,
+            "arm_joint_delta_norm": self.arm_joint_delta_norm,
+            "arm_joint_delta_clipped": self.arm_joint_delta_clipped,
+            "requested_twist": self.requested_twist,
+            "achieved_twist": self.achieved_twist,
             "hand_position_reward": hand_position_reward,
             "hand_velocity_reward": hand_velocity_reward,
             "hand_action_rate_reward": hand_action_rate_reward,
@@ -2423,9 +2891,20 @@ class MotionImitationEnv:
             "fingertip_keypoint_error_m",
         ):
             self.episode_sums[name] += metrics[name]
-        self.episode_sums["position_reward"] += metrics["position_reward"]
-        self.episode_sums["velocity_reward"] += metrics["velocity_reward"]
-        self.episode_sums["action_rate_reward"] += metrics["action_rate_reward"]
+        self.episode_sums["palm_tilt_reward"] += metrics["palm_tilt_reward"]
+        self.episode_sums["palm_tilt_error_rad"] += metrics["palm_tilt_error_rad"]
+        self.episode_sums["ee_action_rate_reward"] += metrics[
+            "ee_action_rate_reward"
+        ]
+        self.episode_sums["arm_joint_rate_reward"] += metrics[
+            "arm_joint_rate_reward"
+        ]
+        self.episode_sums["ik_residual_reward"] += metrics["ik_residual_reward"]
+        self.episode_sums["ik_residual_norm"] += metrics["ik_residual_norm"]
+        self.episode_sums["arm_joint_delta_norm"] += metrics["arm_joint_delta_norm"]
+        self.episode_sums["arm_joint_delta_clipped"] += metrics[
+            "arm_joint_delta_clipped"
+        ]
         self.episode_sums["hand_position_reward"] += metrics["hand_position_reward"]
         self.episode_sums["hand_velocity_reward"] += metrics["hand_velocity_reward"]
         self.episode_sums["hand_action_rate_reward"] += metrics[
@@ -2473,8 +2952,11 @@ class MotionImitationEnv:
         self.episode_sums["rms_velocity_error"] += metrics[
             "velocity_mse"
         ].sqrt()
-        self.episode_sums["rms_action_rate"] += metrics[
-            "action_rate_mse"
+        self.episode_sums["rms_ee_action_rate"] += metrics[
+            "ee_action_rate_mse"
+        ].sqrt()
+        self.episode_sums["rms_arm_joint_rate"] += metrics[
+            "arm_joint_rate_mse"
         ].sqrt()
         self.episode_sums["object_assist_force_n"] += (
             self.object_assist_force_n
@@ -2566,7 +3048,7 @@ class MotionImitationEnv:
         # The robot receives a possibly older command; self.actions keeps this
         # step's, so the action-rate reward still judges what the policy asked
         # for rather than what the delayed path delivered.
-        complete_target_q = self.scale_actions(self.action_delay(self.actions))
+        complete_target_q = self.command_targets(self.action_delay(self.actions))
         next_indices = (self.reference_index + 1).clamp(
             max=self.reference.last_index
         )
@@ -2606,6 +3088,9 @@ class MotionImitationEnv:
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        # Refreshed at the end of the step, so the Jacobian the next step's IK
+        # reads describes the configuration this step left the arm in.
+        self.gym.refresh_jacobian_tensors(self.sim)
         if self.contact_enabled:
             self.gym.refresh_net_contact_force_tensor(self.sim)
         self.render(sync_frame_time=True)
@@ -2614,6 +3099,8 @@ class MotionImitationEnv:
         self.reference_index.add_(1).clamp_(max=self.reference.last_index)
         self.episode_length_buf += 1
         metrics = self._compute_reward_and_errors()
+        # The post-reset exemption has now been spent on the step it was set for.
+        self.suppress_ee_action_rate.fill_(False)
         self._accumulate_episode_metrics(metrics)
         done, early, timeout = self._compute_termination(
             metrics["palm_keypoint_error_m"],
@@ -2647,7 +3134,8 @@ class MotionImitationEnv:
             "worst_joint_index": metrics["q_error"].abs().argmax(dim=1),
             "rms_position_error": metrics["position_mse"].sqrt(),
             "rms_velocity_error": metrics["velocity_mse"].sqrt(),
-            "rms_action_rate": metrics["action_rate_mse"].sqrt(),
+            "rms_ee_action_rate": metrics["ee_action_rate_mse"].sqrt(),
+            "rms_arm_joint_rate": metrics["arm_joint_rate_mse"].sqrt(),
             "rms_hand_position_error": metrics["hand_position_mse"].sqrt(),
             "rms_hand_velocity_error": metrics["hand_velocity_mse"].sqrt(),
             "rms_hand_action_rate": metrics["hand_action_rate_mse"].sqrt(),
@@ -2656,9 +3144,14 @@ class MotionImitationEnv:
             "fingertip_keypoint_reward": metrics["fingertip_keypoint_reward"],
             "palm_keypoint_error_m": metrics["palm_keypoint_error_m"],
             "fingertip_keypoint_error_m": metrics["fingertip_keypoint_error_m"],
-            "position_reward": metrics["position_reward"],
-            "velocity_reward": metrics["velocity_reward"],
-            "action_rate_reward": metrics["action_rate_reward"],
+            "palm_tilt_reward": metrics["palm_tilt_reward"],
+            "palm_tilt_error_rad": metrics["palm_tilt_error_rad"],
+            "ee_action_rate_reward": metrics["ee_action_rate_reward"],
+            "arm_joint_rate_reward": metrics["arm_joint_rate_reward"],
+            "ik_residual_reward": metrics["ik_residual_reward"],
+            "ik_residual_norm": metrics["ik_residual_norm"].clone(),
+            "arm_joint_delta_norm": metrics["arm_joint_delta_norm"].clone(),
+            "arm_joint_delta_clipped": metrics["arm_joint_delta_clipped"].clone(),
             "hand_position_reward": metrics["hand_position_reward"],
             "hand_velocity_reward": metrics["hand_velocity_reward"],
             "hand_action_rate_reward": metrics["hand_action_rate_reward"],

@@ -21,9 +21,18 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 740)
         self.assertEqual(env_cfg.env.rsi_max_start_index, 830)
         self.assertEqual(
-            env_cfg.control.action_parameterization, "animrl_residual"
+            env_cfg.control.action_parameterization, "operational_space_arm"
         )
-        self.assertEqual(env_cfg.control.scale_joint_target, 0.25)
+        self.assertEqual(env_cfg.control.arm_translation_speed_m_per_s, 0.40)
+        self.assertEqual(env_cfg.control.arm_rotation_speed_rad_per_s, 1.0)
+        # Removed on purpose: a binding per-component clip made the policy's
+        # range past the rail unreachable. Magnitude saturation replaced it.
+        self.assertFalse(hasattr(env_cfg.control, "arm_action_clip"))
+        self.assertEqual(env_cfg.control.ik_damping, 0.02)
+        self.assertEqual(env_cfg.control.ik_max_joint_delta_rad, 0.05)
+        # Deleted with the arm's joint-space path. Deployment and sim2sim still
+        # read it and are meant to fail loudly, so its absence is the contract.
+        self.assertFalse(hasattr(env_cfg.control, "scale_joint_target"))
         self.assertEqual(env_cfg.control.scale_hand_joint_target, 0.15)
         self.assertEqual(env_cfg.control.clip_joint_target, 100.0)
         # The fingers are allowed to pass through each other, which is what
@@ -56,21 +65,36 @@ class ConfigAndDemoTest(unittest.TestCase):
         # reference keypoints describe a differently shaped hand.
         self.assertEqual(env_cfg.rewards.palm_lever_arm_m, 0.1)
         expected_robot_rewards = {
-            "position_arm_weight": 0.06,
-            "velocity_arm_weight": 0.0,
-            "action_rate_arm_weight": 0.2,
-            "position_arm_std_rad": 0.223607,
-            "velocity_arm_std_rad_per_s": 1.0,
-            "action_rate_arm_std": 5,
+            # Pitch and roll of the palm; yaw excluded because the bar's yaw is
+            # randomised and the hand has to follow it.
+            "palm_tilt_weight": 0.25,
+            "palm_tilt_std_rad": 0.6,
+            "ee_action_rate_weight": 0.2,
+            "ee_action_rate_std": 0.03,
+            "arm_joint_rate_weight": 0.05,
+            "arm_joint_rate_std_rad": 0.02,
+            # Ships off: the feasibility pressure is meant to arrive through the
+            # keypoint tracking reward, not through an explicit penalty.
+            "ik_residual_weight": 0.0,
+            "ik_residual_std": 0.01,
             "position_hand_weight": 0.05,
             "velocity_hand_weight": 0.12,
-            "action_rate_hand_weight": 0.12,
+            "hand_action_rate_weight": 0.12,
             "position_hand_std_rad": 0.223607,
             "velocity_hand_std_rad_per_s": 1.0,
-            "action_rate_hand_std": 5,
+            "hand_action_rate_std": 1.0,
         }
         for name, expected in expected_robot_rewards.items():
             self.assertEqual(getattr(env_cfg.rewards, name), expected)
+        # The arm's joint-space tracking terms were removed outright, not
+        # zero-weighted; their absence is what keeps them from creeping back.
+        for name in (
+            "position_arm_weight",
+            "velocity_arm_weight",
+            "position_arm_std_rad",
+            "velocity_arm_std_rad_per_s",
+        ):
+            self.assertFalse(hasattr(env_cfg.rewards, name))
         self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
         self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.4)
         # Off: the object-frame fingertip keypoints subsume what this shaped.

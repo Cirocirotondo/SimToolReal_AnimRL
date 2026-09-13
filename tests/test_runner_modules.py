@@ -360,10 +360,15 @@ class RunnerModulesTest(unittest.TestCase):
             "fingertip_keypoint_reward": 0.4 * ones,
             "palm_keypoint_error_m": torch.zeros(num_envs),
             "fingertip_keypoint_error_m": torch.zeros(num_envs),
-            "position_reward": 0.1 * ones,
-            "velocity_reward": ones,
-            "action_rate_reward": ones,
-            "rms_action_rate": torch.zeros(num_envs),
+            "palm_tilt_reward": ones,
+            "palm_tilt_error_rad": torch.zeros(num_envs),
+            "ee_action_rate_reward": ones,
+            "arm_joint_rate_reward": ones,
+            "ik_residual_reward": ones,
+            "ik_residual_norm": torch.zeros(num_envs),
+            "arm_joint_delta_clipped": torch.zeros(num_envs),
+            "rms_ee_action_rate": torch.zeros(num_envs),
+            "rms_arm_joint_rate": torch.zeros(num_envs),
             "hand_position_reward": 0.2 * ones,
             "hand_velocity_reward": ones,
             "hand_action_rate_reward": ones,
@@ -404,7 +409,6 @@ class RunnerModulesTest(unittest.TestCase):
             reference = Reference()
             gym = Gym()
             sim = None
-            action_scales = torch.ones(2)
             action_target_clip = 100.0
             rsi_distribution = "pregrasp_mixture"
             rsi_max_start_index = 830
@@ -419,6 +423,9 @@ class RunnerModulesTest(unittest.TestCase):
 
             def reset_idx(self, env_ids, indices):
                 pass
+
+            def saturated_actions(self, actions):
+                return torch.zeros_like(actions, dtype=torch.bool)
 
             def compute_observations(self):
                 pass

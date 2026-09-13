@@ -154,9 +154,13 @@ class PPO:
         episode_count = 0
         episode_sums = {}
         episode_maxima = {}
-        position_reward_sum = 0.0
-        velocity_reward_sum = 0.0
-        action_rate_reward_sum = 0.0
+        palm_tilt_reward_sum = 0.0
+        palm_tilt_error_sum = 0.0
+        ee_action_rate_reward_sum = 0.0
+        arm_joint_rate_reward_sum = 0.0
+        ik_residual_reward_sum = 0.0
+        ik_residual_norm_sum = 0.0
+        arm_joint_delta_clipped_sum = 0.0
         hand_position_reward_sum = 0.0
         hand_velocity_reward_sum = 0.0
         hand_action_rate_reward_sum = 0.0
@@ -175,7 +179,8 @@ class PPO:
         rms_hand_action_rate_sum = 0.0
         rms_position_error_sum = 0.0
         rms_velocity_error_sum = 0.0
-        rms_action_rate_sum = 0.0
+        rms_ee_action_rate_sum = 0.0
+        rms_arm_joint_rate_sum = 0.0
         max_abs_position_error = 0.0
         clipped_action_target_count = 0
         action_value_count = 0
@@ -194,10 +199,7 @@ class PPO:
                     actor_observations
                 )
                 clipped_action_target_count += int(
-                    (
-                        actions.abs() * self.env.action_scales
-                        > self.env.action_target_clip
-                    ).sum()
+                    self.env.saturated_actions(actions).sum()
                 )
                 action_value_count += actions.numel()
                 abs_action_sum += float(actions.abs().sum())
@@ -230,12 +232,29 @@ class PPO:
                     )
 
                 reward_sum += float(rewards.mean())
-                position_reward_sum += float(infos["position_reward"].mean())
-                velocity_reward_sum += float(infos["velocity_reward"].mean())
-                action_rate_reward_sum += float(
-                    infos["action_rate_reward"].mean()
+                palm_tilt_reward_sum += float(infos["palm_tilt_reward"].mean())
+                palm_tilt_error_sum += float(
+                    infos["palm_tilt_error_rad"].mean()
                 )
-                rms_action_rate_sum += float(infos["rms_action_rate"].mean())
+                ee_action_rate_reward_sum += float(
+                    infos["ee_action_rate_reward"].mean()
+                )
+                arm_joint_rate_reward_sum += float(
+                    infos["arm_joint_rate_reward"].mean()
+                )
+                ik_residual_reward_sum += float(
+                    infos["ik_residual_reward"].mean()
+                )
+                ik_residual_norm_sum += float(infos["ik_residual_norm"].mean())
+                arm_joint_delta_clipped_sum += float(
+                    infos["arm_joint_delta_clipped"].mean()
+                )
+                rms_ee_action_rate_sum += float(
+                    infos["rms_ee_action_rate"].mean()
+                )
+                rms_arm_joint_rate_sum += float(
+                    infos["rms_arm_joint_rate"].mean()
+                )
                 hand_position_reward_sum += float(
                     infos["hand_position_reward"].mean()
                 )
@@ -328,9 +347,19 @@ class PPO:
         transition_count = int(self.cfg.num_steps_per_env * self.env.num_envs)
         result = {
             "mean_reward": reward_sum / rollout_steps,
-            "mean_position_reward": position_reward_sum / rollout_steps,
-            "mean_velocity_reward": velocity_reward_sum / rollout_steps,
-            "mean_action_rate_reward": action_rate_reward_sum / rollout_steps,
+            "mean_palm_tilt_reward": palm_tilt_reward_sum / rollout_steps,
+            "mean_palm_tilt_error_rad": palm_tilt_error_sum / rollout_steps,
+            "mean_ee_action_rate_reward": (
+                ee_action_rate_reward_sum / rollout_steps
+            ),
+            "mean_arm_joint_rate_reward": (
+                arm_joint_rate_reward_sum / rollout_steps
+            ),
+            "mean_ik_residual_reward": ik_residual_reward_sum / rollout_steps,
+            "mean_ik_residual_norm": ik_residual_norm_sum / rollout_steps,
+            "mean_arm_joint_delta_clipped": (
+                arm_joint_delta_clipped_sum / rollout_steps
+            ),
             "mean_hand_position_reward": hand_position_reward_sum / rollout_steps,
             "mean_hand_velocity_reward": hand_velocity_reward_sum / rollout_steps,
             "mean_hand_action_rate_reward": (
@@ -377,7 +406,8 @@ class PPO:
             ),
             "mean_rms_position_error": rms_position_error_sum / rollout_steps,
             "mean_rms_velocity_error": rms_velocity_error_sum / rollout_steps,
-            "mean_rms_action_rate": rms_action_rate_sum / rollout_steps,
+            "mean_rms_ee_action_rate": rms_ee_action_rate_sum / rollout_steps,
+            "mean_rms_arm_joint_rate": rms_arm_joint_rate_sum / rollout_steps,
             "max_abs_position_error": max_abs_position_error,
             "action_target_clipped_fraction": (
                 clipped_action_target_count / float(max(action_value_count, 1))
@@ -734,9 +764,10 @@ class PPO:
         iteration = int(stats["iteration"])
         tags = {
             "Train/mean_step_reward": "mean_reward",
-            "Reward/position": "mean_position_reward",
-            "Reward/velocity": "mean_velocity_reward",
-            "Reward/action_delta_tracking": "mean_action_rate_reward",
+            "Reward/palm_tilt": "mean_palm_tilt_reward",
+            "Reward/ee_action_rate": "mean_ee_action_rate_reward",
+            "Reward/arm_joint_rate": "mean_arm_joint_rate_reward",
+            "Reward/ik_residual": "mean_ik_residual_reward",
             "Reward/hand_position": "mean_hand_position_reward",
             "Reward/hand_velocity": "mean_hand_velocity_reward",
             "Reward/hand_action_delta_tracking": (
@@ -768,7 +799,11 @@ class PPO:
             "Tracking/rms_arm_position_error": "mean_rms_position_error",
             "Tracking/rms_arm_velocity_error": "mean_rms_velocity_error",
             "Tracking/max_abs_arm_position_error": "max_abs_position_error",
-            "Policy/rms_action_delta_error": "mean_rms_action_rate",
+            "Policy/palm_tilt_error_rad": "mean_palm_tilt_error_rad",
+            "Policy/rms_ee_action_rate": "mean_rms_ee_action_rate",
+            "Policy/rms_arm_joint_rate": "mean_rms_arm_joint_rate",
+            "Policy/ik_residual_norm": "mean_ik_residual_norm",
+            "Policy/arm_joint_delta_clipped": "mean_arm_joint_delta_clipped",
             "Policy/rms_hand_action_delta_error": (
                 "mean_rms_hand_action_rate"
             ),
@@ -993,14 +1028,17 @@ class PPO:
         )
         if "evaluation_score" in stats:
             print(
-                "  Evaluation | score={:.4f} | arm_pos(fixed/sampled)="
+                # palm_kp replaces the old arm_pos: nothing rewards arm joint
+                # tracking now, and the palm keypoint term is what the score
+                # is actually built from.
+                "  Evaluation | score={:.4f} | palm_kp(fixed/sampled)="
                 "{:.4f}/{:.4f} | hand_pos(fixed/sampled)={:.4f}/{:.4f} | "
                 "object_pos(fixed/sampled)={:.4f}/{:.4f} | "
                 "object_rot(fixed/sampled)={:.4f}/{:.4f} | "
                 "early(fixed/sampled)={:.3f}/{:.3f}{}".format(
                     stats["evaluation_score"],
-                    stats["evaluation_fixed_mean_position_reward"],
-                    stats["evaluation_uniform_mean_position_reward"],
+                    stats["evaluation_fixed_mean_palm_keypoint_reward"],
+                    stats["evaluation_uniform_mean_palm_keypoint_reward"],
                     stats["evaluation_fixed_mean_hand_position_reward"],
                     stats["evaluation_uniform_mean_hand_position_reward"],
                     stats["evaluation_fixed_mean_object_position_reward"],

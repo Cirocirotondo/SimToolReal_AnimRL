@@ -73,9 +73,45 @@ def assert_correct_pd_gains(env):
     )
 
 
+def identity_transform_index(env):
+    """The bank entry closest to leaving the demonstration where it was.
+
+    The bank is sampled randomly, so it holds no exact identity; this picks the
+    nearest one the same way the evaluator does, trading 10 degrees of yaw
+    against 1.75 cm of translation.
+    """
+    import torch
+
+    bank = env.transform_bank
+    return int(
+        (
+            bank.translation[:, :2].square().sum(dim=1)
+            + (0.1 * bank.yaw_rad).square()
+        ).argmin()
+    )
+
+
 def assert_reset_matches_reference(env, reference_index):
+    """The RSI write must land the robot exactly on the pose it was given.
+
+    Pinned to the near-identity transform first. env.reference is the raw
+    demonstration, while a reset draws from the transform bank, so comparing the
+    two under a randomly sampled transform measures the transform rather than
+    the state write -- and passes or fails depending on which transforms the
+    bank happened to sample.
+    """
+    import torch
+
+    env.reset_idx(
+        env.all_env_ids,
+        env.reference_index.clone(),
+        torch.full_like(env.all_env_ids, identity_transform_index(env)),
+    )
     env.gym.refresh_dof_state_tensor(env.sim)
-    reference = env.reference.sample(env.reference_index)
+    env.gym.refresh_actor_root_state_tensor(env.sim)
+    reference = env.transform_bank.sample(
+        env.transform_index, env.reference_index
+    )
     position_error = (env.q - reference.q).abs().max().item()
     velocity_error = (env.dq - reference.dq).abs().max().item()
     if position_error > 1e-6 or velocity_error > 1e-5:
@@ -171,14 +207,21 @@ def assert_object_scene_contract(env):
 
 
 def assert_vectorized_object_rsi_contract(env):
-    """Check distinct per-env RSI states and one indexed partial reset."""
+    """Check distinct per-env RSI states and one indexed partial reset.
+
+    Every reset here pins the near-identity transform. Left to sample its own,
+    each reset would also move the bar, and the comparison would measure the
+    transform rather than the RSI write it is meant to check.
+    """
     import torch
 
     env_ids = torch.arange(env.num_envs, dtype=torch.long, device=env.device)
-    env.reset_idx(env_ids)
+    identity = identity_transform_index(env)
+    transforms = torch.full_like(env_ids, identity)
+    env.reset_idx(env_ids, None, transforms)
     env.gym.refresh_actor_root_state_tensor(env.sim)
     sampled_expected = env._cube_reference_root_states(
-        env.reference.sample(env.reference_index)
+        env.transform_bank.sample(env.transform_index, env.reference_index)
     )
     if not bool(
         torch.allclose(env.cube_root_state, sampled_expected, rtol=0.0, atol=1e-6)
@@ -193,9 +236,11 @@ def assert_vectorized_object_rsi_contract(env):
         steps=env.num_envs,
         device=env.device,
     ).round().long()
-    env.reset_idx(env_ids, spread)
+    env.reset_idx(env_ids, spread, transforms)
     env.gym.refresh_actor_root_state_tensor(env.sim)
-    expected = env._cube_reference_root_states(env.reference.sample(spread))
+    expected = env._cube_reference_root_states(
+        env.transform_bank.sample(env.transform_index, spread)
+    )
     if not bool(torch.allclose(env.cube_root_state, expected, rtol=0.0, atol=1e-6)):
         raise AssertionError("Vectorized RSI did not apply each cube reference state")
 
@@ -207,10 +252,12 @@ def assert_vectorized_object_rsi_contract(env):
             dtype=torch.long,
             device=env.device,
         )
-        env.reset_idx(partial_env_ids, partial_reference)
+        env.reset_idx(partial_env_ids, partial_reference, transforms[:1])
         env.gym.refresh_actor_root_state_tensor(env.sim)
         expected_partial = env._cube_reference_root_states(
-            env.reference.sample(partial_reference)
+            env.transform_bank.sample(
+                env.transform_index[:1], partial_reference
+            )
         )
         if not bool(
             torch.allclose(
@@ -224,12 +271,115 @@ def assert_vectorized_object_rsi_contract(env):
             raise AssertionError("Partial RSI changed a non-selected cube")
 
 
+def assert_continuous_placement_contract(env):
+    """A caller-chosen placement must move the cuboid exactly, not snap it.
+
+    The interactive evaluator (scripts/evaluate_viser.py) places the cuboid at a
+    continuous transform while the arm reference comes from the nearest bank
+    entry -- the same approximation training makes, where the bank is only the
+    nearest-neighbour source for arm IK. If the placement were silently snapped
+    to the bank instead, every measurement taken through that GUI would describe
+    a pose other than the one on screen.
+
+    The offset below is deliberately small compared with the bank's spacing so
+    the same entry stays nearest, which is what lets the two resets be compared
+    exactly: same reference, same yaw, translations differing by the offset.
+    """
+    import torch
+
+    from simtoolreal_animrl.envs.transform_bank import nearest_transform_indices
+
+    env_ids = env.all_env_ids
+    count = env_ids.numel()
+    frame_zero = torch.zeros(count, dtype=torch.long, device=env.device)
+    index = identity_transform_index(env)
+    indices = torch.full_like(env_ids, index)
+    bank_translation = env.transform_bank.translation[indices]
+    bank_yaw = env.transform_bank.yaw_rad[indices]
+
+    env.reset_idx(env_ids, frame_zero, indices)
+    env.gym.refresh_actor_root_state_tensor(env.sim)
+    snapped_position = env.cube_position.clone()
+
+    offset = torch.tensor([0.004, -0.003, 0.0], device=env.device)
+    requested = bank_translation + offset
+    env.reset_idx(
+        env_ids,
+        frame_zero,
+        None,
+        episode_translation=requested,
+        episode_yaw_rad=bank_yaw,
+    )
+    env.gym.refresh_actor_root_state_tensor(env.sim)
+
+    if not bool(torch.allclose(env.episode_translation, requested, atol=1e-6)):
+        raise AssertionError(
+            "A requested continuous placement was not stored verbatim"
+        )
+    if not bool(torch.allclose(env.episode_yaw_rad, bank_yaw, atol=1e-6)):
+        raise AssertionError("A requested yaw was not stored verbatim")
+    expected_index = nearest_transform_indices(
+        requested,
+        bank_yaw,
+        env.transform_bank.translation,
+        env.transform_bank.yaw_rad,
+        float(env.cfg.object_randomization.nearest_yaw_lever_arm_m),
+    )
+    if not bool(torch.equal(env.transform_index, expected_index)):
+        raise AssertionError(
+            "A continuous placement did not resolve to the nearest bank entry"
+        )
+    if not bool(torch.equal(env.transform_index, indices)):
+        raise AssertionError(
+            "The test offset is too large: a different bank entry won, so the "
+            "two resets no longer share a reference and cannot be compared"
+        )
+    measured_shift = env.cube_position - snapped_position
+    if not bool(
+        torch.allclose(
+            measured_shift, offset.expand_as(measured_shift), atol=1e-6
+        )
+    ):
+        raise AssertionError(
+            "The cuboid was snapped to the bank instead of placed at the "
+            "requested transform: shift {}, expected {}".format(
+                measured_shift[0].tolist(), offset.tolist()
+            )
+        )
+
+    try:
+        env.reset_idx(
+            env_ids,
+            frame_zero,
+            indices,
+            episode_translation=requested,
+            episode_yaw_rad=bank_yaw,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "Passing both transform_indices and a continuous placement must "
+            "raise: one of the two would have been silently ignored"
+        )
+
+
 def assert_observation_contract(env):
     import torch
 
+    # Recompute first. reset_idx writes state but does not refill the
+    # observation buffer, so whatever a caller reset last would otherwise be
+    # compared against a buffer built for an earlier pose -- which measures
+    # staleness rather than the block layout this checks.
+    env.compute_observations()
     obs = env.get_observations()
-    if obs.shape != (env.num_envs, 108):
-        raise AssertionError("Expected 108D observations, got {}".format(obs.shape))
+    # Read the width from the configuration rather than pinning a literal: the
+    # observation has already grown from 79 to 108 to 112, and a hardcoded
+    # number here fails on the widening rather than on a real defect.
+    if obs.shape != (env.num_envs, env.num_obs):
+        raise AssertionError(
+            "Expected {}D observations, got {}".format(env.num_obs, obs.shape)
+        )
 
     expected_phase = (
         env.reference_index.float() / float(env.reference.last_index)
@@ -246,12 +396,14 @@ def assert_observation_contract(env):
         dim=1,
     )
     if not bool(torch.allclose(obs, expected, rtol=0.0, atol=1e-6)):
-        raise AssertionError("The 108D observation blocks are inconsistent")
+        raise AssertionError("The observation blocks are inconsistent")
 
     if not bool(((obs[:, :6] >= -1.0) & (obs[:, :6] <= 1.0)).all()):
         raise AssertionError("Normalized arm positions escaped [-1, 1]")
 
-    block_widths = (3, 4, 15, 4, 3)
+    # palm position, palm rotation as the continuous 6D representation,
+    # five palm-relative fingertips, cube rotation as 6D, cube centre.
+    block_widths = (3, 6, 15, 6, 3)
     if tuple(component.shape[1] for component in task_space) != block_widths:
         raise AssertionError("Task-space observation block widths are incorrect")
     fingertip_positions_palm = task_space[2].reshape(env.num_envs, 5, 3)
@@ -274,26 +426,43 @@ def assert_observation_contract(env):
         raise AssertionError(
             "Fingertip observations are not palm-relative positions"
         )
-    palm_quaternion = obs[:, 82:86]
-    cube_quaternion = obs[:, 101:105]
-    for name, quaternion in (
-        ("palm", palm_quaternion),
-        ("cube relative to palm", cube_quaternion),
+    # Both rotations travel as the first two columns of their rotation matrix,
+    # so the invariant is orthonormality of that pair -- not the unit norm and
+    # canonical sign a quaternion carried before the representation changed.
+    for name, rotation_6d in (
+        ("palm", task_space[1]),
+        ("cube relative to palm", task_space[3]),
     ):
+        first, second = rotation_6d[:, 0:3], rotation_6d[:, 3:6]
+        ones = torch.ones(env.num_envs, device=env.device)
+        for column, values in (("first", first), ("second", second)):
+            if not bool(
+                torch.allclose(
+                    torch.linalg.vector_norm(values, dim=1),
+                    ones,
+                    rtol=0.0,
+                    atol=1e-5,
+                )
+            ):
+                raise AssertionError(
+                    "{} rotation 6D {} column is not a unit vector".format(
+                        name, column
+                    )
+                )
         if not bool(
             torch.allclose(
-                torch.linalg.vector_norm(quaternion, dim=1),
-                torch.ones(env.num_envs, device=env.device),
+                (first * second).sum(dim=1),
+                torch.zeros_like(ones),
                 rtol=0.0,
                 atol=1e-5,
             )
         ):
-            raise AssertionError("{} quaternion is not normalized".format(name))
-        if not bool((quaternion[:, 3] >= 0.0).all()):
-            raise AssertionError("{} quaternion sign is not canonical".format(name))
+            raise AssertionError(
+                "{} rotation 6D columns are not orthogonal".format(name)
+            )
 
     if not bool(torch.isfinite(obs).all()):
-        raise AssertionError("The 108D observation contains NaN or infinity")
+        raise AssertionError("The observation contains NaN or infinity")
 
 
 def assert_reward_contract(env):
@@ -324,10 +493,19 @@ def assert_reward_contract(env):
         raise AssertionError("Velocity reward is not restricted to the arm")
     if metrics["hand_q_error"].shape != (env.num_envs, 20):
         raise AssertionError("Hand diagnostics have an unexpected shape")
-    if metrics["action_rate_reward"].shape != (env.num_envs,):
-        raise AssertionError(
-            "Action-delta tracking reward has an unexpected shape"
-        )
+    for name in (
+        "palm_tilt_reward",
+        "palm_tilt_error_rad",
+        "ee_action_rate_reward",
+        "arm_joint_rate_reward",
+        "ik_residual_reward",
+        "ik_residual_norm",
+        "arm_joint_delta_clipped",
+    ):
+        if metrics[name].shape != (env.num_envs,):
+            raise AssertionError(
+                "{} has an unexpected shape".format(name)
+            )
     if metrics["object_position_error_m"].shape != (env.num_envs,):
         raise AssertionError("Object position error has an unexpected shape")
     if metrics["object_orientation_error_rad"].shape != (env.num_envs,):
@@ -375,12 +553,13 @@ def assert_reward_contract(env):
         raise AssertionError("Object Gaussian rewards escaped [0, 1]")
     r = env.cfg.rewards
     expected_reward = (
-        float(r.position_arm_weight) * metrics["position_reward"]
-        + float(r.velocity_arm_weight) * metrics["velocity_reward"]
-        + float(r.action_rate_arm_weight) * metrics["action_rate_reward"]
+        float(r.palm_tilt_weight) * metrics["palm_tilt_reward"]
+        + float(r.ee_action_rate_weight) * metrics["ee_action_rate_reward"]
+        + float(r.arm_joint_rate_weight) * metrics["arm_joint_rate_reward"]
+        + float(r.ik_residual_weight) * metrics["ik_residual_reward"]
         + float(r.position_hand_weight) * metrics["hand_position_reward"]
         + float(r.velocity_hand_weight) * metrics["hand_velocity_reward"]
-        + float(r.action_rate_hand_weight) * metrics["hand_action_rate_reward"]
+        + float(r.hand_action_rate_weight) * metrics["hand_action_rate_reward"]
         + float(r.object_position_weight) * metrics["object_position_reward"]
         + float(r.object_orientation_weight)
         * metrics["object_orientation_reward"]
@@ -393,16 +572,205 @@ def assert_reward_contract(env):
         raise AssertionError("Reward does not match the configured weights")
 
 
+def assert_palm_jacobian_matches_urdf(env):
+    """The Isaac Gym palm Jacobian against pytorch_kinematics on the URDF.
+
+    This one assertion covers every way the task-space controller can be wired
+    to the wrong numbers: the Jacobian's DOF columns are in asset order and
+    demo_to_asset is a real permutation, the link axis is offset by one for a
+    fixed-base actor, and the palm is a point transfer off wrist_3_link rather
+    than a body Isaac Gym reports. Any of those being wrong still produces a
+    smoothly moving arm, just not one that moves where the reward is measured.
+
+    Checked at several reference indices because a transfer error scales with the
+    wrist's angular rate and would hide at a single pose.
+    """
+    import torch
+
+    kinematics = env._palm_kinematics
+    worst = 0.0
+    hold = torch.zeros(
+        (env.num_envs, env.num_actions), dtype=torch.float32, device=env.device
+    )
+    for reference_index in (0, 200, 400, 600, 740, 830):
+        env.reset(reference_index=reference_index)
+        # Isaac Gym does not propagate a DOF-state write into the rigid-body or
+        # Jacobian tensors until physics runs, so compare only after a step --
+        # otherwise this reads a Jacobian for the previous configuration and
+        # both sides describe different poses.
+        env.step(hold)
+        expected = kinematics.jacobian(env.arm_q.double().cpu())
+        actual = env._palm_jacobian_arm().double().cpu()
+        if actual.shape != expected.shape:
+            raise AssertionError(
+                "Palm Jacobian has shape {}, expected {}".format(
+                    tuple(actual.shape), tuple(expected.shape)
+                )
+            )
+        worst = max(worst, float((actual - expected).abs().max()))
+    # float32 Isaac Gym against float64 pytorch_kinematics.
+    if worst > 2e-4:
+        raise AssertionError(
+            "Isaac Gym palm Jacobian differs from the URDF by {:.3e}; suspect "
+            "the asset-order DOF columns, the link index, or the point "
+            "transfer".format(worst)
+        )
+
+
+def assert_zero_twist_holds_the_arm(env):
+    """A zero action must mean "hold", and must cost nothing in residual."""
+    import torch
+
+    env.reset(reference_index=400)
+    before = env.previous_arm_targets.clone()
+    actions = torch.zeros(
+        (env.num_envs, env.num_actions), dtype=torch.float32, device=env.device
+    )
+    for _ in range(50):
+        env.step(actions)
+    drift = float((env.previous_arm_targets - before).abs().max())
+    if drift > 1e-5:
+        raise AssertionError(
+            "A zero twist moved the arm target by {:.3e} rad".format(drift)
+        )
+    residual = float(env.ik_residual_norm.max())
+    if residual > 1e-5:
+        raise AssertionError(
+            "A zero twist left an IK residual of {:.3e}".format(residual)
+        )
+
+
+def assert_infeasible_commands_are_reported(env):
+    """The feasibility signal has to actually reach the diagnostics.
+
+    An impossible twist must show up as a saturated clamp and a large residual.
+    If these stayed silent the whole design would be unobservable: the policy
+    would be free to ask for the impossible and nothing would say so.
+    """
+    import torch
+
+    env.reset(reference_index=400)
+    actions = torch.zeros(
+        (env.num_envs, env.num_actions), dtype=torch.float32, device=env.device
+    )
+
+    # An over-range request must be bounded in magnitude and left pointing the
+    # way it was asked to point. Per-component clipping would satisfy the first
+    # and quietly break the second.
+    actions[:, 0] = 10.0
+    actions[:, 1] = 20.0
+    env.step(actions)
+    translation = env.requested_twist[:, :3]
+    limit = env.arm_translation_speed * env.dt
+    if float(translation.norm(dim=1).max()) > limit * (1.0 + 1e-6):
+        raise AssertionError("The commanded translation exceeded the speed limit")
+    # (10, 20, 0) normalised is (0.4472, 0.8944, 0); clipping each component
+    # would have returned (0.7071, 0.7071, 0) instead.
+    direction = translation / translation.norm(dim=1, keepdim=True)
+    expected = torch.tensor(
+        [10.0, 20.0, 0.0], device=env.device, dtype=direction.dtype
+    )
+    expected = expected / expected.norm()
+    if not bool(torch.allclose(direction, expected.expand_as(direction), atol=1e-5)):
+        raise AssertionError(
+            "Saturating the twist turned it: got {}, expected {}".format(
+                direction[0].tolist(), expected.tolist()
+            )
+        )
+
+    # In the regime the policy actually operates in -- tracking the reference --
+    # the solver must deliver essentially all of what it is asked for. Measured
+    # at 0.5% lost and the clamp never binding; a full-scale command is a
+    # different matter and saturates about 17% of the time, which is the clamp
+    # doing its job as a joint-speed limit rather than a defect.
+    env.reset(reference_index=400)
+    reference_actions, _ = env.next_reference_action()
+    env.step(reference_actions)
+    requested_norm = env.requested_twist.norm(dim=1).clamp_min(1e-12)
+    residual_fraction = float((env.ik_residual_norm / requested_norm).max())
+    if residual_fraction > 0.05:
+        raise AssertionError(
+            "Tracking the reference lost {:.1%} of the commanded twist; "
+            "suspect ik_damping".format(residual_fraction)
+        )
+    if bool((env.arm_joint_delta_clipped > 0.5).any()):
+        raise AssertionError(
+            "The per-joint IK clamp bound while merely tracking the reference"
+        )
+
+    # Now force the clamp to bind, and check the report reaches the outside.
+    # Shrinking the clamp is the cheapest way to make any command infeasible;
+    # the mechanism it exercises -- applied delta read back, pushed through the
+    # Jacobian, differenced against the request -- is the same one a joint limit
+    # or a singularity triggers in training.
+    original = env.ik_max_joint_delta
+    env.ik_max_joint_delta = 1e-5
+    try:
+        env.step(actions)
+        if not bool((env.arm_joint_delta_clipped > 0.5).all()):
+            raise AssertionError(
+                "A clamped IK step did not set the saturation flag"
+            )
+        if float(env.ik_residual_norm.min()) <= 1e-4:
+            raise AssertionError(
+                "A clamped IK step reported no unresolved residual"
+            )
+        achieved = float(env.achieved_twist.abs().max())
+        requested = float(env.requested_twist.abs().max())
+        if achieved >= requested:
+            raise AssertionError(
+                "A clamped step claims to have delivered the full twist"
+            )
+    finally:
+        env.ik_max_joint_delta = original
+
+
+def assert_the_ik_runs_once_per_step(env):
+    """The arm mapping is a stateful integrator, so a second call double-counts.
+
+    This is the bug the scale_actions -> command_targets rename exists to
+    prevent, so it is worth pinning rather than trusting.
+    """
+    import torch
+
+    calls = {"count": 0}
+    original = env._operational_space_arm_targets
+
+    def counting(arm_actions):
+        calls["count"] += 1
+        return original(arm_actions)
+
+    env._operational_space_arm_targets = counting
+    try:
+        actions = torch.zeros(
+            (env.num_envs, env.num_actions),
+            dtype=torch.float32,
+            device=env.device,
+        )
+        env.step(actions)
+    finally:
+        env._operational_space_arm_targets = original
+    if calls["count"] != 1:
+        raise AssertionError(
+            "The IK ran {} times in one step; it integrates onto the previous "
+            "target, so it must run exactly once".format(calls["count"])
+        )
+
+
 def assert_demonstration_action_delta_reward(env):
     import torch
 
     original_actions = env.actions.clone()
     original_previous_actions = env.previous_actions.clone()
     reference = env.reference.sample(env.reference_index)
-    expected_delta = reference.dq * env.dt / env.action_scales
+    # Hand only: the arm's regularizer is pure command smoothness and is not
+    # compared against the demonstration, so there is no arm counterpart here.
+    expected_delta = (
+        reference.dq[:, 6:] * env.dt / env.hand_action_scale
+    )
     if not bool(
         torch.allclose(
-            env.demonstration_action_delta(reference.dq),
+            env.demonstration_hand_action_delta(reference.dq),
             expected_delta,
             rtol=0.0,
             atol=1e-8,
@@ -410,12 +778,13 @@ def assert_demonstration_action_delta_reward(env):
     ):
         raise AssertionError("Demonstration velocity was mapped incorrectly")
 
-    env.actions.copy_(env.previous_actions + expected_delta)
+    env.actions.copy_(env.previous_actions)
+    env.actions[:, 6:] += expected_delta
     matched = env._compute_reward_and_errors()
     if not bool(
         torch.allclose(
-            matched["action_delta_error"],
-            torch.zeros_like(matched["action_delta_error"]),
+            matched["hand_action_rate_mse"],
+            torch.zeros_like(matched["hand_action_rate_mse"]),
             rtol=0.0,
             # a_{t-1} can be O(10) in residual space; adding then subtracting
             # the small demonstrated delta loses a few float32 ulps.
@@ -425,18 +794,6 @@ def assert_demonstration_action_delta_reward(env):
         raise AssertionError(
             "The demonstrated action delta does not maximize regularization"
         )
-
-    env.actions.copy_(env.previous_actions)
-    static = env._compute_reward_and_errors()
-    if not bool(
-        torch.allclose(
-            static["action_delta_error"],
-            -expected_delta,
-            rtol=0.0,
-            atol=1e-8,
-        )
-    ):
-        raise AssertionError("A zero action delta has the wrong tracking error")
 
     env.actions.copy_(original_actions)
     env.previous_actions.copy_(original_previous_actions)
@@ -486,12 +843,15 @@ def assert_ppo_step_contract(env, obs, critic_obs, rewards, dones, extras):
             "return",
             "length",
             "mean_reward",
-            "mean_position_reward",
-            "mean_velocity_reward",
-            "mean_action_rate_reward",
+            "mean_palm_tilt_reward",
+            "mean_ee_action_rate_reward",
+            "mean_arm_joint_rate_reward",
+            "mean_ik_residual_reward",
             "mean_rms_position_error",
             "mean_rms_velocity_error",
-            "mean_rms_action_rate",
+            "mean_rms_ee_action_rate",
+            "mean_rms_arm_joint_rate",
+            "mean_arm_joint_delta_clipped",
             "early_termination_fraction",
             "horizon_fraction",
             "reference_end_fraction",
@@ -533,16 +893,25 @@ def run_ideal_episode(env, initial_indices):
     )
     pending = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
     observed_steps = torch.zeros_like(initial_indices)
+    peak_arm_action = 0.0
 
     for step in range(1, env.max_episode_length + 1):
         actions, complete_target = env.next_reference_action()
-        reconstructed_target = env.scale_actions(actions)
+        # The hand's residual mapping is still exactly invertible. The arm's is
+        # not, by construction -- an integrator through a damped, clamped,
+        # limit-saturated IK has no pointwise inverse -- so the arm is held to a
+        # task-space standard below instead: it must track the reference palm
+        # without terminating, using well under the full action range.
+        reconstructed_hand = env.scale_hand_actions(actions[:, 6:])
         if not bool(
             torch.allclose(
-                reconstructed_target, complete_target, rtol=0.0, atol=1e-6
+                reconstructed_hand, complete_target[:, 6:], rtol=0.0, atol=1e-6
             )
         ):
-            raise AssertionError("AnimRL residual action mapping is not invertible")
+            raise AssertionError("The hand residual mapping is not invertible")
+        peak_arm_action = max(
+            peak_arm_action, float(actions[:, :6].abs().max())
+        )
 
         obs, critic_obs, rewards, dones, extras = env.step(actions)
         assert_ppo_step_contract(
@@ -552,12 +921,13 @@ def run_ideal_episode(env, initial_indices):
             raise AssertionError("Reward contains NaN or infinity")
         r = env.cfg.rewards
         reward_upper_bound = (
-            float(r.position_arm_weight)
-            + float(r.velocity_arm_weight)
-            + float(r.action_rate_arm_weight)
+            float(r.palm_tilt_weight)
+            + float(r.ee_action_rate_weight)
+            + float(r.arm_joint_rate_weight)
+            + float(r.ik_residual_weight)
             + float(r.position_hand_weight)
             + float(r.velocity_hand_weight)
-            + float(r.action_rate_hand_weight)
+            + float(r.hand_action_rate_weight)
             + float(r.object_position_weight)
             + float(r.object_orientation_weight)
             + float(r.fingertip_object_distance_weight)
@@ -666,7 +1036,19 @@ def run_ideal_episode(env, initial_indices):
     if bool(pending.any()) or not bool(torch.equal(observed_steps, expected_steps)):
         raise AssertionError("Not every initial RSI episode ended at the expected step")
 
+    # The empirical check on control.arm_translation_speed_m_per_s. Tracking the
+    # demonstration measured 0.373 at the configured scales, so the headroom
+    # above that is what the policy has left for correcting a perturbation. A
+    # materially larger number means the Jacobian, the frame or a speed scale is
+    # wrong; the fix is to raise the speed scale, never to relax this bound.
+    if peak_arm_action > 0.5:
+        raise AssertionError(
+            "Reference playback needs |arm action| up to {:.3f}, leaving no "
+            "headroom under the +/-1 clip".format(peak_arm_action)
+        )
+
     return {
+        "peak_arm_action": peak_arm_action,
         "peak_position_error": peak_position_error,
         "peak_velocity_rms_error": peak_velocity_error,
         "minimum_reward": minimum_reward,
@@ -897,6 +1279,7 @@ def main():
         )
         assert_object_scene_contract(env)
         assert_vectorized_object_rsi_contract(env)
+        assert_continuous_placement_contract(env)
         env.reset_idx(env.all_env_ids, initial_indices)
         env.gym.refresh_dof_state_tensor(env.sim)
         env.gym.refresh_actor_root_state_tensor(env.sim)
@@ -904,6 +1287,15 @@ def main():
         assert_reward_contract(env)
         assert_demonstration_action_delta_reward(env)
         assert_correct_pd_gains(env)
+        # The task-space controller. These reset the env themselves, so they run
+        # before the horizon walk below re-establishes the initial indices.
+        assert_palm_jacobian_matches_urdf(env)
+        assert_zero_twist_holds_the_arm(env)
+        assert_infeasible_commands_are_reported(env)
+        assert_the_ik_runs_once_per_step(env)
+        env.reset_idx(env.all_env_ids, initial_indices)
+        env.gym.refresh_dof_state_tensor(env.sim)
+        env.gym.refresh_actor_root_state_tensor(env.sim)
         # Exact joint targets do not guarantee that the dynamic cube remains
         # grasped, so exercise the complete horizon without the object-distance
         # reset here. Its threshold, grace period and opt-out behavior are
@@ -960,7 +1352,7 @@ def main():
         print("  cube/table physics        : verified")
         print("  collision filtering       : verified")
         print("  vectorized object RSI      : verified")
-        print("  108D observation contract : verified")
+        print("  observation contract      : verified ({}D)".format(env.num_obs))
         print("  policy-driven hand        : verified")
         print("  no-object reward contract : verified")
         print("  demo action-delta reward  : verified")

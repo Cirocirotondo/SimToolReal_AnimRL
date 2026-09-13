@@ -21,12 +21,13 @@ import torch
 # contact weight, which lives in cfg.contact. Order fixes the legend order and
 # must stay aligned with MotionImitationEnv._compute_reward_and_errors.
 REWARD_TERMS: Tuple[Tuple[str, Optional[str]], ...] = (
-    ("position_reward", "position_arm_weight"),
-    ("velocity_reward", "velocity_arm_weight"),
-    ("action_rate_reward", "action_rate_arm_weight"),
+    ("palm_tilt_reward", "palm_tilt_weight"),
+    ("ee_action_rate_reward", "ee_action_rate_weight"),
+    ("arm_joint_rate_reward", "arm_joint_rate_weight"),
+    ("ik_residual_reward", "ik_residual_weight"),
     ("hand_position_reward", "position_hand_weight"),
     ("hand_velocity_reward", "velocity_hand_weight"),
-    ("hand_action_rate_reward", "action_rate_hand_weight"),
+    ("hand_action_rate_reward", "hand_action_rate_weight"),
     ("object_position_reward", "object_position_weight"),
     ("object_orientation_reward", "object_orientation_weight"),
     (
@@ -36,11 +37,20 @@ REWARD_TERMS: Tuple[Tuple[str, Optional[str]], ...] = (
     ("fingertip_contact_reward", None),
 )
 
+# The arm's six actions are an end-effector twist in the robot base frame, so
+# they are labelled by twist component rather than by joint.
+EE_ACTION_NAMES: Tuple[str, ...] = ("dx", "dy", "dz", "wx", "wy", "wz")
+
 # Scalar per-step diagnostics copied straight out of the step extras.
 SCALAR_INFO_KEYS: Tuple[str, ...] = (
     "rms_position_error",
     "rms_velocity_error",
-    "rms_action_rate",
+    "palm_tilt_error_rad",
+    "rms_ee_action_rate",
+    "rms_arm_joint_rate",
+    "ik_residual_norm",
+    "arm_joint_delta_norm",
+    "arm_joint_delta_clipped",
     "rms_hand_position_error",
     "rms_hand_velocity_error",
     "rms_hand_action_rate",
@@ -141,7 +151,6 @@ class EvaluationPlotter:
         self._position_threshold: Optional[float] = None
         self._hand_position_threshold: Optional[float] = None
         self._reference_initial_object_com_height_m = 0.0
-        self._action_scale = 1.0
         self._hand_action_scale = 1.0
         self._num_arm_dofs = 0
         self._num_hand_dofs = 0
@@ -159,7 +168,6 @@ class EvaluationPlotter:
     def start_episode(self, slug: str, env) -> None:
         self._slug = str(slug)
         self._dt = float(env.dt)
-        self._action_scale = float(env.action_scale)
         self._hand_action_scale = float(env.hand_action_scale)
         # The policy now drives all 26 joints, so the split comes from the
         # environment's own arm/hand views rather than from the action width:
@@ -246,13 +254,16 @@ class EvaluationPlotter:
         action = _vector(actions, env_idx)
         self._append("action", action[:arm])
         self._append("hand_action", action[arm:])
-        # Recomputed from the action rather than read back from the environment:
-        # reset_idx() overwrites the stored targets of a terminated env.
-        target = _vector(env.scale_actions(
-            torch.as_tensor(action, dtype=torch.float32, device=env.device).unsqueeze(0)
-        ), 0)
+        # Read back from the environment rather than recomputed: the arm's
+        # mapping is a stateful integrator through the IK now, so calling it
+        # again here would advance the accumulator a second time. The env caches
+        # the targets it actually applied, and reset_idx does not touch that
+        # cache -- which is what the recompute originally existed to avoid.
+        target = _vector(env._last_command_targets, env_idx)
         self._append("arm_target_q", target[:arm])
         self._append("hand_target_q", target[arm:])
+        self._append("requested_twist", _vector(env.requested_twist, env_idx))
+        self._append("achieved_twist", _vector(env.achieved_twist, env_idx))
 
         indices = torch.as_tensor(
             [reference_index], dtype=torch.long, device=env.device
@@ -263,13 +274,17 @@ class EvaluationPlotter:
             "reference_object_com_height_m",
             _scalar(reference_cube_root_state[:, 2], 0),
         )
-        # The action that would have landed exactly on this reference sample.
-        # step() advances reference_index before publishing it, so the index
-        # recorded here is the one the action applied this step was aiming at,
-        # and inverting the residual mapping on it gives the ideal action.
-        ideal_action = _vector(env.positions_to_actions(reference.q), 0)
-        self._append("reference_action", ideal_action[:arm])
-        self._append("reference_hand_action", ideal_action[arm:])
+        # The hand action that would have landed exactly on this reference
+        # sample. step() advances reference_index before publishing it, so the
+        # index recorded here is the one the action applied this step was aiming
+        # at, and inverting the residual mapping on it gives the ideal action.
+        # There is no arm equivalent: its command runs through a saturating IK
+        # onto an accumulator and cannot be inverted pointwise. The arm's
+        # counterpart is the requested/achieved twist pair recorded above.
+        ideal_hand_action = _vector(
+            env.positions_to_hand_actions(reference.q[:, arm:]), 0
+        )
+        self._append("reference_hand_action", ideal_hand_action)
         self._append("reference_arm_q", _vector(reference.q[:, :arm], 0))
         self._append("reference_arm_dq", _vector(reference.dq[:, :arm], 0))
         self._append("reference_hand_q", _vector(reference.q[:, arm:], 0))
@@ -534,8 +549,14 @@ class EvaluationPlotter:
 
         axes[2].plot(
             time_s,
-            data["rms_action_rate"],
-            label="arm RMS |delta(a) - delta(a_demo)|",
+            data["rms_ee_action_rate"],
+            label="EE RMS |delta(a)|",
+            linewidth=1.3,
+        )
+        axes[2].plot(
+            time_s,
+            data["rms_arm_joint_rate"],
+            label="arm joint RMS |delta(q_target)|",
             linewidth=1.3,
         )
         axes[2].plot(
@@ -883,13 +904,14 @@ class EvaluationPlotter:
         delta = (
             data["action_delta"] if group == "arm" else data["hand_action_delta"]
         )
-        ideal = (
-            data["reference_action"]
-            if group == "arm"
-            else data["reference_hand_action"]
-        )
-        names = self._arm_names if group == "arm" else self._hand_names
-        scale = self._action_scale if group == "arm" else self._hand_action_scale
+        # No arm equivalent: a twist command through a saturating IK onto an
+        # accumulator has no pointwise inverse, so there is no "the action that
+        # would have reproduced the reference" trace to draw against it.
+        ideal = None if group == "arm" else data["reference_hand_action"]
+        # The arm's action is an end-effector twist, not six joint residuals,
+        # so it is labelled by twist component and has no per-joint scale.
+        names = EE_ACTION_NAMES if group == "arm" else self._hand_names
+        scale = None if group == "arm" else self._hand_action_scale
         count = action.shape[1]
 
         fig, axes = plt.subplots(count, 1, figsize=(14, 2.3 * count), sharex=True)
@@ -897,18 +919,19 @@ class EvaluationPlotter:
         for index in range(count):
             ax = axes[index]
             trace = action[:, index]
-            ideal_trace = ideal[:, index]
+            ideal_trace = None if ideal is None else ideal[:, index]
             ax.plot(time_s, trace, label="action", linewidth=1.1)
-            # The open-loop action that reproduces the demonstration exactly:
-            # the gap to it is the residual the policy is adding on top.
-            ax.plot(
-                time_s,
-                ideal_trace,
-                label="ideal (demo)",
-                linewidth=1.1,
-                linestyle="--",
-                color="0.25",
-            )
+            if ideal_trace is not None:
+                # The open-loop action that reproduces the demonstration
+                # exactly: the gap to it is the residual the policy adds on top.
+                ax.plot(
+                    time_s,
+                    ideal_trace,
+                    label="ideal (demo)",
+                    linewidth=1.1,
+                    linestyle="--",
+                    color="0.25",
+                )
             ax.plot(
                 time_s,
                 delta[:, index],
@@ -928,19 +951,21 @@ class EvaluationPlotter:
                 if finite_delta.size
                 else 0.0
             )
-            gap = trace - ideal_trace
-            rms_gap = (
-                float(np.sqrt(np.nanmean(gap ** 2))) if gap.size else 0.0
+            title = "{}    sign-flip rate {:.3f}    RMS delta {:.4f}".format(
+                names[index] if index < len(names) else index,
+                flip_rate,
+                rms_delta,
             )
+            if ideal_trace is not None:
+                gap = trace - ideal_trace
+                rms_gap = (
+                    float(np.sqrt(np.nanmean(gap ** 2))) if gap.size else 0.0
+                )
+                title += "    RMS vs ideal {:.3f}".format(rms_gap)
+            if scale is not None:
+                title += "    ±1 -> {:+.3f} rad residual".format(scale)
             ax.set_title(
-                "{}    sign-flip rate {:.3f}    RMS delta {:.4f}    "
-                "RMS vs ideal {:.3f}    ±1 -> {:+.3f} rad residual".format(
-                    names[index] if index < len(names) else index,
-                    flip_rate,
-                    rms_delta,
-                    rms_gap,
-                    scale,
-                ),
+                title,
                 fontsize=9,
                 loc="left",
             )

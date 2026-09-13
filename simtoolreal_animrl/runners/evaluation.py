@@ -194,11 +194,14 @@ class DeterministicEvaluator:
             self.env.num_envs, dtype=torch.float32, device=self.env.device
         )
         reward_sum = torch.zeros_like(episode_steps)
-        position_reward_sum = torch.zeros_like(episode_steps)
+        palm_tilt_reward_sum = torch.zeros_like(episode_steps)
+        palm_tilt_error_sum = torch.zeros_like(episode_steps)
+        ee_action_rate_reward_sum = torch.zeros_like(episode_steps)
+        arm_joint_rate_reward_sum = torch.zeros_like(episode_steps)
+        ik_residual_norm_sum = torch.zeros_like(episode_steps)
+        arm_joint_delta_clipped_sum = torch.zeros_like(episode_steps)
         palm_keypoint_reward_sum = torch.zeros_like(episode_steps)
         fingertip_keypoint_reward_sum = torch.zeros_like(episode_steps)
-        velocity_reward_sum = torch.zeros_like(episode_steps)
-        action_rate_reward_sum = torch.zeros_like(episode_steps)
         hand_position_reward_sum = torch.zeros_like(episode_steps)
         hand_velocity_reward_sum = torch.zeros_like(episode_steps)
         hand_action_rate_reward_sum = torch.zeros_like(episode_steps)
@@ -214,7 +217,8 @@ class DeterministicEvaluator:
         rms_hand_position_error_sum = torch.zeros_like(episode_steps)
         max_hand_position_error = torch.zeros_like(episode_steps)
         rms_position_error_sum = torch.zeros_like(episode_steps)
-        rms_action_rate_sum = torch.zeros_like(episode_steps)
+        rms_ee_action_rate_sum = torch.zeros_like(episode_steps)
+        rms_arm_joint_rate_sum = torch.zeros_like(episode_steps)
         rms_velocity_error_sum = torch.zeros_like(episode_steps)
         max_position_error = torch.zeros_like(episode_steps)
         initial_object_com_height = self.env.cube_position[:, 2].clone()
@@ -231,13 +235,7 @@ class DeterministicEvaluator:
                 normalized = runner.actor_obs_normalizer(observations)
                 actions = runner.policy.act_inference(normalized)
                 clipped_target_components += int(
-                    (
-                        (
-                            actions.abs() * self.env.action_scales
-                            > self.env.action_target_clip
-                        )
-                        & active[:, None]
-                    ).sum()
+                    (self.env.saturated_actions(actions) & active[:, None]).sum()
                 )
                 action_components += int(active.sum()) * self.env.num_actions
                 abs_action_sum += float((actions.abs() * active[:, None]).sum())
@@ -268,18 +266,32 @@ class DeterministicEvaluator:
                 active_float = active.float()
                 episode_steps += active_float
                 reward_sum += rewards * active_float
-                position_reward_sum += infos["position_reward"] * active_float
+                palm_tilt_reward_sum += infos["palm_tilt_reward"] * active_float
+                palm_tilt_error_sum += (
+                    infos["palm_tilt_error_rad"] * active_float
+                )
+                ee_action_rate_reward_sum += (
+                    infos["ee_action_rate_reward"] * active_float
+                )
+                arm_joint_rate_reward_sum += (
+                    infos["arm_joint_rate_reward"] * active_float
+                )
+                ik_residual_norm_sum += infos["ik_residual_norm"] * active_float
+                arm_joint_delta_clipped_sum += (
+                    infos["arm_joint_delta_clipped"] * active_float
+                )
                 palm_keypoint_reward_sum += (
                     infos["palm_keypoint_reward"] * active_float
                 )
                 fingertip_keypoint_reward_sum += (
                     infos["fingertip_keypoint_reward"] * active_float
                 )
-                velocity_reward_sum += infos["velocity_reward"] * active_float
-                action_rate_reward_sum += (
-                    infos["action_rate_reward"] * active_float
+                rms_ee_action_rate_sum += (
+                    infos["rms_ee_action_rate"] * active_float
                 )
-                rms_action_rate_sum += infos["rms_action_rate"] * active_float
+                rms_arm_joint_rate_sum += (
+                    infos["rms_arm_joint_rate"] * active_float
+                )
                 hand_position_reward_sum += (
                     infos["hand_position_reward"] * active_float
                 )
@@ -358,7 +370,6 @@ class DeterministicEvaluator:
         lengths = episode_steps.clamp_min(1.0)
         per_env_palm_keypoint_reward = palm_keypoint_reward_sum / lengths
         per_env_fingertip_keypoint_reward = fingertip_keypoint_reward_sum / lengths
-        per_env_position_reward = position_reward_sum / lengths
         per_env_hand_position_reward = hand_position_reward_sum / lengths
         per_env_object_position_reward = object_position_reward_sum / lengths
         per_env_object_orientation_reward = (
@@ -385,10 +396,11 @@ class DeterministicEvaluator:
                 per_env_object_position_reward
             )
         # Score the checkpoint on what the policy is actually asked to do.
-        # These were the arm and hand JOINT Gaussians, which now carry weights
-        # of 0.06 and 0.05 against the keypoint terms' 0.80 and 0.48 -- so
+        # These were the arm and hand JOINT Gaussians, which carried weights of
+        # 0.06 and 0.05 against the keypoint terms' 0.80 and 0.48 -- so
         # best_model.pt would have been selected by tracking the policy is
-        # deliberately not optimising for.
+        # deliberately not optimising for. The arm's joint Gaussians have since
+        # been removed outright, which is the same conclusion carried further.
         mean_robot_position_reward = 0.5 * (
             per_env_palm_keypoint_reward.mean()
             + per_env_fingertip_keypoint_reward.mean()
@@ -407,15 +419,29 @@ class DeterministicEvaluator:
             "mean_fingertip_keypoint_reward": float(
                 per_env_fingertip_keypoint_reward.mean()
             ),
-            "mean_position_reward": float(per_env_position_reward.mean()),
-            "mean_velocity_reward": float(
-                (velocity_reward_sum / lengths).mean()
+            "mean_palm_tilt_reward": float(
+                (palm_tilt_reward_sum / lengths).mean()
             ),
-            "mean_action_rate_reward": float(
-                (action_rate_reward_sum / lengths).mean()
+            "mean_palm_tilt_error_rad": float(
+                (palm_tilt_error_sum / lengths).mean()
             ),
-            "mean_rms_action_rate": float(
-                (rms_action_rate_sum / lengths).mean()
+            "mean_ee_action_rate_reward": float(
+                (ee_action_rate_reward_sum / lengths).mean()
+            ),
+            "mean_arm_joint_rate_reward": float(
+                (arm_joint_rate_reward_sum / lengths).mean()
+            ),
+            "mean_ik_residual_norm": float(
+                (ik_residual_norm_sum / lengths).mean()
+            ),
+            "mean_arm_joint_delta_clipped": float(
+                (arm_joint_delta_clipped_sum / lengths).mean()
+            ),
+            "mean_rms_ee_action_rate": float(
+                (rms_ee_action_rate_sum / lengths).mean()
+            ),
+            "mean_rms_arm_joint_rate": float(
+                (rms_arm_joint_rate_sum / lengths).mean()
             ),
             "mean_rms_position_error": float(
                 (rms_position_error_sum / lengths).mean()

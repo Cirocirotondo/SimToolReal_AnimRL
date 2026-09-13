@@ -77,8 +77,22 @@ SERIES = [
     # Scale-free, so it is the one smoothness number comparable across runs
     # with different reward sigmas.
     (
-        "evaluation_fixed_mean_rms_action_rate",
-        "Action rate (vibration)",
+        "evaluation_fixed_mean_rms_ee_action_rate",
+        "EE action rate (command vibration)",
+        "",
+        "down",
+    ),
+    (
+        "evaluation_fixed_mean_rms_arm_joint_rate",
+        "Arm joint rate (IK output vibration)",
+        "rad",
+        "down",
+    ),
+    # How often the IK step hit its per-joint clamp. Persistently high means the
+    # policy is asking for more than the arm can deliver in one control step.
+    (
+        "evaluation_fixed_mean_arm_joint_delta_clipped",
+        "IK clamp saturation",
         "",
         "down",
     ),
@@ -90,8 +104,8 @@ SERIES_KEYS = [key for key, _, _, _ in SERIES]
 # open-loop action that would reproduce the demonstration, and the step-to-step
 # difference on the same axes, which is what exposes chatter.
 EVAL_FIGURES = [
-    ("arm_action_per_joint", "Arm action per joint",
-     "action vs ideal (demo) vs a_t - a_(t-1), one panel per arm joint"),
+    ("arm_action_per_joint", "Arm end-effector action",
+     "commanded twist and a_t - a_(t-1), one panel per twist component"),
     ("hand_action_per_joint", "Hand action per joint",
      "action vs ideal (demo) vs a_t - a_(t-1), one panel per hand joint"),
 ]
