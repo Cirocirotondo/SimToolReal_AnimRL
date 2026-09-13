@@ -105,6 +105,7 @@ class TransformBank:
         cube_linear_velocity: torch.Tensor,
         cube_angular_velocity: torch.Tensor,
         reference_keypoints: torch.Tensor,
+        reference_palm_tilt: torch.Tensor,
         acceptance: float,
     ) -> None:
         self.yaw_rad = yaw_rad
@@ -115,6 +116,7 @@ class TransformBank:
         self.cube_linear_velocity = cube_linear_velocity
         self.cube_angular_velocity = cube_angular_velocity
         self.reference_keypoints = reference_keypoints
+        self.reference_palm_tilt = reference_palm_tilt
         self.acceptance = float(acceptance)
 
     @property
@@ -140,6 +142,7 @@ class TransformBank:
             move(self.cube_linear_velocity),
             move(self.cube_angular_velocity),
             move(self.reference_keypoints),
+            move(self.reference_palm_tilt),
             self.acceptance,
         )
 
@@ -169,6 +172,22 @@ class TransformBank:
         """``(N, 9, 3)`` reference keypoints -- no transform index needed."""
         return self.reference_keypoints[frame_indices.long()]
 
+    def palm_tilt_at(self, frame_indices: torch.Tensor) -> torch.Tensor:
+        """``(N, 3)`` reference palm tilt -- no transform index needed either.
+
+        Gravity's direction expressed in the palm frame, which is what is left
+        of the palm's orientation once rotation about the world vertical is
+        discarded: the palm's pitch and roll, and nothing else.
+
+        One table serves every transform because the bank's transforms are a
+        planar translation plus a yaw about the bar's vertical axis. A left
+        multiplication by ``R_z`` leaves ``R^T z`` untouched, so this quantity
+        cannot depend on which transform an episode drew -- measured varying by
+        0.013 degrees across transforms spanning 112 degrees of yaw, which is
+        the bank's own IK residual rather than a real dependence.
+        """
+        return self.reference_palm_tilt[frame_indices.long()]
+
     def save(self, path: Union[str, Path]) -> None:
         destination = Path(path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +201,7 @@ class TransformBank:
                 "cube_linear_velocity": self.cube_linear_velocity,
                 "cube_angular_velocity": self.cube_angular_velocity,
                 "reference_keypoints": self.reference_keypoints,
+                "reference_palm_tilt": self.reference_palm_tilt,
                 "acceptance": self.acceptance,
             },
             str(destination),
@@ -205,8 +225,25 @@ class TransformBank:
             payload["cube_linear_velocity"],
             payload["cube_angular_velocity"],
             payload["reference_keypoints"],
+            cls._require_palm_tilt(payload),
             payload["acceptance"],
         )
+
+    @staticmethod
+    def _require_palm_tilt(payload):
+        """Fail with instructions rather than silently dropping a reward term.
+
+        Banks built before the palm-tilt reward existed have no table, and the
+        term that reads it is what stops the policy lifting the cube by turning
+        its wrist. Defaulting it would disable that quietly.
+        """
+        if "reference_palm_tilt" not in payload:
+            raise KeyError(
+                "This transform bank predates the palm-tilt reference and "
+                "cannot drive the palm_tilt reward. Rebuild it:\n"
+                "    PYTHONPATH=. python scripts/build_transform_bank.py"
+            )
+        return payload["reference_palm_tilt"]
 
 
 def map_arm_velocities(
@@ -278,6 +315,25 @@ def transform_cube_track(
     return torch.cat((positions, orientations), dim=-1), linear, angular
 
 
+def palm_tilt_in_palm_frame(kinematics, arm_q: torch.Tensor) -> torch.Tensor:
+    """``(frames, 3)`` gravity direction in the palm frame, per demonstration frame.
+
+    What remains of the palm's orientation after discarding rotation about the
+    world vertical: its pitch and roll. Computed from the demonstration alone
+    because a yaw transform cannot change it -- ``(R_z R)^T z = R^T z`` -- so the
+    same table is correct for every transform in the bank.
+
+    Yaw is left out deliberately. The bar's own yaw is randomised per episode and
+    the hand has to follow it, so pinning the palm's yaw would fight the
+    randomisation. Pitch and roll carry no such dependence: whatever the bar's
+    yaw, the hand approaches and lifts it at the same tilt.
+    """
+    matrices = kinematics.palm_matrices(arm_q)
+    up = torch.tensor([0.0, 0.0, 1.0], dtype=arm_q.dtype, device=arm_q.device)
+    tilt = matrices[:, :3, :3].transpose(1, 2) @ up
+    return torch.nn.functional.normalize(tilt, dim=-1)
+
+
 def build_transform_bank(
     kinematics: PalmKinematics,
     demonstration,
@@ -331,6 +387,7 @@ def build_transform_bank(
     reference_keypoints = reference_keypoints_in_object_frame(
         kinematics, demo_q, demo_cube_base, lever_arm_m
     )
+    reference_palm_tilt = palm_tilt_in_palm_frame(kinematics, demo_arm_q)
 
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
     collected, attempted, accepted = [], 0, 0
@@ -428,6 +485,7 @@ def build_transform_bank(
         linear.permute(1, 0, 2).contiguous(),
         angular.permute(1, 0, 2).contiguous(),
         reference_keypoints,
+        reference_palm_tilt,
         accepted / max(attempted, 1),
     )
 

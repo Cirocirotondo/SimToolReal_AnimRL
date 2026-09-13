@@ -12,7 +12,7 @@ This score uses only quantities that are free of both problems: the cohort that
 follows the training distribution, and physical measurements in metres, radians
 and action units that no sigma can move.
 
-    deployment_score = grasp_gate * (0.5*smooth + 0.3*arm + 0.2*hand)
+    deployment_score = grasp_gate            # quality terms await re-anchoring
 
 The grasp is a *gate*, not a summand. A policy that drops the cube is worthless
 however smooth it is, and an additive term would let one be traded for the
@@ -30,12 +30,30 @@ DEMONSTRATION_LIFT_M = 0.24
 # _sigma, the smoothest policy trained here. A term is 0 at `worst` and 1 at
 # `best`, and the scale is logarithmic because these span two decades.
 ANCHORS = {
-    "action_rate": (2.5275, 0.0076),
-    "arm_position_error": (0.0692, 0.0061),
     "hand_position_error": (0.2124, 0.0103),
 }
 
-WEIGHTS = {"action_rate": 0.5, "arm_position_error": 0.3, "hand_position_error": 0.2}
+# The smoothness term is suspended, not renamed. Its anchors (2.5275, 0.0076)
+# were measured on joint-space action deltas, and the arm's action is now an
+# end-effector twist: feeding the new metric into the old scale would silently
+# mis-score half of this number. Re-anchor it from the first task-space runs and
+# restore the 0.5 weight then. Until that happens the remaining two terms are
+# renormalized so the score still spans [0, 1] and stays comparable within the
+# task-space era -- though not against any pre-change run.
+#
+# arm_position_error is gone for the same reason, and dropping it was a
+# correction rather than a plan: it was first kept as a "diagnostic input",
+# which was wrong. Its anchors were measured on runs that TRAINED arm joint
+# tracking. With that reward removed the arm wanders its null space freely, the
+# error settles around 0.21 rad -- three times worse than the anchor's worst
+# case -- and _log_term clamps to 0. A zero term zeroed the whole product, so
+# the score read 0.0 for every checkpoint and best_deployment_model.pt was
+# never once updated. A metric outside its own calibration range does not
+# degrade gracefully; it has to come out.
+#
+# Hand tracking is still trained, so that term is still meaningful and now
+# carries the quality half alone.
+WEIGHTS = {"hand_position_error": 1.0}
 
 
 def _log_term(value, worst, best):
@@ -72,22 +90,20 @@ def deployment_score(metrics):
     )
     if gate is None:
         return None
-    sources = {
-        "action_rate": metrics.get("evaluation_fixed_mean_rms_action_rate"),
-        "arm_position_error": metrics.get(
-            "evaluation_fixed_mean_rms_position_error"
-        ),
-        "hand_position_error": metrics.get(
-            "evaluation_fixed_mean_rms_hand_position_error"
-        ),
-    }
-    quality = 0.0
-    for name, value in sources.items():
-        term = _log_term(value, *ANCHORS[name])
-        if term is None:
-            return None
-        quality += WEIGHTS[name] * term
-    return gate * quality
+    # The quality block is suspended in full, not weighted down. Every anchor
+    # in it was measured under the joint-tracking reward this project has since
+    # replaced, and THIS policy sits outside all of them: arm joint error lands
+    # near 0.21 rad against a 0.069 worst case, hand error near 0.25 against
+    # 0.212. _log_term clamps an out-of-range reading to 0, a zero factor zeroes
+    # the product, and the score read exactly 0.0 at every evaluation of the
+    # first task-space run -- best_deployment_model.pt was never updated once.
+    #
+    # So the gate stands alone for now. It is the honest half: lift x survival,
+    # both physical measurements no reward sigma can move, and it is the only
+    # signal here that can see the policy starting to lift the cube. Restore the
+    # quality terms once they have been re-anchored on task-space runs, and note
+    # that scores from before that point are gate-only and not comparable.
+    return gate
 
 
 def deployment_terms(metrics):
@@ -96,14 +112,6 @@ def deployment_terms(metrics):
         "deployment_grasp_gate": grasp_gate(
             metrics.get("evaluation_uniform_early_termination_fraction"),
             metrics.get("evaluation_uniform_mean_peak_object_com_lift_m"),
-        ),
-        "deployment_smooth": _log_term(
-            metrics.get("evaluation_fixed_mean_rms_action_rate"),
-            *ANCHORS["action_rate"]
-        ),
-        "deployment_arm": _log_term(
-            metrics.get("evaluation_fixed_mean_rms_position_error"),
-            *ANCHORS["arm_position_error"]
         ),
         "deployment_hand": _log_term(
             metrics.get("evaluation_fixed_mean_rms_hand_position_error"),

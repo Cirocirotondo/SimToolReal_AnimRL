@@ -285,8 +285,68 @@ class SimToolRealCfg(BaseEnvCfg):
     class control:
         control_type = "P"
         decimation = 1
-        action_parameterization = "animrl_residual"
-        scale_joint_target = 0.25
+        # The arm is commanded in task space and the hand in joint space. The
+        # old "animrl_residual" value, where the arm's six actions were joint
+        # offsets, is rejected rather than mapped: a stale config must fail
+        # instead of silently reinterpreting six actions.
+        action_parameterization = "operational_space_arm"
+
+        # --- arm: end-effector deltas through an in-loop IK -------------------
+        # actions[0:3] is a base-frame translation and actions[3:6] a base-frame
+        # axis-angle rotation. Both are multiplied by dt below, so these are the
+        # speeds commanded at |action| = 1 -- and they are hard maxima, because
+        # each half of the twist is then saturated to that magnitude while
+        # keeping its direction. Asking for more turns the command no further,
+        # rather than being clipped per axis into a different direction.
+        #
+        # Measured, not inherited. Pushing the demonstration's arm_q through
+        # PalmKinematics and pose_error gives a peak palm speed of 0.160 m/s and
+        # 0.393 rad/s, so at these scales tracking the demonstration needs at
+        # most |action| = 0.373. The rest of the range is what the policy has
+        # left for correcting the RSI perturbation and rejecting disturbances,
+        # and saturating the clip is precisely what would stop it correcting.
+        # The bank's transforms are a rigid yaw plus translation, which preserve
+        # palm speed exactly, so the bank asks for no more than the demo does.
+        # tests/test_operational_space.py pins the 0.373.
+        arm_translation_speed_m_per_s = 0.40
+        arm_rotation_speed_rad_per_s = 1.0
+        # No per-component action clip. One was tried at +/-1 and was a mistake:
+        # nothing else in this repository clips actions (clip_joint_target is set
+        # so wide it never binds, and prior runs used |action| up to 20), so a
+        # binding clip put most of the policy's range where the action could not
+        # reach the environment. The advantage is flat in a dead zone, so nothing
+        # pulled the mean back and |action| drifted to 14 with 46% of arm
+        # components pinned. The twist magnitude is bounded by the speed scales
+        # above instead, direction-preservingly, which limits the command without
+        # ever making it unreachable.
+        # Levenberg-Marquardt damping for the in-loop solve. The UR5e passes
+        # close to wrist and elbow singularities under some of the bank's
+        # transforms, where an undamped inverse asks for unbounded joint speed.
+        #
+        # 0.02 rather than the 0.05 this port came from, and it is the value
+        # envs/retarget.py's offline solve_palm_ik has always used, so the two
+        # now agree. Damping is not free: it buys boundedness by under-solving,
+        # and the palm Jacobian's smallest singular value gets down to 0.073
+        # here, where 0.05 discards lambda^2/(sigma^2 + lambda^2) = 32% of the
+        # commanded twist. Measured over 64 environments at six starts, 0.05
+        # loses 9.8% of the command on average and 73% at worst, against 0.7%
+        # and 18% for 0.02. Going further to 0.01 was measured overshooting
+        # (a residual larger than the request) near the worst poses, so 0.02 is
+        # the floor, not a step on the way down.
+        ik_damping = 0.02
+        # Per-joint clamp on one IK step. The demonstration's largest single-step
+        # joint motion is 0.0058 rad, so this sits ~9x above it and binds only on
+        # commands the demonstration never makes. It is not the binding
+        # constraint on speed either: a full translation command moves the palm
+        # 0.4/60 = 6.7 mm per step, while 0.05 rad on a ~0.5 m lever is ~25 mm.
+        ik_max_joint_delta_rad = 0.05
+
+        # --- hand: unchanged joint-space residual -----------------------------
+        # NOTE: scale_joint_target was deleted with the arm's joint-space path.
+        # deployment/run_policy_real.py, simtoolreal_animrl/sim2sim/observation.py
+        # and scripts/run_mujoco_sim2sim.py still read it and will raise KeyError
+        # at launch. That is deliberate: they need the same in-loop IK before
+        # they can run a task-space policy, and failing loudly beats diverging.
         # Finer residual for the hand. Its joints travel a median of 0.414 rad
         # from the default pose against the arm's 0.458, and the smaller scale
         # buys resolution for the contact work that follows.
@@ -364,27 +424,97 @@ class SimToolRealCfg(BaseEnvCfg):
         # terms already use. Must match the value the bank was built with.
         palm_lever_arm_m = 0.1
 
-        # --- joint space, demoted to null-space selection -------------------
-        # These no longer do the tracking. A 6-DOF arm has a null space for a
-        # given palm pose and several IK branches; each finger has four joints
-        # serving a 3D fingertip target, so five finger degrees of freedom are
-        # otherwise unconstrained. Small but non-zero is what picks one
-        # solution, which is all that is wanted from them now.
-        position_arm_weight = 0.06
-        velocity_arm_weight = 0.0
-        action_rate_arm_weight = 0.2
-        position_arm_std_rad = 0.223607
-        velocity_arm_std_rad_per_s = 1.0
-        # Pure command smoothness for the arm: unlike joint-space imitation,
-        # this remains meaningful when the palm trajectory is retargeted.
-        action_rate_arm_std = 5
+        # --- palm tilt: the absolute constraint the cube frame cannot give ---
+        # Pitch and roll of the palm, against the demonstration. Yaw is
+        # deliberately excluded: the bar's yaw is randomised per episode and the
+        # hand must follow it, so the target is gravity's direction in the palm
+        # frame, which is exactly the part of the orientation a yaw cannot move.
+        #
+        # This exists because every other term is blind to the palm's absolute
+        # pose. Hand keypoints are measured in the CUBE's frame, so a hand that
+        # rotates together with the cube scores full marks; the object terms are
+        # satisfied by the cube reaching its reference height however it got
+        # there. The first task-space run found the gap and exploited it: over
+        # the lift it raised the palm 0.05 m against the demonstration's 0.21 m
+        # and rotated it 110 degrees against the demonstration's 18, tipping the
+        # cube up on the wrist instead of carrying it. Absolute palm error
+        # reached 0.28 m without ever tripping the 0.20 m keypoint threshold,
+        # because relative to the cube the hand looked correct.
+        #
+        # 97% of that rotation was tilt rather than yaw, which is why this term
+        # is enough on its own and why raising object_orientation_weight instead
+        # would treat the symptom.
+        palm_tilt_weight = 0.25
+        # Tilt error of the wrist-turning solution measured 86.6 degrees (1.51
+        # rad) mean over the lift against 11.4 degrees while merely approaching.
+        # 0.6 rad puts the gradient across the band between those: a
+        # demonstration-like 11 degrees scores 0.95, 45 degrees scores 0.43, and
+        # the 87-degree cheat scores 0.07. Wider stops discouraging the cheat;
+        # narrower is flat at zero where the policy currently sits.
+        palm_tilt_std_rad = 0.6
+
+        # --- regularization, one term per side of the IK --------------------
+        # The IK now sits in the middle of the arm's control path, so each of
+        # these says which side of it it lives on. "ee_" is the twist the policy
+        # commands, upstream; "arm_joint_" is what the solver emitted for it,
+        # downstream.
+        #
+        # The arm's joint-space *tracking* terms are gone. They only ever
+        # survived as null-space selection -- a 6-DOF arm has a null space for a
+        # given palm pose, and several IK branches -- and the accumulating solver
+        # now settles that structurally: it deforms continuously from the reset
+        # configuration and cannot jump branches. Pinning the arm to the
+        # reference's joint trajectory would just fight the new action space.
+        # The joint error survives as a diagnostic (rms_position_error), where it
+        # now reads as null-space drift.
+
+        # How much the commanded end-effector twist may change from step to step.
+        # Derived from the demonstration: converting its per-step palm twist into
+        # the action that reproduces it and taking the step-to-step MSE gives a
+        # p99 of 6.3e-5, which scores 0.966 here -- demonstration-like smoothness
+        # is close to free. Ten times rougher scores 0.705 and a hundred times
+        # 0.030, so genuine flicker is what this actually charges for. The 5.0
+        # this replaces was inert: it scored 0.99999 on everything.
+        ee_action_rate_weight = 0.2
+        ee_action_rate_std = 0.03
+        # The solver's own output at consecutive times, q_target,t - q_target,t-1,
+        # measured after the per-joint and joint-limit clamps so a truncated
+        # command is scored on what was actually commanded. What the solver could
+        # not deliver is priced by ik_residual below, not here, so the two terms
+        # do not double-count. The demonstration's worst single step is 0.0058
+        # rad and scores above 0.99; a step at the 0.05 rad clamp scores ~0.04.
+        arm_joint_rate_weight = 0.05
+        arm_joint_rate_std_rad = 0.02
+        # The commanded twist the IK could not deliver. Ships at zero on purpose,
+        # as it did in every config of the implementation this is ported from:
+        # the pressure to stay feasible is meant to arrive through the palm
+        # keypoint tracking reward, which degrades on its own when the
+        # accumulated command drifts somewhere the arm cannot follow. Turning
+        # this on makes the policy avoid singular configurations directly, which
+        # is a different and more heavy-handed thing to ask for.
+        ik_residual_weight = 0.0
+        ik_residual_std = 0.01
 
         position_hand_weight = 0.05
         velocity_hand_weight = 0.12
-        action_rate_hand_weight = 0.12
+        hand_action_rate_weight = 0.12
         position_hand_std_rad = 0.223607
         velocity_hand_std_rad_per_s = 1.0
-        action_rate_hand_std = 5
+        # Retuned from 5, which was inert: the demonstration's own per-step
+        # hand action-delta MSE has a p99 of 4.7e-03, and at sigma = 5 a hand
+        # 100x rougher than that still scored 0.9907, so the term paid a near
+        # constant 0.12 whatever the fingers did. Measured over the whole of
+        # the 9000-iteration task_space_palm_tilt run, mean_hand_action_rate_
+        # reward never left 0.93-0.99 while rms_hand_action_rate sat at ~2.1.
+        #
+        # 1.0 is chosen to put the CURRENT policy on the Gaussian's slope
+        # rather than in its tail, which is where the gradient lives: at the
+        # measured deterministic median MSE of 1.1 it scores 0.57, at the p95
+        # of 4.0 it scores 0.14, and the demonstration's p99 still scores
+        # 0.998 -- demo-like smoothness stays free. A tighter sigma was
+        # rejected on the same measurement: 0.2 scores 8e-07 at the current
+        # roughness, a dead tail with no gradient to climb out of.
+        hand_action_rate_std = 1.0
         # Adaptive widths. Off by default, so every existing run reproduces.
         # When on, position_* and action_rate_* sigmas follow a slow average of
         # their own MSE and hold the term near adaptive_sigma_target_reward, so
@@ -405,10 +535,17 @@ class SimToolRealCfg(BaseEnvCfg):
         # asking for better than that has never been necessary and a width that
         # chases the policy indefinitely is how blind_sharp traded its grasp
         # away for tracking it did not need.
-        adaptive_sigma_position_arm_floor = 0.0061
         adaptive_sigma_position_hand_floor = 0.0103
-        adaptive_sigma_action_rate_arm_floor = 0.0076
-        adaptive_sigma_action_rate_hand_floor = 0.0076
+        # A 3x shrink below ee_action_rate_std's new 0.03. The 0.0076 this
+        # replaces was measured against joint-space action deltas and means
+        # nothing now that the arm's action is a twist.
+        adaptive_sigma_ee_action_rate_floor = 0.01
+        # A 3x shrink below hand_action_rate_std's new 1.0, matching how the
+        # ee floor above is set. The 0.0076 this replaces was calibrated when
+        # the width was 5 and inert; leaving it would have let an adaptive run
+        # shrink the width 130x, straight into the dead tail described above.
+        # Inert either way while adaptive_sigma_enabled is False.
+        adaptive_sigma_hand_action_rate_floor = 0.33
 
         # Cube position tracking rewards
         object_scale = 1

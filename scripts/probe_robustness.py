@@ -331,7 +331,8 @@ class PerturbationHarness:
         if spec.init_q_offset_rad or spec.init_dq_offset_rad_s:
             self._offset_initial_state(env_ids, spec)
         if spec.action_delay_steps > 0:
-            # reset_idx has just set actions to positions_to_actions(sample.q),
+            # reset_idx has just set the arm actions to zero (a zero twist
+            # holds the reset pose) and the hand actions to the inverse residual,
             # so a delayed episode re-commands its own start pose instead of
             # replaying a zero action for its first few steps.
             self._delay_buffer[:, env_ids] = self.env.actions[env_ids]
