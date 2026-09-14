@@ -110,11 +110,30 @@ class FingertipForceObservationTest(unittest.TestCase):
 
 
 class ContactRewardGateTest(unittest.TestCase):
-    def test_the_shaping_reward_is_off_by_default(self):
-        """Acquiring forces for the observation must not add a reward term."""
+    def test_the_reward_gate_is_independent_of_the_force_tensor(self):
+        """Acquiring forces must stay separable from paying a reward for them.
+
+        Both ship on now -- the grasp released the bar at the lift under ideal
+        actions, so the shaping reward earns its place -- but the two flags
+        must remain independent, or turning the tensor on for the critic would
+        silently change the reward function too.
+        """
         cfg = SimToolRealCfg()
-        self.assertFalse(cfg.contact.reward_enabled)
         self.assertEqual(cfg.contact.reward_per_finger, 0.05)
+        cfg.contact.reward_enabled = False
+        self.assertTrue(cfg.contact.enabled)
+        self.assertFalse(cfg.contact.reward_enabled)
+
+    def test_the_actor_stays_blind_to_contact_by_default(self):
+        """The deployed policy must not depend on fingertip force sensing.
+
+        The critic may read the forces -- it is discarded at deployment -- but
+        the actor's observation must not, or the policy could not run on a
+        robot without force sensors.
+        """
+        cfg = SimToolRealCfg()
+        self.assertFalse(cfg.contact.observe_fingertip_forces)
+        self.assertTrue(cfg.contact.critic_observes_fingertip_forces)
 
     def test_the_weight_survives_for_callers_that_ask_for_it(self):
         cfg = SimToolRealCfg()

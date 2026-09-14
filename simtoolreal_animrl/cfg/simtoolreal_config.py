@@ -368,7 +368,16 @@ class SimToolRealCfg(BaseEnvCfg):
         # Optional GPU contact shaping for the three fingers used by the
         # grasp.  When disabled, MotionImitationEnv keeps PhysX contact
         # reporting at CC_NEVER and does not acquire/refresh its tensor.
-        enabled = False
+        #
+        # Turned on because the grasp does not survive the lift even under
+        # IDEAL actions: replaying the demonstration exactly, fingertip forces
+        # read 1.10/1.02/0.43 N at reference frame 880 and then exactly
+        # 0.00/0.00/0.00 from 900 onward, with the bar frozen 0.044 m up
+        # against the demonstration's 0.21 m. The hand lets go at the moment
+        # the lift begins. Friction is not the constraint -- 0.65 N per finger
+        # would carry the 0.2 kg bar and there was more than that until the
+        # release -- so the term that rewards KEEPING force is the lever.
+        enabled = True
         # Isaac Gym ContactCollection value: 1 = CC_LAST_SUBSTEP and
         # 2 = CC_ALL_SUBSTEPS. LAST_SUBSTEP is the cheaper production default
         # for the stable contacts expected during a grasp.
@@ -382,7 +391,7 @@ class SimToolRealCfg(BaseEnvCfg):
         # force tensor on for the observation does not quietly change the
         # reward function too.
         reward_per_finger = 0.05
-        reward_enabled = False
+        reward_enabled = True
         # Append one 3D contact-force vector per selected fingertip to the
         # observation vector, rotated into the palm frame like the fingertip
         # positions and the cube pose already are. Needs `enabled`, which is
@@ -395,7 +404,10 @@ class SimToolRealCfg(BaseEnvCfg):
         # in the critic because the critic is discarded at deployment, and a
         # value function that can see contact explains the returns a blind
         # actor cannot, which lowers the advantage noise the actor learns from.
-        critic_observes_fingertip_forces = False
+        # On: the actor stays blind (observe_fingertip_forces above remains
+        # False, so the deployed policy never needs force sensing) while the
+        # critic reads the forces that explain why a return collapsed.
+        critic_observes_fingertip_forces = True
         # The palm-frame force is divided by this before it reaches the policy,
         # so a firm grasp lands near unit scale instead of tens of newtons.
         observation_force_scale_n = 10.0
@@ -451,7 +463,15 @@ class SimToolRealCfg(BaseEnvCfg):
         # demonstration-like 11 degrees scores 0.95, 45 degrees scores 0.43, and
         # the 87-degree cheat scores 0.07. Wider stops discouraging the cheat;
         # narrower is flat at zero where the policy currently sits.
-        palm_tilt_std_rad = 0.6
+        # Re-measured on 2026-09-14 against adaptive_sigma_scratch: the cheat
+        # 0.6 was calibrated against has shrunk from 86.6 to 27.3 degrees mean
+        # over the lift (p95 56.8), so 0.6 became too wide -- it still paid
+        # 0.73 of full marks at the new operating point. 0.35 restores the
+        # original intent, gradient centred on the cheat as it now is: the
+        # reference's own 0.5 degrees during the lift scores 1.00, the policy's
+        # 27 degrees scores 0.40, and the 57-degree p95 scores 0.018 -- low but
+        # not the flat zero 0.25 would give.
+        palm_tilt_std_rad = 0.35
 
         # --- regularization, one term per side of the IK --------------------
         # The IK now sits in the middle of the arm's control path, so each of
@@ -515,14 +535,22 @@ class SimToolRealCfg(BaseEnvCfg):
         # rejected on the same measurement: 0.2 scores 8e-07 at the current
         # roughness, a dead tail with no gradient to climb out of.
         hand_action_rate_std = 1.0
-        # Adaptive widths. Off by default, so every existing run reproduces.
-        # When on, position_* and action_rate_* sigmas follow a slow average of
-        # their own MSE and hold the term near adaptive_sigma_target_reward, so
-        # it keeps a live gradient however good the policy gets. This is the
-        # sharpening ladder done continuously: the fixed widths above stop
-        # paying once the policy passes them, which is why mean_reward kept
-        # rising while the deployment score fell after iteration 1500.
-        adaptive_sigma_enabled = False
+        # Adaptive widths. position_* and action_rate_* sigmas follow a slow
+        # average of their own MSE and hold the term near
+        # adaptive_sigma_target_reward, so each keeps a live gradient however
+        # good the policy gets. This is the sharpening ladder done
+        # continuously: a fixed width stops paying once the policy passes it,
+        # which is why mean_reward kept rising while the deployment score fell
+        # after iteration 1500 in an earlier run, and why
+        # hand_rate_sigma1_warm's rms_hand_action_rate only fell 2.28 -> 1.93
+        # over 9000 iterations at the fixed hand_action_rate_std = 1.0 above --
+        # 27x the demonstration's own roughness, with the term's reward
+        # plateauing at ~0.19 instead of continuing to climb.
+        #
+        # Enabled from here on; was off while every fixed width above was
+        # being calibrated by hand, so a run could be reproduced against a
+        # width that was known not to move.
+        adaptive_sigma_enabled = True
         adaptive_sigma_target_reward = 0.6
         adaptive_sigma_decay = 0.999
         # How far a width may relax above its tightest value when the policy
@@ -551,8 +579,36 @@ class SimToolRealCfg(BaseEnvCfg):
         object_scale = 1
         object_position_weight = 0.8 * object_scale
         object_orientation_weight = 0.4 * object_scale
-        object_position_std_m = 0.05
-        object_orientation_std_rad = 0.5
+        # Calibrated on the LIFT, which is the only phase where this term has
+        # to do any work: while the bar sits on the table the error is small
+        # whatever the policy does, so the approach phase cannot calibrate it.
+        # Measured over 64 environments of adaptive_sigma_scratch, during the
+        # lift: environments that carried the bar up sit at 0.154 m median
+        # error, those that left it on the table at 0.279 m. At 0.05 those
+        # score 0.009 and 0.000 -- the term is dead exactly where it matters
+        # and cannot tell the two apart.
+        #
+        # The reference bar travels 0.241 m vertically over the lift, so 0.12
+        # is half the journey: 0.44 for carrying it, 0.067 for leaving it,
+        # a 6.6x separation with live gradient on both sides.
+        object_position_std_m = 0.12
+        # Narrowed, and NOT to make orientation stricter. Measured on the same
+        # 64 environments: during the lift, environments that carried the bar
+        # show 94.5 degrees of orientation error (they carry it with the wrong
+        # rotation) while environments that left it on the table show 35.4 --
+        # the bar simply stays where the reference started it. At 0.5 that pays
+        # 0.465 for leaving it alone against 0.004 for lifting it imperfectly,
+        # so this term was paying 0.19 of reward to NOT attempt the lift.
+        #
+        # That is a barrier, not a miscalibration: the route from "no lift" to
+        # "correct carry" runs through "carry with the wrong rotation", which
+        # scored below the starting point. Widening deepens it (0.60 at 0.9);
+        # narrowing shrinks it, because it stops paying for an untouched bar:
+        # 0.30 leaves 0.12 there instead of 0.465.
+        #
+        # Orientation becomes calibratable again once the carry works and the
+        # error is a few degrees rather than ninety. Re-tighten it then.
+        object_orientation_std_rad = 0.30
 
         # Fingertip-object distance rewards
         fingertip_object_distance_weight = 0 * 0.2 * object_scale

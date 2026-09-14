@@ -437,6 +437,13 @@ class EvaluationViewer:
         self.bank_yaw_deg = np.rad2deg(bank.yaw_rad.detach().cpu().numpy())
 
     def _build_policy(self) -> None:
+        # The saved train_cfg may carry record_video=True from a training run
+        # launched with --record-video; PPO enforces that against
+        # viewer.training_camera_enabled, which this evaluator always disables
+        # (Viser renders the scene itself). The evaluator never asks PPO to
+        # record, so the saved flag is irrelevant here and must not veto
+        # construction.
+        self.train_cfg.runner.record_video = False
         runner = PPO(self.env, self.train_cfg, log_dir=None, device=self.env.device)
         self.checkpoint_infos = runner.load(
             self.checkpoint, load_optimizer=False, load_normalizers=True

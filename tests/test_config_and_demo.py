@@ -68,7 +68,7 @@ class ConfigAndDemoTest(unittest.TestCase):
             # Pitch and roll of the palm; yaw excluded because the bar's yaw is
             # randomised and the hand has to follow it.
             "palm_tilt_weight": 0.25,
-            "palm_tilt_std_rad": 0.6,
+            "palm_tilt_std_rad": 0.35,
             "ee_action_rate_weight": 0.2,
             "ee_action_rate_std": 0.03,
             "arm_joint_rate_weight": 0.05,
@@ -108,9 +108,12 @@ class ConfigAndDemoTest(unittest.TestCase):
             env_cfg.rewards.fingertip_object_distance_names,
             ["thumb", "index", "middle"],
         )
-        self.assertFalse(env_cfg.contact.enabled)
-        self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
-        self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
+        self.assertTrue(env_cfg.contact.enabled)
+        # The actor must stay blind to contact; only the critic may see it.
+        self.assertFalse(env_cfg.contact.observe_fingertip_forces)
+        self.assertTrue(env_cfg.contact.critic_observes_fingertip_forces)
+        self.assertEqual(env_cfg.rewards.object_position_std_m, 0.12)
+        self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.30)
         self.assertTrue(env_cfg.termination.object_position_enabled)
         self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.07)
         self.assertTrue(env_cfg.termination.enabled)

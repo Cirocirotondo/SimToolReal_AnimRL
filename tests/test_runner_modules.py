@@ -485,7 +485,7 @@ class RunnerModulesTest(unittest.TestCase):
 
     def test_contact_reward_configuration_round_trip(self):
         cfg = SimToolRealCfg()
-        self.assertFalse(cfg.contact.enabled)
+        self.assertTrue(cfg.contact.enabled)
         self.assertEqual(cfg.contact.collection, 1)
         self.assertEqual(
             cfg.contact.fingertip_names, ["thumb", "index", "middle"]
@@ -495,9 +495,11 @@ class RunnerModulesTest(unittest.TestCase):
 
         snapshot = config_to_dict(cfg)
         restored = SimToolRealCfg()
-        restored.contact.enabled = True
+        # Opposite of the snapshot's value, so the round trip has to overwrite
+        # it rather than merely agreeing with the default.
+        restored.contact.enabled = False
         update_config_from_dict(restored, snapshot)
-        self.assertFalse(restored.contact.enabled)
+        self.assertTrue(restored.contact.enabled)
         self.assertEqual(
             restored.contact.fingertip_names,
             snapshot["contact"]["fingertip_names"],
