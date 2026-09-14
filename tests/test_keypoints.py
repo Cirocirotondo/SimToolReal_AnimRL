@@ -160,3 +160,83 @@ class TrackingErrorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnchorChoiceTest(unittest.TestCase):
+    """Why the palm and the fingertips are measured from different bars.
+
+    See docs/adr/0001-palm-keypoints-anchored-to-the-reference-bar.md. The
+    scenario below is the failure that motivated it: the policy establishes a
+    perfect grasp and then never lifts, while the reference bar rises without
+    it. Anchored on the measured bar the reward cannot tell this apart from a
+    flawless carry, because a rigid grasp moves hand and bar together and
+    leaves the relative pose untouched either way.
+    """
+
+    LIFT_M = 0.20
+
+    def frozen_scene(self):
+        """A held-but-never-lifted hand, and the reference bar 20 cm above it."""
+        palm_position, palm_orientation, fingertips = scene(count=4, seed=23)
+        keypoints = hand_keypoints(
+            palm_position, palm_orientation, fingertips, LEVER_ARM
+        )
+        identity = torch.tensor(
+            [0.0, 0.0, 0.0, 1.0], dtype=torch.float64
+        ).expand(4, 4)
+        measured_bar = torch.zeros(4, 3, dtype=torch.float64)
+        reference_bar = measured_bar.clone()
+        reference_bar[:, 2] += self.LIFT_M
+        # The grasp is perfect, so the demonstration's keypoints are exactly
+        # the ones the hand is holding right now, in the bar's frame.
+        reference_keypoints = keypoints_in_object_frame(
+            keypoints, measured_bar, identity
+        )
+        return keypoints, measured_bar, reference_bar, identity, reference_keypoints
+
+    def test_the_measured_bar_is_blind_to_the_missing_lift(self):
+        keypoints, measured, _, identity, reference = self.frozen_scene()
+        error = keypoint_tracking_error(
+            keypoints_in_object_frame(keypoints, measured, identity), reference
+        )
+        torch.testing.assert_close(error, torch.zeros_like(error))
+
+    def test_the_reference_bar_charges_the_full_missing_lift(self):
+        keypoints, _, reference_bar, identity, reference = self.frozen_scene()
+        error = keypoint_tracking_error(
+            keypoints_in_object_frame(keypoints, reference_bar, identity),
+            reference,
+        )
+        torch.testing.assert_close(
+            error.sqrt(),
+            torch.full_like(error, self.LIFT_M),
+        )
+
+    def test_the_two_anchors_agree_while_the_bar_is_still_on_the_table(self):
+        """The change has to be inert during the approach, where the measured
+        anchor works and the phase the policy already performs well."""
+        keypoints, measured, _, identity, reference = self.frozen_scene()
+        on_the_table = measured
+        torch.testing.assert_close(
+            keypoints_in_object_frame(keypoints, on_the_table, identity),
+            keypoints_in_object_frame(keypoints, measured, identity),
+        )
+        error = keypoint_tracking_error(
+            keypoints_in_object_frame(keypoints, on_the_table, identity),
+            reference,
+        )
+        torch.testing.assert_close(error, torch.zeros_like(error))
+
+    def test_a_perfect_carry_scores_the_same_under_both_anchors(self):
+        """The reference anchor must not punish a correct lift: when the hand
+        does carry the bar up, both anchors report zero."""
+        keypoints, measured, reference_bar, identity, reference = self.frozen_scene()
+        lifted = keypoints.clone()
+        lifted[:, :, 2] += self.LIFT_M
+        measured_after = measured.clone()
+        measured_after[:, 2] += self.LIFT_M
+        for anchor in (measured_after, reference_bar):
+            error = keypoint_tracking_error(
+                keypoints_in_object_frame(lifted, anchor, identity), reference
+            )
+            torch.testing.assert_close(error, torch.zeros_like(error))

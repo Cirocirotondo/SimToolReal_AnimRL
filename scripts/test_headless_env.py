@@ -24,6 +24,23 @@ from simtoolreal_animrl.envs.controller import (
 from simtoolreal_animrl.envs.motion_imitation import MotionImitationEnv
 
 
+# Where the demonstrated bar is unambiguously airborne, and so where the palm
+# keypoint anchor starts mattering (docs/adr/0001, CONTEXT.md). Measured on
+# demo_..._stable_grasp.npz: the bar first rises 2 mm at frame 770 and 20 mm at
+# 832, out of a 0.241 m total lift. 832 is the conservative end of that range
+# on purpose -- the frames in between are ambiguous, and a test that straddles
+# them would report a failure of the anchor when it saw only lift-off jitter.
+LIFT_START_REFERENCE_INDEX = 832
+
+# Tolerance for comparing a cuboid world pose against the reference it was
+# written from. Looser than the joint-space bounds elsewhere, and it has to be:
+# the cuboid's world position carries the robot base offset, so these are
+# float32 values of order one metre round-tripped through the GPU root-state
+# tensor. 1e-6 is below what that representation can hold and the measured
+# residual sits at 1.9e-6 whatever the environment does.
+CUBE_POSE_ATOL = 1e-5
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -125,7 +142,7 @@ def assert_reset_matches_reference(env, reference_index):
             raise AssertionError("The requested RSI index was not applied")
     expected_cube_root = env._cube_reference_root_states(reference)
     cube_error = (env.cube_root_state - expected_cube_root).abs().max().item()
-    if cube_error > 1e-6:
+    if cube_error > CUBE_POSE_ATOL:
         raise AssertionError(
             "RSI cube root-state write failed: max error={:.3e}".format(cube_error)
         )
@@ -224,7 +241,9 @@ def assert_vectorized_object_rsi_contract(env):
         env.transform_bank.sample(env.transform_index, env.reference_index)
     )
     if not bool(
-        torch.allclose(env.cube_root_state, sampled_expected, rtol=0.0, atol=1e-6)
+        torch.allclose(
+            env.cube_root_state, sampled_expected, rtol=0.0, atol=CUBE_POSE_ATOL
+        )
     ):
         raise AssertionError("Configured RSI did not reset cubes from sampled phases")
     if bool((env.reference_index > env.rsi_max_start_index).any()):
@@ -241,7 +260,9 @@ def assert_vectorized_object_rsi_contract(env):
     expected = env._cube_reference_root_states(
         env.transform_bank.sample(env.transform_index, spread)
     )
-    if not bool(torch.allclose(env.cube_root_state, expected, rtol=0.0, atol=1e-6)):
+    if not bool(
+        torch.allclose(env.cube_root_state, expected, rtol=0.0, atol=CUBE_POSE_ATOL)
+    ):
         raise AssertionError("Vectorized RSI did not apply each cube reference state")
 
     if env.num_envs > 1:
@@ -261,7 +282,10 @@ def assert_vectorized_object_rsi_contract(env):
         )
         if not bool(
             torch.allclose(
-                env.cube_root_state[:1], expected_partial, rtol=0.0, atol=1e-6
+                env.cube_root_state[:1],
+                expected_partial,
+                rtol=0.0,
+                atol=CUBE_POSE_ATOL,
             )
         ):
             raise AssertionError("Partial RSI did not reset the selected cube")
@@ -335,15 +359,21 @@ def assert_continuous_placement_contract(env):
             "two resets no longer share a reference and cannot be compared"
         )
     measured_shift = env.cube_position - snapped_position
-    if not bool(
-        torch.allclose(
-            measured_shift, offset.expand_as(measured_shift), atol=1e-6
-        )
-    ):
+    deviation = (measured_shift - offset.expand_as(measured_shift)).abs()
+    worst = int(deviation.max(dim=1).values.argmax())
+    # Both operands are metre-scale float32 world positions, so differencing
+    # them to recover a 4 mm offset cancels most of the mantissa. Report the
+    # worst environment rather than env 0, which can agree while another does
+    # not -- a snap to the bank would miss by millimetres, not by this.
+    if float(deviation.max()) > CUBE_POSE_ATOL:
         raise AssertionError(
             "The cuboid was snapped to the bank instead of placed at the "
-            "requested transform: shift {}, expected {}".format(
-                measured_shift[0].tolist(), offset.tolist()
+            "requested transform: worst env {} shifted {}, expected {} "
+            "(max deviation {:.3e})".format(
+                worst,
+                measured_shift[worst].tolist(),
+                offset.tolist(),
+                float(deviation.max()),
             )
         )
 
@@ -528,7 +558,23 @@ def assert_reward_contract(env):
     if bool(proximity_active.any()) and bool(
         (metrics["fingertip_object_distance_reward"][proximity_active] <= 0.0).any()
     ):
-        raise AssertionError("Fingertip-distance reward stayed off during pre-grasp")
+        off = proximity_active & (
+            metrics["fingertip_object_distance_reward"] <= 0.0
+        )
+        distances = metrics["fingertip_object_distance_m"][off]
+        raise AssertionError(
+            "Fingertip-distance reward stayed off during pre-grasp in {} of {} "
+            "environments: distances {:.4f}..{:.4f} m against std {:.3f} m, "
+            "reference indices {}..{}".format(
+                int(off.sum()),
+                int(proximity_active.sum()),
+                float(distances.min()),
+                float(distances.max()),
+                float(env.cfg.rewards.fingertip_object_distance_std_m),
+                int(env.reference_index[off].min()),
+                int(env.reference_index[off].max()),
+            )
+        )
     if metrics["fingertip_contact_reward"].shape != (env.num_envs,):
         raise AssertionError("Fingertip-contact reward has an unexpected shape")
     expected_max_contacts = float(len(env.contact_fingertip_names))
@@ -565,11 +611,29 @@ def assert_reward_contract(env):
         * metrics["object_orientation_reward"]
         + float(r.fingertip_object_distance_weight)
         * metrics["fingertip_object_distance_reward"]
-        + float(env.contact_reward_per_finger)
+        # The two heaviest terms in the sum, and they were missing here: 1.28
+        # of weight that the reconstruction never checked, so any change to
+        # either of them passed this assertion untouched.
+        + float(r.palm_keypoint_weight) * metrics["palm_keypoint_reward"]
+        + float(r.fingertip_keypoint_weight)
+        * metrics["fingertip_keypoint_reward"]
+        # contact_shaping_weight, not contact_reward_per_finger: the two agree
+        # only while contact.reward_enabled is True, and the env sums the
+        # former.
+        + float(env.contact_shaping_weight)
         * metrics["fingertip_contact_reward"]
     )
-    if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-7)):
-        raise AssertionError("Reward does not match the configured weights")
+    if not bool(torch.allclose(env.rew_buf, expected_reward, rtol=0.0, atol=1e-6)):
+        residual = (env.rew_buf - expected_reward)
+        raise AssertionError(
+            "Reward does not match the configured weights: residual "
+            "{:+.6f}..{:+.6f} against a reward of {:.4f}..{:.4f}".format(
+                float(residual.min()),
+                float(residual.max()),
+                float(env.rew_buf.min()),
+                float(env.rew_buf.max()),
+            )
+        )
 
 
 def assert_palm_jacobian_matches_urdf(env):
@@ -805,8 +869,25 @@ def assert_ppo_step_contract(env, obs, critic_obs, rewards, dones, extras):
 
     if obs.shape != (env.num_envs, env.num_obs):
         raise AssertionError("PPO observation shape mismatch")
-    if critic_obs is not None:
-        raise AssertionError("This environment must not expose privileged observations")
+    # Asymmetric actor-critic: the critic may see the fingertip forces, the
+    # actor never does. Assert the shape contract rather than the absence,
+    # which only held while contact.critic_observes_fingertip_forces was off.
+    if not (env.critic_force_observation_dim or env.critic_parameter_dim):
+        if critic_obs is not None:
+            raise AssertionError(
+                "A symmetric environment must not expose privileged observations"
+            )
+    else:
+        if critic_obs is None:
+            raise AssertionError(
+                "The critic observation was configured but never produced"
+            )
+        if critic_obs.shape != (env.num_envs, env.num_privileged_obs):
+            raise AssertionError("PPO critic observation shape mismatch")
+        if not bool(torch.equal(critic_obs[:, : env.num_obs], obs)):
+            raise AssertionError(
+                "The critic observation must extend the actor's, not replace it"
+            )
     if rewards.shape != (env.num_envs,) or rewards.dtype != torch.float32:
         raise AssertionError("PPO rewards must be float32 with shape (num_envs,)")
     if dones.shape != (env.num_envs,) or dones.dtype != torch.bool:
@@ -894,6 +975,9 @@ def run_ideal_episode(env, initial_indices):
     pending = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
     observed_steps = torch.zeros_like(initial_indices)
     peak_arm_action = 0.0
+    peak_arm_action_where = None
+    peak_palm_keypoint_error = 0.0
+    peak_lifting_palm_keypoint_error = 0.0
 
     for step in range(1, env.max_episode_length + 1):
         actions, complete_target = env.next_reference_action()
@@ -909,9 +993,24 @@ def run_ideal_episode(env, initial_indices):
             )
         ):
             raise AssertionError("The hand residual mapping is not invertible")
-        peak_arm_action = max(
-            peak_arm_action, float(actions[:, :6].abs().max())
-        )
+        # Only environments still inside their first episode. Once one ends it
+        # is reset onto a fresh RSI index, and the correction its next action
+        # asks for describes that reset, not the demonstration this bound is
+        # about -- measured as a peak of 0.814 against 0.39 for the tracked
+        # population.
+        tracked = actions[pending, :6].abs()
+        if tracked.numel():
+            step_peak = float(tracked.max())
+            if step_peak > peak_arm_action:
+                peak_arm_action = step_peak
+                rows = pending.nonzero(as_tuple=False).flatten()
+                worst = int(rows[int(tracked.max(dim=1).values.argmax())])
+                peak_arm_action_where = (
+                    step,
+                    int(env.reference_index[worst]),
+                    int(initial_indices[worst]),
+                    int(actions[worst, :6].abs().argmax()),
+                )
 
         obs, critic_obs, rewards, dones, extras = env.step(actions)
         assert_ppo_step_contract(
@@ -931,6 +1030,10 @@ def run_ideal_episode(env, initial_indices):
             + float(r.object_position_weight)
             + float(r.object_orientation_weight)
             + float(r.fingertip_object_distance_weight)
+            + float(r.palm_keypoint_weight)
+            + float(r.fingertip_keypoint_weight)
+            + float(env.contact_shaping_weight)
+            * float(len(env.contact_fingertip_names))
         )
         if bool((rewards < -1e-7).any()) or bool(
             (rewards > reward_upper_bound + 1e-6).any()
@@ -949,6 +1052,23 @@ def run_ideal_episode(env, initial_indices):
         )
         minimum_reward = min(minimum_reward, float(rewards.min()))
         mean_rewards.append(float(rewards.mean()))
+
+        # The palm keypoints are anchored on the *reference* bar
+        # (docs/adr/0001), so this error is now an absolute deviation from the
+        # demonstrated palm trajectory rather than relative grasp geometry.
+        # Under ideal playback it must stay near zero through the lift: if the
+        # anchor or its symmetry handling were wrong, the two would disagree
+        # exactly where the reference bar leaves the table, and nowhere else.
+        palm_error = extras["palm_keypoint_error_m"]
+        peak_palm_keypoint_error = max(
+            peak_palm_keypoint_error, float(palm_error.max())
+        )
+        lifting = extras["reference_index"] >= LIFT_START_REFERENCE_INDEX
+        if bool(lifting.any()):
+            peak_lifting_palm_keypoint_error = max(
+                peak_lifting_palm_keypoint_error,
+                float(palm_error[lifting].max()),
+            )
 
         still_active = pending & ~dones
         if bool(still_active.any()):
@@ -1036,6 +1156,17 @@ def run_ideal_episode(env, initial_indices):
     if bool(pending.any()) or not bool(torch.equal(observed_steps, expected_steps)):
         raise AssertionError("Not every initial RSI episode ended at the expected step")
 
+    print(
+        "    ideal playback: peak |arm action| {:.3f} at (step, ref, rsi "
+        "start, channel) {}, peak palm keypoint error {:.4f} m "
+        "(lift only {:.4f} m)".format(
+            peak_arm_action,
+            peak_arm_action_where,
+            peak_palm_keypoint_error,
+            peak_lifting_palm_keypoint_error,
+        )
+    )
+
     # The empirical check on control.arm_translation_speed_m_per_s. Tracking the
     # demonstration measured 0.373 at the configured scales, so the headroom
     # above that is what the policy has left for correcting a perturbation. A
@@ -1047,8 +1178,24 @@ def run_ideal_episode(env, initial_indices):
             "headroom under the +/-1 clip".format(peak_arm_action)
         )
 
+    # Test (a) of docs/adr/0001: playing the demonstration back open-loop must
+    # leave the reference-anchored palm term satisfied, the lift included. The
+    # bound is the termination threshold, which the run above already enforces
+    # implicitly; asserting it here separates "the anchor is wired correctly"
+    # from "nothing terminated", which can fail for unrelated reasons.
+    if peak_lifting_palm_keypoint_error > float(
+        env.cfg.termination.palm_keypoint_threshold_m
+    ):
+        raise AssertionError(
+            "Reference playback leaves {:.4f} m of palm keypoint error during "
+            "the lift; the reference anchor or its symmetry handling is "
+            "wrong".format(peak_lifting_palm_keypoint_error)
+        )
+
     return {
         "peak_arm_action": peak_arm_action,
+        "peak_palm_keypoint_error": peak_palm_keypoint_error,
+        "peak_lifting_palm_keypoint_error": peak_lifting_palm_keypoint_error,
         "peak_position_error": peak_position_error,
         "peak_velocity_rms_error": peak_velocity_error,
         "minimum_reward": minimum_reward,
@@ -1076,8 +1223,14 @@ def assert_early_termination_logic(env):
     env.arm_violation_steps.zero_()
     env.hand_violation_steps.zero_()
     env.object_violation_steps.zero_()
+    # The arm's termination is task space now: one RMS palm keypoint error per
+    # environment against palm_keypoint_threshold_m, not a per-joint angle
+    # against a rad limit. Under the reference anchor (docs/adr/0001) that
+    # error is absolute deviation from the demonstrated palm trajectory, which
+    # is what makes a policy that never lifts terminate rather than collect
+    # reward forever.
     arm_error = torch.zeros(
-        (env.num_envs, env.arm_q.shape[1]), dtype=torch.float32, device=env.device
+        env.num_envs, dtype=torch.float32, device=env.device
     )
     hand_error = torch.zeros(
         (env.num_envs, env.hand_q.shape[1]), dtype=torch.float32, device=env.device
@@ -1085,7 +1238,7 @@ def assert_early_termination_logic(env):
     object_error = torch.zeros(
         env.num_envs, dtype=torch.float32, device=env.device
     )
-    arm_error[:, 0] = float(env.cfg.termination.arm_position_threshold_rad) + 0.1
+    arm_error.fill_(float(env.cfg.termination.palm_keypoint_threshold_m) + 0.1)
 
     grace = int(env.cfg.termination.grace_steps)
     for count in range(1, grace + 1):
@@ -1179,7 +1332,7 @@ def assert_early_termination_logic(env):
     env.arm_violation_steps.zero_()
     env.hand_violation_steps.zero_()
     env.object_violation_steps.zero_()
-    arm_over = float(env.cfg.termination.arm_position_threshold_rad) + 0.1
+    arm_over = float(env.cfg.termination.palm_keypoint_threshold_m) + 0.1
     hand_over = float(env.cfg.termination.hand_position_threshold_rad) + 0.1
     object_over = float(env.cfg.termination.object_position_threshold_m) + 0.01
     for step in range(6 * grace):
@@ -1187,7 +1340,7 @@ def assert_early_termination_logic(env):
         hand_error.zero_()
         object_error.zero_()
         if step % 3 == 0:
-            arm_error[:, 0] = arm_over
+            arm_error.fill_(arm_over)
         elif step % 3 == 1:
             hand_error[:, 0] = hand_over
         else:
@@ -1204,7 +1357,7 @@ def assert_early_termination_logic(env):
 
 def assert_early_termination_step_contract(env):
     """Force a task failure and verify that PPO must not bootstrap it."""
-    original_arm_threshold = env.cfg.termination.arm_position_threshold_rad
+    original_arm_threshold = env.cfg.termination.palm_keypoint_threshold_m
     original_hand_threshold = env.cfg.termination.hand_position_threshold_rad
     grace = int(env.cfg.termination.grace_steps)
     env.reset(reference_index=0)
@@ -1212,7 +1365,7 @@ def assert_early_termination_step_contract(env):
     try:
         # A negative diagnostic threshold makes every finite tracking error a
         # violation without perturbing the simulator state itself.
-        env.cfg.termination.arm_position_threshold_rad = -1.0
+        env.cfg.termination.palm_keypoint_threshold_m = -1.0
         env.cfg.termination.hand_position_threshold_rad = -1.0
         for step in range(1, grace + 1):
             actions, _ = env.next_reference_action()
@@ -1235,7 +1388,7 @@ def assert_early_termination_step_contract(env):
         if abs(float(episode["early_termination_fraction"]) - 1.0) > 1e-6:
             raise AssertionError("Early-termination episode statistics are wrong")
     finally:
-        env.cfg.termination.arm_position_threshold_rad = original_arm_threshold
+        env.cfg.termination.palm_keypoint_threshold_m = original_arm_threshold
         env.cfg.termination.hand_position_threshold_rad = original_hand_threshold
         env.reset(reference_index=0)
 
@@ -1283,6 +1436,18 @@ def main():
         env.reset_idx(env.all_env_ids, initial_indices)
         env.gym.refresh_dof_state_tensor(env.sim)
         env.gym.refresh_actor_root_state_tensor(env.sim)
+        # A DOF-state write does not move the links. Isaac Gym recomputes body
+        # transforms during simulate(), and refresh_* re-reads its buffer
+        # rather than recomputing it, so without a step every keypoint below is
+        # read from the asset's default pose -- the palm a stale 1.2 m from the
+        # bar, and both keypoint rewards reporting over a metre of error on a
+        # state the simulator had never been in.
+        env.gym.simulate(env.sim)
+        env.gym.fetch_results(env.sim, True)
+        env.gym.refresh_dof_state_tensor(env.sim)
+        env.gym.refresh_actor_root_state_tensor(env.sim)
+        env.gym.refresh_rigid_body_state_tensor(env.sim)
+        env.gym.refresh_jacobian_tensors(env.sim)
         assert_observation_contract(env)
         assert_reward_contract(env)
         assert_demonstration_action_delta_reward(env)
@@ -1294,8 +1459,16 @@ def main():
         assert_infeasible_commands_are_reported(env)
         assert_the_ik_runs_once_per_step(env)
         env.reset_idx(env.all_env_ids, initial_indices)
+        # Step before reading, for the same reason as the reset above: the
+        # controller tests just above leave the arm somewhere else entirely,
+        # and the playback's first palm Jacobian is transferred through the
+        # wrist quaternion in the rigid-body tensor.
+        env.gym.simulate(env.sim)
+        env.gym.fetch_results(env.sim, True)
         env.gym.refresh_dof_state_tensor(env.sim)
         env.gym.refresh_actor_root_state_tensor(env.sim)
+        env.gym.refresh_rigid_body_state_tensor(env.sim)
+        env.gym.refresh_jacobian_tensors(env.sim)
         # Exact joint targets do not guarantee that the dynamic cube remains
         # grasped, so exercise the complete horizon without the object-distance
         # reset here. Its threshold, grace period and opt-out behavior are

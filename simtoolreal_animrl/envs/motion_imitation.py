@@ -1648,21 +1648,40 @@ class MotionImitationEnv:
             self.symmetry_index,
         )
 
-    def _hand_keypoints_cube_frame(self) -> torch.Tensor:
-        """``(num_envs, 9, 3)`` hand keypoints measured from the cuboid.
+    def _hand_keypoints_world(self) -> torch.Tensor:
+        """``(num_envs, 9, 3)`` palm and fingertip keypoints in world space.
 
-        Anchored on the cuboid's *measured* pose, not on the reference one, so
-        the term still points the right way when the bar has been nudged.
+        The anchor is chosen by the caller, because the two halves of the
+        keypoint reward want different ones. See ``_hand_keypoints_anchored``.
         """
         palm_position_world, palm_orientation_world = self._palm_pose_world()
-        keypoints = hand_keypoints(
+        return hand_keypoints(
             palm_position_world,
             palm_orientation_world,
             self._fingertip_positions_world(),
             self.palm_lever_arm_m,
         )
+
+    def _hand_keypoints_anchored(
+        self,
+        keypoints_world: torch.Tensor,
+        anchor_position: torch.Tensor,
+        anchor_orientation: torch.Tensor,
+    ) -> torch.Tensor:
+        """``(num_envs, 9, 3)`` hand keypoints expressed in an anchor's frame.
+
+        Choosing the anchor is choosing what the resulting reward is a
+        statement *about*, which is why the palm and the fingertips use
+        different ones. See docs/adr/0001.
+
+        Anchored on the cuboid's *measured* pose the error is hand-bar relative
+        geometry, so the term still points the right way when the bar has been
+        nudged -- but it is also blind to the pair moving together, and the
+        grasp makes it uncorrectable. Anchored on the *reference* pose the
+        error is where the hand is in the world, which is what the lift needs.
+        """
         return keypoints_in_object_frame(
-            keypoints, self.cube_position, self.canonical_cube_orientation()
+            keypoints_world, anchor_position, anchor_orientation
         )
 
     def _palm_tilt(self) -> torch.Tensor:
@@ -2655,11 +2674,33 @@ class MotionImitationEnv:
         # Palm and fingertips keep separate Gaussians for the same reason the
         # arm and hand joints do: averaged into one term, five fingertips
         # outvote four palm points and the approach stops being paid for.
-        keypoints_cube_frame = self._hand_keypoints_cube_frame()
-        reference_keypoints = self.transform_bank.keypoints_at(self.reference_index)
-        actual_palm, actual_fingertips = split_palm_and_fingertips(
-            keypoints_cube_frame
+        #
+        # The two halves take different anchors on purpose (docs/adr/0001).
+        # The fingertips price the grasp, whose subject matter is relative
+        # geometry, so they stay on the measured bar. The palm prices the
+        # transport: on the measured bar it cannot see the lift at all, since
+        # a rigid grasp carries hand and bar together and leaves the relative
+        # pose untouched, so it anchors on the reference bar instead and its
+        # target rises with the reference.
+        #
+        # No symmetry element on the reference side. canonical_cube_orientation
+        # exists to bring the *measured* quaternion into the labelling the
+        # demonstration used; the reference quaternion is the demonstration's,
+        # so re-applying it would move the frame rather than align it.
+        keypoints_world = self._hand_keypoints_world()
+        palm_frame = self._hand_keypoints_anchored(
+            keypoints_world,
+            reference_cube_root_state[:, 0:3],
+            reference_cube_orientation,
         )
+        fingertip_frame = self._hand_keypoints_anchored(
+            keypoints_world,
+            self.cube_position,
+            self.canonical_cube_orientation(),
+        )
+        reference_keypoints = self.transform_bank.keypoints_at(self.reference_index)
+        actual_palm, _ = split_palm_and_fingertips(palm_frame)
+        _, actual_fingertips = split_palm_and_fingertips(fingertip_frame)
         reference_palm, reference_fingertips = split_palm_and_fingertips(
             reference_keypoints
         )
