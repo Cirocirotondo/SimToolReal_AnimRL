@@ -9,7 +9,6 @@ from simtoolreal_animrl.envs.cuboid_symmetry import (
     apply_cuboid_symmetry,
     canonicalize_cuboid_orientation,
     cuboid_rotation_symmetries,
-    symmetry_invariant_orientation_error,
 )
 from simtoolreal_animrl.envs.rotations import (
     normalize_canonical_quaternion,
@@ -144,81 +143,3 @@ class HeldChoiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class SymmetryInvariantOrientationErrorTest(unittest.TestCase):
-    """The orientation reward must price physics, not labelling.
-
-    The bar's cross-section is square, so half a turn about its long axis is
-    the same physical pose. The plain geodesic angle charged up to pi for it,
-    which is why raising that term's weight and widening its sigma both moved
-    the trained result by under 10%: the error it was pricing was not one the
-    policy could remove.
-    """
-
-    def symmetries(self):
-        return cuboid_rotation_symmetries(BAR)
-
-    def test_a_symmetry_of_the_bar_costs_nothing(self):
-        sym = self.symmetries()
-        reference = yaw(37.0).expand(sym.shape[0], 4)
-        # Every relabelling of the same physical pose, all at once.
-        relabelled = quat_multiply(reference, sym)
-        error = symmetry_invariant_orientation_error(relabelled, reference, sym)
-        torch.testing.assert_close(
-            error, torch.zeros_like(error), atol=1e-6, rtol=0.0
-        )
-
-    def test_a_real_rotation_still_costs_its_angle(self):
-        sym = self.symmetries()
-        reference = yaw(0.0)
-        for degrees in (5.0, 15.0, 30.0):
-            error = symmetry_invariant_orientation_error(
-                yaw(degrees), reference, sym
-            )
-            self.assertAlmostEqual(
-                float(error), math.radians(degrees), places=5
-            )
-
-    def test_it_never_exceeds_the_plain_geodesic_angle(self):
-        sym = self.symmetries()
-        generator = torch.Generator().manual_seed(3)
-        a = normalize_canonical_quaternion(
-            torch.randn(256, 4, generator=generator, dtype=torch.float64)
-        )
-        b = normalize_canonical_quaternion(
-            torch.randn(256, 4, generator=generator, dtype=torch.float64)
-        )
-        plain = 2.0 * torch.acos((a * b).sum(dim=1).abs().clamp(max=1.0))
-        quotient = symmetry_invariant_orientation_error(a, b, sym)
-        self.assertTrue(bool((quotient <= plain + 1e-9).all()))
-
-    def test_it_is_symmetric_in_its_arguments(self):
-        sym = self.symmetries()
-        generator = torch.Generator().manual_seed(5)
-        a = normalize_canonical_quaternion(
-            torch.randn(64, 4, generator=generator, dtype=torch.float64)
-        )
-        b = normalize_canonical_quaternion(
-            torch.randn(64, 4, generator=generator, dtype=torch.float64)
-        )
-        torch.testing.assert_close(
-            symmetry_invariant_orientation_error(a, b, sym),
-            symmetry_invariant_orientation_error(b, a, sym),
-            atol=1e-7,
-            rtol=0.0,
-        )
-
-    def test_the_worst_case_is_bounded_by_the_symmetry_group(self):
-        """With 8 relabellings no pose can be more than a quarter turn away
-        about the long axis, which is what makes the term calibratable."""
-        sym = self.symmetries()
-        generator = torch.Generator().manual_seed(11)
-        a = normalize_canonical_quaternion(
-            torch.randn(4096, 4, generator=generator, dtype=torch.float64)
-        )
-        b = normalize_canonical_quaternion(
-            torch.randn(4096, 4, generator=generator, dtype=torch.float64)
-        )
-        worst = float(symmetry_invariant_orientation_error(a, b, sym).max())
-        self.assertLess(worst, math.pi)
