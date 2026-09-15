@@ -95,8 +95,20 @@ class ConfigAndDemoTest(unittest.TestCase):
             "velocity_arm_std_rad_per_s",
         ):
             self.assertFalse(hasattr(env_cfg.rewards, name))
-        self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
-        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.4)
+        # A backstop, not the driver: the palm keypoint term (anchored to the
+        # reference cube pose, docs/adr/0001) already scores the palm against
+        # the demonstration's absolute trajectory, so a correct palm carries
+        # the bar as a consequence. Below palm_keypoint_weight (0.80) on
+        # purpose, so the bar's own pose cannot outbid tracking how it got
+        # there -- which it did at 0.8/0.4, and the arm answered with up to
+        # 234 degrees of null-space wrist rotation during the lift.
+        self.assertEqual(env_cfg.rewards.object_position_weight, 0.10)
+        self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.10)
+        self.assertLess(
+            env_cfg.rewards.object_position_weight
+            + env_cfg.rewards.object_orientation_weight,
+            env_cfg.rewards.palm_keypoint_weight,
+        )
         # Off: the object-frame fingertip keypoints subsume what this shaped.
         self.assertEqual(
             env_cfg.rewards.fingertip_object_distance_weight, 0.0

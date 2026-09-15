@@ -575,10 +575,31 @@ class SimToolRealCfg(BaseEnvCfg):
         # Inert either way while adaptive_sigma_enabled is False.
         adaptive_sigma_hand_action_rate_floor = 0.33
 
-        # Cube position tracking rewards
+        # Cube position/orientation tracking: a BACKSTOP, not the driver.
+        #
+        # The palm keypoint term (palm_keypoint_weight, 0.80) is anchored to
+        # the reference cube pose (docs/adr/0001), so it already scores the
+        # palm against the demonstration's absolute trajectory -- the demo's
+        # motion, rigidly transported once at reset onto this episode's cube
+        # placement (x, y, yaw), then held fixed for the whole episode. A palm
+        # that tracks that trajectory carries the bar correctly as a
+        # consequence; the bar's own pose reward should not have to do that
+        # work a second time.
+        #
+        # Before this change object_position_weight + object_orientation_weight
+        # summed to 1.2, outweighing the palm term at 0.80. Measured on
+        # 2026-09-15: the arm drifted up to 234 degrees of null-space rotation
+        # in wrist_1 during the lift (57 degrees max during the approach), the
+        # bar spun up to 180 degrees off its demonstrated orientation, and the
+        # reward collected during the lift favoured object_position (0.75 of
+        # 1.0) over palm_tilt (0.05) and object_orientation (0.01) by roughly
+        # 50x -- the policy could ignore how the palm got there as long as the
+        # bar's centre arrived. Demoting these two below the palm term removes
+        # that competition; they stay live only to catch what the palm term
+        # cannot see on its own -- the bar slipping in an already-closed grasp.
         object_scale = 1
-        object_position_weight = 0.8 * object_scale
-        object_orientation_weight = 0.4 * object_scale
+        object_position_weight = 0.10 * object_scale
+        object_orientation_weight = 0.10 * object_scale
         # Calibrated on the LIFT, which is the only phase where this term has
         # to do any work: while the bar sits on the table the error is small
         # whatever the policy does, so the approach phase cannot calibrate it.
