@@ -158,3 +158,46 @@ def apply_cuboid_symmetry(
     return normalize_canonical_quaternion(
         quat_multiply(normalize_canonical_quaternion(orientation), selected)
     )
+
+
+def symmetry_invariant_orientation_error(
+    orientation: torch.Tensor,
+    reference: torch.Tensor,
+    symmetries: torch.Tensor,
+) -> torch.Tensor:
+    """Geodesic angle between two orientations, modulo the cuboid's symmetry.
+
+    ``(...,)`` radians: the smallest rotation carrying ``orientation`` onto any
+    relabelling of ``reference``. For a bar with a square cross-section, half a
+    turn about its long axis is the same physical pose, so the raw angle can
+    charge up to pi for a state that is exactly right.
+
+    Unlike :func:`canonicalize_cuboid_orientation` this picks a fresh element
+    every call, and that is correct *here* precisely because the result is a
+    scalar distance rather than a frame. The rule in this module's docstring --
+    choose once, replay it -- protects quantities measured *in* the cuboid's
+    frame, where re-choosing makes the frame jump mid-motion. A distance has no
+    frame to jump: it is the geodesic on the quotient by the symmetry group,
+    which is what "how far is this bar from where it should be" means.
+    """
+    if symmetries.ndim != 2 or symmetries.shape[-1] != 4:
+        raise ValueError("Expected symmetries with shape (K, 4)")
+    symmetries = symmetries.to(dtype=orientation.dtype, device=orientation.device)
+    orientation = normalize_canonical_quaternion(orientation)
+    reference = normalize_canonical_quaternion(
+        torch.as_tensor(
+            reference, dtype=orientation.dtype, device=orientation.device
+        )
+    )
+    batch = orientation.shape[:-1]
+    count = symmetries.shape[0]
+    candidates = quat_multiply(
+        orientation.unsqueeze(-2).expand(*batch, count, 4),
+        symmetries.expand(*batch, count, 4),
+    )
+    # abs(): q and -q are the same rotation, so the double cover must not pick
+    # the representative. max over the symmetry axis is the closest relabelling.
+    alignment = (
+        (candidates * reference.unsqueeze(-2)).sum(dim=-1).abs().amax(dim=-1)
+    )
+    return 2.0 * torch.acos(alignment.clamp(max=1.0))
