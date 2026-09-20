@@ -3,23 +3,61 @@
 Minimal UR5e + Tesollo DG5F motion-imitation environment using the training
 structure and Python configuration style of `cmm-25-a3-animrl`.
 
-This repository intentionally does not depend on `rl_games`.  The first
-milestone is a headless reference-action test; PPO will be added only after the
-environment is verified independently.
+This repository intentionally does not depend on `rl_games`. It contains a
+small AnimRL-compatible PPO stack plus an independently testable Isaac Gym
+environment. This branch trains the arm-only policy described below; the
+`object` branch extends it with the cube, the full 26-joint policy, and the
+sim2sim/real-robot pipeline.
+
+## Setup
+
+Tested with Python 3.8, PyTorch 2.4 (CUDA 12.1) and Isaac Gym Preview 4 on
+Linux. Isaac Gym is not on PyPI: download it from NVIDIA, install its Python
+package into the same virtual environment, then install this repository.
+
+```bash
+python3.8 -m venv .venv && source .venv/bin/activate
+pip install torch            # pick the CUDA build matching your driver
+pip install -e /path/to/isaacgym/python
+pip install -e .
+```
+
+`python` in every command below is the interpreter of that environment.
+Training and evaluation need a CUDA GPU; the unit tests do not.
+
+## Repository layout
+
+- `simtoolreal_animrl/cfg/`: Python configuration classes (environment, rewards,
+  termination, PPO), overridable from the command line with `--set PATH=VALUE`.
+- `simtoolreal_animrl/envs/`: the Isaac Gym motion-imitation environment.
+- `simtoolreal_animrl/runners/`: AnimRL-compatible PPO, evaluation, plotting.
+- `assets/`: UR5e + Tesollo DG5F URDF and meshes.
+- `demonstrations/`: the 60 Hz retargeted demonstration (`.npz`).
+- `scripts/`: entry points (`train.py`, `evaluate.py`, viewers, tests).
+- `tests/`: simulator-free unit tests.
+
+## Running the tests
+
+The unit tests exercise the configuration, the demonstration loader and the
+PPO runner modules on CPU and need neither Isaac Gym nor a GPU:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```
 
 ## Headless environment test
 
 From the repository root:
 
 ```bash
-/home/simone/.venv/bin/python scripts/test_headless_env.py --num-envs 16
+python scripts/test_headless_env.py --num-envs 16
 ```
 
 The production configuration uses 4096 environments, matching AnimRL's Walk
 and Cartwheel configurations:
 
 ```bash
-/home/simone/.venv/bin/python scripts/test_headless_env.py
+python scripts/test_headless_env.py
 ```
 
 The test loads the local robot asset and 60 Hz demonstration, applies the
@@ -69,7 +107,7 @@ loop. Run one complete 24-step rollout followed by the configured five PPO
 epochs and four minibatches with:
 
 ```bash
-/home/simone/.venv/bin/python scripts/test_ppo_update.py --num-envs 64
+python scripts/test_ppo_update.py --num-envs 64
 ```
 
 The test checks finite rollout tensors and losses, normalized GAE advantages,
@@ -81,13 +119,13 @@ Start production training with the AnimRL Cartwheel PPO settings (4096 envs,
 rate) using:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py
+python scripts/train.py
 ```
 
 For a short smoke run:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py \
+python scripts/train.py \
   --num-envs 64 \
   --iterations 2 \
   --save-interval 1 \
@@ -98,7 +136,7 @@ Checkpoints use AnimRL's `model_<iteration>.pt` schema. Resume for an additional
 number of PPO updates with:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py \
+python scripts/train.py \
   --num-envs 64 \
   --iterations 2 \
   --resume logs/simtoolreal/<run>/model_2.pt
@@ -108,7 +146,7 @@ Each run stores `config.json`, `metrics.jsonl`, TensorBoard event files, and
 AnimRL-compatible models. Follow a running experiment locally with:
 
 ```bash
-/home/simone/.venv/bin/tensorboard --logdir logs/simtoolreal
+tensorboard --logdir logs/simtoolreal
 ```
 
 TensorBoard records reward components, actor/critic losses, policy standard
@@ -141,7 +179,7 @@ Evaluate the policy mean (the deterministic action used by original AnimRL)
 from reference sample zero with one headless environment:
 
 ```bash
-/home/simone/.venv/bin/python scripts/evaluate.py \
+python scripts/evaluate.py \
   --checkpoint logs/simtoolreal/<run>/model_3000.pt
 ```
 
@@ -150,7 +188,7 @@ validates the 19D/6D arm-only environment contract, and writes
 `eval_model_3000.json`. To display the same rollout in Isaac Gym:
 
 ```bash
-/home/simone/.venv/bin/python scripts/evaluate.py \
+python scripts/evaluate.py \
   --checkpoint logs/simtoolreal/<run>/model_3000.pt \
   --viewer
 ```
@@ -165,14 +203,14 @@ the six policy outputs with the ideal AnimRL residual action for the next
 demonstration sample (the hand remains reference-driven), run:
 
 ```bash
-/home/simone/.venv/bin/python scripts/demo_viewer_isaacgym.py
+python scripts/demo_viewer_isaacgym.py
 ```
 
 It uses one environment and uniform RSI by default. For deterministic playback
 from a particular demonstration sample and for one episode only:
 
 ```bash
-/home/simone/.venv/bin/python scripts/demo_viewer_isaacgym.py \
+python scripts/demo_viewer_isaacgym.py \
   --rsi-index 732 \
   --episodes 1
 ```
