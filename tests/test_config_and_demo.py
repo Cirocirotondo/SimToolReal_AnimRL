@@ -52,8 +52,10 @@ class ConfigAndDemoTest(unittest.TestCase):
             self.assertEqual(getattr(env_cfg.rewards, name), expected)
         self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
         self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.2)
+        # Proximity shaping is off in the default configuration (7e39324);
+        # the pre-grasp launchers re-enable it explicitly.
         self.assertEqual(
-            env_cfg.rewards.fingertip_object_distance_weight, 0.2
+            env_cfg.rewards.fingertip_object_distance_weight, 0.0
         )
         self.assertEqual(
             env_cfg.rewards.fingertip_object_distance_std_m, 0.04

@@ -12,13 +12,13 @@ is applied, matching the saved blind run.
 Run the default checkpoint with a viewer:
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_mujoco_sim2sim.py
+python scripts/run_mujoco_sim2sim.py
 ```
 
 Run headless without real-time pacing:
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_mujoco_sim2sim.py \
+python scripts/run_mujoco_sim2sim.py \
   --headless --no-realtime
 ```
 
@@ -52,5 +52,5 @@ cube can contact the table. The ground plane is visual only.
 Run the focused tests with:
 
 ```bash
-/home/simone/.venv/bin/python -m unittest tests.test_sim2sim -v
+python -m unittest tests.test_sim2sim -v
 ```

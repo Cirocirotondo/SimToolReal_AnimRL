@@ -9,27 +9,107 @@ environment.
 
 ## Current training status
 
-Object tracking, configurable object-distance termination, pre-grasp RSI and
-optional fingertip-contact shaping are implemented and covered by software
-tests. The grasp-training experiments run so far still do not learn a reliable
-grasp, so this training strategy remains experimental and needs further tuning.
-The annealed object assist described below adds an optional grasp curriculum:
-an external PD wrench carries the cube along the demonstration and decays to
-zero, leaving the policy to take the load over.
+This branch adds the physical cube to the scene and extends the policy from the
+arm to all 26 joints (108D observation, 26 actions). Object tracking,
+configurable object-distance termination, pre-grasp RSI, fingertip proximity
+and contact shaping, and an annealed object assist (an external PD wrench that
+carries the cube along the demonstration and decays to zero) are implemented
+and covered by software tests.
+
+The blind 108D policy does learn the grasp: the checkpoints in `best_models/`
+lift the cube close to the demonstrated 0.24 m from a pre-grasp RSI reset, and
+`pg830_blind512_n256` also transfers to the standalone MuJoCo model in
+`simtoolreal_animrl/sim2sim/`. Two smoother later policies did not survive that
+transfer, which is what motivated the domain randomization, sensor noise and
+disturbance options described under [Sim-to-real robustness](#sim-to-real-robustness-options).
+They are all off by default, so every recorded run reproduces. The early
+approach (chaining the whole demonstration from frame 0) is still trained too
+rarely under `pregrasp_mixture` to be reliable, and no policy has been run on
+the real robot yet; `deployment/` holds the staged bring-up procedure for that.
+
+## Setup
+
+Tested with Python 3.8, PyTorch 2.4 (CUDA 12.1) and Isaac Gym Preview 4 on
+Linux. Isaac Gym is not on PyPI: download it from NVIDIA, install its Python
+package into the same virtual environment, then install this repository.
+
+```bash
+python3.8 -m venv .venv && source .venv/bin/activate
+pip install torch            # pick the CUDA build matching your driver
+pip install -e /path/to/isaacgym/python
+pip install -e .
+```
+
+Optional extras: `pip install -e '.[video]'` for MP4 recording (imageio +
+ffmpeg), `'.[sim2sim]'` for the MuJoCo sim2sim runner (MuJoCo **3.2.0-3.2.3**,
+see `deployment/README.md` for why newer releases break), `'.[retarget]'` for
+rebuilding the transform bank.
+
+`python` in every command below is the interpreter of that environment.
+Training and evaluation need a CUDA GPU; the unit tests and sim2sim do not.
+
+## Repository layout
+
+- `simtoolreal_animrl/cfg/`: Python configuration classes (environment, object,
+  object assist, contact, domain randomization, rewards, termination, PPO),
+  overridable from the command line with `--set PATH=VALUE`.
+- `simtoolreal_animrl/envs/`: the Isaac Gym environment and its pure helpers
+  (`rsi.py`, `rsi_noise.py`, `proximity.py`, `contact.py`, `object_assist.py`,
+  `domain_randomization.py`, `sensing.py`, `disturbance.py`,
+  `adaptive_sigma.py`, `pd_gains.py`).
+- `simtoolreal_animrl/runners/`: AnimRL-compatible PPO, periodic and final
+  evaluation, plotting, `deployment_score.py`, `lineage.py`.
+- `simtoolreal_animrl/sim2sim/`: standalone MuJoCo re-implementation of the
+  scene, with its own README.
+- `deployment/`: real-robot controller for the UR5e + DG5F, with its own README.
+- `best_models/`: the policies selected for the robot, each with a README.
+- `assets/`, `demonstrations/`: URDF/meshes and the 60 Hz demonstration.
+- `scripts/`: entry points (`train.py`, `evaluate.py`, sweep launchers,
+  viewers, `prepare_warm_start.py`, `probe_robustness.py`,
+  `run_mujoco_sim2sim.py`, `build_training_dashboard.py`).
+- `tests/`: unit tests that need neither Isaac Gym nor a GPU.
+
+## Running the tests
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
+The suite runs on CPU. The sim2sim tests are skipped when MuJoCo is not
+installed, and a few checks that replay the committed `best_models/`
+checkpoints are skipped when those artifacts are absent.
+
+## Selected policies (`best_models/`)
+
+Each folder holds one policy chosen for the robot, its `config.json`, the
+sparse evaluation rows (`evaluations.jsonl`), the deterministic replay video,
+the evaluation plots, and a README saying which `.pt` file to use and why.
+Intermediate checkpoints, TensorBoard events and the full `metrics.jsonl` are
+deliberately not committed (see `.gitignore`).
+
+| folder | use | notes |
+|--------|-----|-------|
+| `2026-09-07_003258_pg830_blind512_n256` | `best_model.pt` | roughest policy, the only one that transfers to MuJoCo |
+| `2026-09-08_012911_blind_quiet2` | `model_1600.pt` | smoother; its `best_model.pt` is the iteration-0 weights, do not use it |
+| `2026-09-08_141812_adapt_sigma` | `best_deployment_model.pt` | first run selected by `deployment_score` |
+
+All three are blind (108D, no contact sensing) and were trained with
+`control.hand_stiffness_scale=0.5`: the hand PD gains are half of what the
+real hand ships with, so the hardware gains must be halved to match.
 
 ## Headless environment test
 
 From the repository root:
 
 ```bash
-/home/simone/.venv/bin/python scripts/test_headless_env.py --num-envs 16
+python scripts/test_headless_env.py --num-envs 16
 ```
 
 The production configuration uses 4096 environments, matching AnimRL's Walk
 and Cartwheel configurations:
 
 ```bash
-/home/simone/.venv/bin/python scripts/test_headless_env.py
+python scripts/test_headless_env.py
 ```
 
 The test loads the local robot asset and 60 Hz demonstration, applies the
@@ -71,7 +151,7 @@ and summarized in `experiment_sweep.json`. A failed or diverged run is recorded
 but does not stop the remaining experiments.
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_robustness_object_reward.py
+python scripts/run_robustness_object_reward.py
 ```
 
 Use `--dry-run` to inspect the seven generated `train.py` commands without
@@ -90,7 +170,7 @@ orientation, fingertip proximity, and contact rewards are all explicitly
 disabled.
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_no_object_entropy_sweep.py
+python scripts/run_no_object_entropy_sweep.py
 ```
 
 Runs are stored below a timestamped `*_no_object_entropy_sweep_seed_42`
@@ -109,7 +189,7 @@ weights, and keeps contact shaping off. Cube-distance early termination is
 enabled at the configured `0.05 m` threshold with a five-step grace period.
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_pregrasp_proximity.py
+python scripts/run_pregrasp_proximity.py
 ```
 
 The default run has 12000 PPO updates, 200-step episodes, and uses seed `43`,
@@ -124,7 +204,7 @@ five times with seed `43`, changing only `entropy_coef` across `0.005, 0.002,
 independent, and a failure or divergence does not stop the remaining values:
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_pregrasp_entropy_sweep.py
+python scripts/run_pregrasp_entropy_sweep.py
 ```
 
 The timestamped output directory contains one subdirectory per coefficient and
@@ -147,7 +227,7 @@ Run both initialization variants, with 1000 PPO updates at each of the ten
 scales:
 
 ```bash
-/home/simone/.venv/bin/python scripts/run_object_reward_sweep.py
+python scripts/run_object_reward_sweep.py
 ```
 
 Use `--dry-run` to inspect every command without starting Isaac Gym. The run
@@ -226,7 +306,7 @@ The feature is **off by default**, so every existing experiment launcher keeps
 reproducing its original physics. Enable it from `train.py`:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py \
+python scripts/train.py \
   --object-assist \
   --object-assist-start-iteration 0 \
   --object-assist-end-iteration 6000
@@ -260,7 +340,7 @@ PPO. It freezes the robot at its RSI pose while the demonstration walks away,
 so only the assist can keep the cube on the demonstrated trajectory:
 
 ```bash
-/home/simone/.venv/bin/python scripts/test_object_assist_env.py
+python scripts/test_object_assist_env.py
 ```
 
 At scale 1 the cube ends 0.03 m from its target after 90 held steps, against
@@ -291,7 +371,7 @@ never acquired and the figure is skipped rather than drawn flat at zero. To
 inspect the forces anyway:
 
 ```bash
-/home/simone/.venv/bin/python scripts/evaluate.py \
+python scripts/evaluate.py \
   --checkpoint logs/simtoolreal/<run>/model_<n>.pt \
   --contact-forces
 ```
@@ -335,7 +415,7 @@ loop. Run one complete 24-step rollout followed by the configured five PPO
 epochs and four minibatches with:
 
 ```bash
-/home/simone/.venv/bin/python scripts/test_ppo_update.py --num-envs 64
+python scripts/test_ppo_update.py --num-envs 64
 ```
 
 The test checks finite rollout tensors and losses, normalized GAE advantages,
@@ -347,13 +427,13 @@ Start production training with the AnimRL Cartwheel PPO settings (4096 envs,
 rate) using:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py
+python scripts/train.py
 ```
 
 For a short smoke run:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py \
+python scripts/train.py \
   --num-envs 64 \
   --iterations 2 \
   --save-interval 1 \
@@ -365,7 +445,7 @@ the GPU contact tensor and add `0.05` per contacting fingertip at each step
 with:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py \
+python scripts/train.py \
   --set contact.enabled=true
 ```
 
@@ -385,7 +465,7 @@ Checkpoints use AnimRL's `model_<iteration>.pt` schema. Resume for an additional
 number of PPO updates with:
 
 ```bash
-/home/simone/.venv/bin/python scripts/train.py \
+python scripts/train.py \
   --num-envs 64 \
   --iterations 2 \
   --resume logs/simtoolreal/<run>/model_2.pt
@@ -395,7 +475,7 @@ Each run stores `config.json`, `metrics.jsonl`, TensorBoard event files, and
 AnimRL-compatible models. Follow a running experiment locally with:
 
 ```bash
-/home/simone/.venv/bin/tensorboard --logdir logs/simtoolreal
+tensorboard --logdir logs/simtoolreal
 ```
 
 TensorBoard records reward components, actor/critic losses, policy standard
@@ -437,13 +517,138 @@ python scripts/train.py --eval-interval 50 --eval-num-envs 128
 
 Use `--no-periodic-eval` for short profiling/debug runs.
 
+## Sim-to-real robustness options
+
+The training scene is deterministic by default: fixed PD gains, exact joint
+readings, instantaneous actions, nothing ever pushes the robot. Every option
+in this section is **off by default** so that all recorded runs reproduce; the
+values below are what the `train.py` flags switch on, and any single field can
+be changed with `--set domain_randomization.<field>=<value>`.
+
+Before randomizing anything, `scripts/probe_robustness.py` measures which
+disturbances an existing checkpoint already survives and which break it, by
+wrapping the unchanged environment at evaluation time:
+
+```bash
+python scripts/probe_robustness.py \
+  --checkpoint best_models/2026-09-07_003258_pg830_blind512_n256/best_model.pt
+```
+
+### Domain randomization, disturbances and sensor noise
+
+`--domain-randomization` samples per-environment multipliers once at creation
+(each range is a fractional spread about the nominal, `0.4` meaning uniform in
+`[0.6, 1.4]`): hand stiffness/damping `0.40`, arm stiffness/damping `0.20`,
+fingertip, cube and table friction `0.35`, cube mass `0.25`, robot link mass
+`0.15`. The same flag adds sparse external impulses (probability `0.02` per
+environment per control step, `12 N` on the robot and `1 N` on the cube),
+Gaussian observation noise (`0.005 rad` on joint positions with a per-environment
+`0.005 rad` bias, `0.4243 rad/s` on velocities) and a per-environment control
+delay of up to one step. The pure helpers live in
+`simtoolreal_animrl/envs/domain_randomization.py`, `disturbance.py` and
+`sensing.py`.
+
+```bash
+python scripts/train.py --domain-randomization
+```
+
+`env.rsi_position_noise_arm_rad`, `env.rsi_position_noise_hand_rad` and
+`env.rsi_velocity_noise_scale` perturb the reference pose an episode is reset
+onto (`simtoolreal_animrl/envs/rsi_noise.py`), since a real arm can never be
+placed exactly on a demonstration frame.
+
+### Contact observations and asymmetric critic
+
+`--contact-observations` appends one palm-frame contact-force vector per
+fingertip in `contact.fingertip_names` to the observation (scaled by
+`contact.observation_force_scale_n`, clipped at `contact.observation_clip`),
+which widens the input past 108D: such a run cannot warm-start from a blind
+checkpoint. `--asymmetric-critic` keeps the actor blind and gives only the
+critic the fingertip forces; on a scratch run combined with
+`--domain-randomization` the critic also receives the sampled physical
+multipliers. The critic is discarded at deployment, so neither costs the
+deployed policy anything. Both flags enable PhysX contact reporting
+(`contact.enabled`) automatically.
+
+## Adaptive reward widths and deployment score
+
+`rewards.adaptive_sigma_enabled` replaces the fixed position and action-rate
+reward widths by widths that track a slow average of their own error and hold
+each term near `rewards.adaptive_sigma_target_reward` (`0.6`), so the reward
+keeps a gradient however good the policy gets. `adaptive_sigma_slack` bounds
+how far a width may relax when the policy regresses and the
+`adaptive_sigma_*_floor` values stop the tightening at the smoothest policy
+trained here. The live widths are logged as `adaptive_sigma_<term>`.
+
+Because a tighter sigma lowers the score of an unchanged policy, the reward
+based `evaluation_score` that selects `best_model.pt` is not comparable across
+runs, and it also penalizes early termination on fixed start phases that
+`pregrasp_mixture` barely trains. `simtoolreal_animrl/runners/deployment_score.py`
+therefore scores the cohort that follows the training distribution with
+physical quantities only:
+
+```
+deployment_score = grasp_gate * (0.5 * smooth + 0.3 * arm + 0.2 * hand)
+```
+
+The gate is survival times normalized peak cube lift (`0.24 m` scores 1); the
+three terms map RMS action rate and arm/hand position error onto `[0, 1]` on a
+log scale between the roughest and smoothest policies trained so far. Every
+periodic evaluation logs it, and the checkpoint with the best value is saved as
+`best_deployment_model.pt` beside `best_model.pt`. Prefer it.
+
+## Warm starts and lineage
+
+`--resume` writes into the directory of the checkpoint it is given, so
+resuming directly from a finished run would overwrite it. Stage the checkpoint
+first:
+
+```bash
+python scripts/prepare_warm_start.py \
+  --checkpoint logs/simtoolreal/<parent>/best_deployment_model.pt \
+  --run-name smooth_warm2
+```
+
+This creates the new run directory, copies the checkpoint and leaves a
+`checkpoint_source.json` sidecar naming the parent run; `train.py` folds it
+into the `lineage` record of the new run's `config.json`, so a run's ancestry
+can always be read back (`simtoolreal_animrl/runners/lineage.py`).
+
+`scripts/run_outcome.py --run-name <run> --want <iterations>` classifies how a
+run ended (`done`, `retry`, `skip`) for queue scripts, and
+`scripts/build_training_dashboard.py` renders the local runs into a single
+self-contained HTML page.
+
+## MuJoCo sim2sim
+
+`simtoolreal_animrl/sim2sim/` re-implements the scene in MuJoCo without Isaac
+Gym, to check a policy against a second contact model before the robot. It
+shares the observation construction with the real-robot deployment code:
+
+```bash
+pip install -e '.[sim2sim]'
+python scripts/run_mujoco_sim2sim.py --headless --no-realtime
+```
+
+See `simtoolreal_animrl/sim2sim/README.md` for the options, the PD-gain
+matching (`--training-pd-gains`) and the plots it writes.
+
+## Real-robot deployment
+
+`deployment/run_policy_real.py` runs a checkpoint on the physical UR5e and
+DG5F through the lab's arm and hand bridges, in a staged sequence (simulation,
+then arm only, then hand) with rate limits and discontinuity monitors.
+`deployment/README.md` is the bring-up procedure; read its blockers section
+first — it pins the MuJoCo version and the observation contract the checkpoint
+must match.
+
 ## Deterministic checkpoint evaluation
 
 Evaluate the policy mean (the deterministic action used by original AnimRL)
 from reference sample zero with one headless environment:
 
 ```bash
-/home/simone/.venv/bin/python scripts/evaluate.py \
+python scripts/evaluate.py \
   --checkpoint logs/simtoolreal/<run>/model_3000.pt
 ```
 
@@ -452,7 +657,7 @@ validates the 108D/26D environment contract, and writes
 `eval_model_3000.json`. To display the same rollout in Isaac Gym:
 
 ```bash
-/home/simone/.venv/bin/python scripts/evaluate.py \
+python scripts/evaluate.py \
   --checkpoint logs/simtoolreal/<run>/model_3000.pt \
   --viewer
 ```
@@ -468,7 +673,7 @@ viewer shows it. It needs a graphics-capable device but no viewer, so it runs
 over SSH:
 
 ```bash
-/home/simone/.venv/bin/python scripts/evaluate.py \
+python scripts/evaluate.py \
   --checkpoint logs/simtoolreal/<run>/best_model.pt \
   --record-video
 ```
@@ -491,14 +696,14 @@ the six policy outputs with the ideal AnimRL residual action for the next
 demonstration sample (the hand remains reference-driven), run:
 
 ```bash
-/home/simone/.venv/bin/python scripts/demo_viewer_isaacgym.py
+python scripts/demo_viewer_isaacgym.py
 ```
 
 It uses one environment and the configured RSI mixture by default. For deterministic playback
 from a particular demonstration sample and for one episode only:
 
 ```bash
-/home/simone/.venv/bin/python scripts/demo_viewer_isaacgym.py \
+python scripts/demo_viewer_isaacgym.py \
   --rsi-index 732 \
   --episodes 1
 ```
